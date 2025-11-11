@@ -1,0 +1,4 @@
+module CxxPDAL {
+    header "pdal_wrapper.h"
+    export *
+}
