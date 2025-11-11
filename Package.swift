@@ -18,6 +18,10 @@ let package = Package(
             targets: ["OctreeRenderingExample"]
         ),
         .executable(
+            name: "StreamingExample",
+            targets: ["StreamingExample"]
+        ),
+        .executable(
             name: "MetalOctreeViewer",
             targets: ["MetalOctreeViewer"]
         ),
@@ -76,6 +80,29 @@ let package = Package(
             sources: ["OctreeRenderingExample.swift"],
             swiftSettings: [
                 .interoperabilityMode(.Cxx)
+            ],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../../../Frameworks/gdal.xcframework/macos-arm64/gdal.framework",
+                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../Frameworks/gdal.xcframework/macos-arm64/gdal.framework"
+                ])
+            ]
+        ),
+
+        .executableTarget(
+            name: "StreamingExample",
+            dependencies: ["SwiftPDAL"],
+            path: "Examples",
+            sources: ["StreamingExample.swift"],
+            swiftSettings: [
+                .interoperabilityMode(.Cxx),
+                .define("SWIFTPDAL_TESTING")
+            ],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../../../Frameworks/gdal.xcframework/macos-arm64/gdal.framework",
+                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../Frameworks/gdal.xcframework/macos-arm64/gdal.framework"
+                ])
             ]
         ),
 
@@ -88,6 +115,12 @@ let package = Package(
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx)
+            ],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../../../Frameworks/gdal.xcframework/macos-arm64/gdal.framework",
+                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../Frameworks/gdal.xcframework/macos-arm64/gdal.framework"
+                ])
             ]
         ),
     ],

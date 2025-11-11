@@ -39,6 +39,26 @@
             "target": "MetalOctreeViewer",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release MetalOctreeViewer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftPDAL}",
+            "name": "Debug StreamingExample",
+            "target": "StreamingExample",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug StreamingExample"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftPDAL}",
+            "name": "Release StreamingExample",
+            "target": "StreamingExample",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release StreamingExample"
         }
     ]
 }
