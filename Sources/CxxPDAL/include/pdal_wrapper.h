@@ -62,6 +62,43 @@ int pdal_read_binary(const std::string& reader_name_backup, const std::string& f
 
 void pdal_free_data(const char* data, PDALDimensionInfo* dimList);
 
+// ============================================================================
+// STREAMING API
+// ============================================================================
+
+// Structure representing a chunk of point data during streaming
+typedef struct {
+    const char* data;           // Pointer to chunk data (temporary, valid only during callback)
+    size_t pointCount;          // Number of points in this chunk
+    size_t stride;              // Bytes per point
+    bool isComplete;            // True if this is the final chunk
+    size_t totalPointsSoFar;    // Total points delivered so far (including this chunk)
+    size_t estimatedTotalPoints;// Estimated total (0 if unknown)
+} ChunkData;
+
+// Callback function type for streaming chunks with context pointer
+// Returns: true to continue loading, false to cancel
+typedef bool (*ProgressCallback)(const ChunkData& chunk,
+                                  const PDALDimensionInfo* dimInfo,
+                                  size_t dimCount,
+                                  void* context);
+
+// Streaming reader function - calls callback for each chunk of points
+// Parameters:
+//   reader_name_backup: Fallback reader name if inference fails
+//   filename: Path to point cloud file
+//   chunkSize: Number of points per chunk (e.g., 10000)
+//   onChunk: Callback function called for each chunk
+//   bbox: Output parameter for bounds
+// Returns: 0 on success, negative error code on failure
+int pdal_read_binary_stream_progressive(
+    const std::string& reader_name_backup,
+    const std::string& filename,
+    size_t chunkSize,
+    ProgressCallback onChunk,
+    void* context,
+    PDALBounds& bbox);
+
 // Function to destroy the PDAL Pipeline and release resources
 void pdal_pipeline_destroy(PDALPipeline pipeline);
 
