@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftPDAL}",
+            "name": "Debug OctreeRenderingExample",
+            "target": "OctreeRenderingExample",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug OctreeRenderingExample"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftPDAL}",
+            "name": "Release OctreeRenderingExample",
+            "target": "OctreeRenderingExample",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release OctreeRenderingExample"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftPDAL}",
+            "name": "Debug MetalOctreeViewer",
+            "target": "MetalOctreeViewer",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug MetalOctreeViewer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftPDAL}",
+            "name": "Release MetalOctreeViewer",
+            "target": "MetalOctreeViewer",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release MetalOctreeViewer"
+        }
+    ]
+}
