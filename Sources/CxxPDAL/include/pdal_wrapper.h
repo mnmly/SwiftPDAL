@@ -77,7 +77,13 @@ typedef struct {
 } ChunkData;
 
 
-int pdal_load_info(const std::string& reader_name_backup, const std::string& filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox);
+// Opaque pointer to a PointView (for reusing loaded point data)
+typedef void* PDALPointViewPtr;
+
+// Load file info and retain the PointViewPtr for later streaming
+// Returns 0 on success, negative error code on failure
+// IMPORTANT: You must call pdal_free_point_view() when done to free the PointViewPtr
+int pdal_load_info(const std::string& reader_name_backup, const std::string& filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PDALPointViewPtr* outView);
 
 
 // C-compatible callback function type for streaming chunks with context pointer
@@ -107,6 +113,23 @@ int pdal_read_binary_stream_progressive(
     ProgressCallback onChunk,
     void* context,
     PDALBounds& bbox);
+
+// Streaming reader that reuses a pre-loaded PointViewPtr from pdal_load_info
+// This avoids re-reading the file - use this after calling pdal_load_info
+// Parameters:
+//   view: PointViewPtr obtained from pdal_load_info
+//   chunkSize: Number of points per chunk (e.g., 10000)
+//   onChunk: Callback function called for each chunk
+//   context: User context pointer passed to callback
+// Returns: 0 on success, negative error code on failure
+int pdal_read_binary_stream_from_view(
+    PDALPointViewPtr view,
+    size_t chunkSize,
+    ProgressCallback onChunk,
+    void* context);
+
+// Free a PointViewPtr obtained from pdal_load_info
+void pdal_free_point_view(PDALPointViewPtr view);
 
 // Function to destroy the PDAL Pipeline and release resources
 void pdal_pipeline_destroy(PDALPipeline pipeline);

@@ -221,7 +221,10 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
     public let chunkSize: Int
 
     private let boundsLock = NSLock()
-    
+
+    // Retained PointViewPtr from loadInfo (to avoid re-reading file)
+    private var pointViewPtr: UnsafeMutableRawPointer? = nil
+
     //
     public var pointCount: Int = 0
     public var bounds: Bounds = .init(min: .zero, max: .zero)
@@ -229,7 +232,7 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
     public var size: Int = 0
     public var stride: Int = 0
     public var dimensions: [PDALDimensionInfo] = []
-    
+
     public init(
         filePath: String,
         readerName: String = "readers.text",
@@ -239,20 +242,28 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
         self.readerName = readerName
         self.chunkSize = chunkSize
     }
+
+    deinit {
+        // Clean up the retained PointViewPtr if it exists
+        if let viewPtr = pointViewPtr {
+            pdal_free_point_view(viewPtr)
+        }
+    }
     
     public func loadInfo(readerName: String = "readers.text") throws {
-        
+
         let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
         let paths = PointCloud.getPaths(isTesting: isTesting)
         setenv("PROJ_DATA", paths.projDBURL, 1)
         setenv("PDAL_DRIVER_PATH", paths.driversURL, 1)
-        
+
         var outCount: Int = 0
         var outStride: Int = 0
         var dimList: UnsafeMutablePointer<PDALDimensionInfo>?
         var dimCount: Int = 0
         var bbox = PDALBounds()
-        
+        var outView: UnsafeMutableRawPointer? = nil
+
         let result = pdal_load_info(
                     std.string(readerName),
                     std.string(filePath),
@@ -260,7 +271,8 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
                     &outStride,
                     &dimList,
                     &dimCount,
-                    &bbox
+                    &bbox,
+                    &outView
                 )
 
         guard result == 0 else {
@@ -277,11 +289,14 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
         } else {
             []
         }
-        
+
         self.stride = outStride
         self.pointCount = outCount
         self.dimensions = dimensions
         self.bounds = bounds
+
+        // Retain the PointViewPtr for later streaming
+        self.pointViewPtr = outView
     }
 
     /// Stream point cloud chunks progressively
@@ -290,24 +305,40 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
     /// Example:
     /// ```swift
     /// let stream = StreamingPointCloud(filePath: path)
+    /// try stream.loadInfo()  // Load metadata first
     /// for try await progress in stream.load() {
     ///     print("Progress: \(progress.chunk.totalPointsSoFar) points")
     ///     if progress.chunk.isComplete {
-    ///         print("Bounds: \(stream.loadedBounds)")
+    ///         print("Bounds: \(stream.bounds)")
     ///     }
     /// }
     /// ```
     public func load() -> AsyncThrowingStream<StreamingProgress, Error> {
         AsyncThrowingStream { continuation in
-            Task.detached { [filePath, readerName, chunkSize, weak self] in
+            // Capture the viewPtr before entering the Task to ensure it stays alive
+            let capturedViewPtr = self.pointViewPtr
+
+            Task.detached { [filePath, readerName, chunkSize] in
                 do {
-                    let bounds = try Self.readStreamingInternal(
-                        from: filePath,
-                        readerName: readerName,
-                        chunkSize: chunkSize
-                    ) { progress in
-                        continuation.yield(progress)
-                        return !Task.isCancelled
+                    // If we have a retained PointViewPtr, use it (avoids re-reading file)
+                    if let viewPtr = capturedViewPtr {
+                        try Self.readStreamingFromView(
+                            viewPtr: viewPtr,
+                            chunkSize: chunkSize
+                        ) { progress in
+                            continuation.yield(progress)
+                            return !Task.isCancelled
+                        }
+                    } else {
+                        // Fallback: read from file (legacy behavior)
+                        _ = try Self.readStreamingInternal(
+                            from: filePath,
+                            readerName: readerName,
+                            chunkSize: chunkSize
+                        ) { progress in
+                            continuation.yield(progress)
+                            return !Task.isCancelled
+                        }
                     }
                     continuation.finish()
                 } catch {
@@ -442,6 +473,98 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
             min: simd_float3(bbox.min_x, bbox.min_y, bbox.min_z),
             max: simd_float3(bbox.max_x, bbox.max_y, bbox.max_z)
         )
+    }
+
+    private static func readStreamingFromView(
+        viewPtr: UnsafeMutableRawPointer,
+        chunkSize: Int,
+        onProgress: @escaping (StreamingProgress) -> Bool
+    ) throws {
+        // Box to hold our Swift closure and mutable state
+        final class CallbackBox {
+            var onProgress: (StreamingProgress) -> Bool
+            var savedDimensions: [PDALDimensionInfo]?
+
+            init(onProgress: @escaping (StreamingProgress) -> Bool) {
+                self.onProgress = onProgress
+            }
+
+            func handle(chunkData: ChunkData, dimInfo: UnsafePointer<PDALDimensionInfo>?, dimCount: Int) -> Bool {
+                // Save dimensions on first call
+                if savedDimensions == nil, dimCount > 0 {
+                    savedDimensions = Array(UnsafeBufferPointer(start: dimInfo, count: dimCount))
+                }
+
+                let chunk = PointCloudChunk(from: chunkData)
+                let progress = StreamingProgress(
+                    chunk: chunk,
+                    dimensions: savedDimensions ?? []
+                )
+
+                return onProgress(progress)
+            }
+        }
+
+        final class CallbackContext {
+            let box: CallbackBox
+            var dimensions: [PDALDimensionInfo] = []
+            init(box: CallbackBox) {
+                self.box = box
+            }
+        }
+
+        let box = CallbackBox(onProgress: onProgress)
+        let context = CallbackContext(box: box)
+        let contextPtr = Unmanaged.passRetained(context).toOpaque()
+
+        defer {
+            Unmanaged<CallbackContext>.fromOpaque(contextPtr).release()
+        }
+
+        let callback: @convention(c) (
+            UnsafePointer<CChar>?,
+            Int,
+            Int,
+            Bool,
+            Int,
+            Int,
+            UnsafeMutableRawPointer?
+        ) -> Bool = { data, pointCount, stride, isComplete, totalPointsSoFar, estimatedTotalPoints, ctx in
+            guard let ctx = ctx else {
+                return false
+            }
+            let chunkData = ChunkData(
+                data: data,
+                pointCount: pointCount,
+                stride: stride,
+                isComplete: isComplete,
+                totalPointsSoFar: totalPointsSoFar,
+                estimatedTotalPoints: estimatedTotalPoints
+            )
+            let context = Unmanaged<CallbackContext>.fromOpaque(ctx).takeUnretainedValue()
+            return context.box.handle(chunkData: chunkData, dimInfo: nil, dimCount: context.dimensions.count)
+        }
+
+        let result = pdal_read_binary_stream_from_view(
+            viewPtr,
+            chunkSize,
+            callback,
+            contextPtr
+        )
+
+        guard result == 0 else {
+            let errorMessage: String
+            switch result {
+            case -1: errorMessage = "Not implemented on this platform"
+            case -2: errorMessage = "PDAL error occurred"
+            case -3: errorMessage = "Standard exception occurred"
+            case -7: errorMessage = "Invalid callback"
+            case -8: errorMessage = "Invalid chunk size"
+            case -9: errorMessage = "Invalid view pointer"
+            default: errorMessage = "Unknown error code: \(result)"
+            }
+            throw PointCloudError.streamingFailed("Failed to stream from view: \(errorMessage)")
+        }
     }
 }
 
