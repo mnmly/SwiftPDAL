@@ -76,11 +76,20 @@ typedef struct {
     size_t estimatedTotalPoints;// Estimated total (0 if unknown)
 } ChunkData;
 
-// Callback function type for streaming chunks with context pointer
+
+int pdal_load_info(const std::string& reader_name_backup, const std::string& filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox);
+
+
+// C-compatible callback function type for streaming chunks with context pointer
 // Returns: true to continue loading, false to cancel
-typedef bool (*ProgressCallback)(const ChunkData& chunk,
-                                  const PDALDimensionInfo* dimInfo,
-                                  size_t dimCount,
+// Using raw parameters instead of ChunkData struct for Swift @convention(c) compatibility
+// Note: Dimension info is retrieved separately via context, not passed in each callback
+typedef bool (*ProgressCallback)(const char* data,
+                                  size_t pointCount,
+                                  size_t stride,
+                                  bool isComplete,
+                                  size_t totalPointsSoFar,
+                                  size_t estimatedTotalPoints,
                                   void* context);
 
 // Streaming reader function - calls callback for each chunk of points
