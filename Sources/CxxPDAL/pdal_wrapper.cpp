@@ -163,13 +163,13 @@ static size_t createDimensionSpecs(
     for (size_t i = 0; i < dims.size(); i++) {
         auto dim = dims[i];
         specs[i].sourceType = layout->dimType(dim);
+        specs[i].outputType = specs[i].sourceType;
         specs[i].name = layout->dimName(dim);
         specs[i].offset = currentOffset;
         if (specs[i].sourceType == Dimension::Type::Double) {
-            specs[i].outputSize = Dimension::size(Dimension::Type::Float);
-        } else {
-            specs[i].outputSize = layout->dimSize(dim);
+            specs[i].outputType = Dimension::Type::Float;
         }
+        specs[i].outputSize = Dimension::size(specs[i].outputType);
         currentOffset += specs[i].outputSize;
     }
 
@@ -230,13 +230,9 @@ int pdal_read_binary(const std::string& reader_name_backup, const std::string& f
             for (size_t dimIdx = 0; dimIdx < dims.size(); ++dimIdx) {
                 auto dimId = dims[dimIdx];
                 auto name = specs[dimIdx].name;
-                auto sourceType = specs[dimIdx].sourceType;
+                auto outputType = specs[dimIdx].outputType;
                 char* destPtr = pointBase + specs[dimIdx].offset;
-                if (sourceType == Dimension::Type::Double) {
-                    view->getField(destPtr, dimId, Dimension::Type::Float, pointIdx);
-                } else {
-                    view->getField(destPtr, dimId, sourceType, pointIdx);
-                }
+                view->getField(destPtr, dimId, outputType, pointIdx);
             }
         }
         *outData = storage;
@@ -367,15 +363,13 @@ public:
         for (auto dim : dims) {
             PDALDimensionInfo info;
             info.sourceType = layout->dimType(dim);
+            info.outputType = info.sourceType;
             info.name = layout->dimName(dim);
             info.offset = currentOffset;
-
-            // Convert Double to Float for consistency with pdal_read_binary
             if (info.sourceType == Dimension::Type::Double) {
-                info.outputSize = Dimension::size(Dimension::Type::Float);
-            } else {
-                info.outputSize = layout->dimSize(dim);
+                info.outputType = Dimension::Type::Float;
             }
+            info.outputSize = Dimension::size(info.outputType);
             currentOffset += info.outputSize;
             dimSpecs.push_back(info);
         }
@@ -405,13 +399,7 @@ public:
             auto& spec = dimSpecs[dimIdx];
             char* destPtr = pointBase + spec.offset;
             auto dimId = dimIds[dimIdx];
-
-            // Handle Double->Float conversion
-            if (spec.sourceType == Dimension::Type::Double) {
-                point.getField(destPtr, dimId, Dimension::Type::Float);
-            } else {
-                point.getField(destPtr, dimId, spec.sourceType);
-            }
+            point.getField(destPtr, dimId, spec.outputType);
         }
 
         currentPointIndex++;
@@ -613,14 +601,9 @@ int pdal_read_binary_stream_from_view(
 
                 for (size_t dimIdx = 0; dimIdx < dims.size(); ++dimIdx) {
                     auto dimId = dims[dimIdx];
-                    auto sourceType = specs[dimIdx].sourceType;
+                    auto outputType = specs[dimIdx].outputType;
                     char* destPtr = pointBase + specs[dimIdx].offset;
-
-                    if (sourceType == Dimension::Type::Double) {
-                        view->getField(destPtr, dimId, Dimension::Type::Float, pointIdx);
-                    } else {
-                        view->getField(destPtr, dimId, sourceType, pointIdx);
-                    }
+                    view->getField(destPtr, dimId, outputType, pointIdx);
                 }
             }
 

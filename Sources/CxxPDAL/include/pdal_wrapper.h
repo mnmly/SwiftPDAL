@@ -37,6 +37,7 @@
 
 typedef struct {
     pdal::Dimension::Type sourceType;
+    pdal::Dimension::Type outputType;
     std::string name;
     size_t outputSize;
     size_t offset;

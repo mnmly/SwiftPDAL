@@ -9,7 +9,8 @@ public protocol PointCloudData {
     var bounds: Bounds { get }
     var stride: Int { get }
     var dimensions: [PDALDimensionInfo] { get }
-    
+    var data: UnsafeRawPointer { get }
+    var mtlBuffer: MTLBuffer? { get }
     mutating func makeBuffer(device: MTLDevice, options: MTLResourceOptions) -> MTLBuffer?
 }
     
@@ -27,6 +28,8 @@ public struct PointCloud: PointCloudData {
     public let size: Int
     public let stride: Int
     public let dimensions: [PDALDimensionInfo]
+    
+    public var mtlBuffer: MTLBuffer?
 
     private var dataFreed: Bool = false
 
@@ -146,7 +149,8 @@ public struct PointCloud: PointCloudData {
         if buffer != nil {
             self.dataFreed = true
         }
-
+        
+        mtlBuffer = buffer
         return buffer
     }
 }
@@ -216,6 +220,7 @@ public struct StreamingProgress: Sendable {
 
 /// Handles streaming point cloud loading with progressive updates
 public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
+    
     public let filePath: String
     public let readerName: String
     public let chunkSize: Int
@@ -228,7 +233,15 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
     //
     public var pointCount: Int = 0
     public var bounds: Bounds = .init(min: .zero, max: .zero)
-    public var data: UnsafeRawPointer? = nil
+    public var data: UnsafeRawPointer {
+        if let mtlBuffer {
+            return UnsafeRawPointer(mtlBuffer.contents())
+        }
+        // Return a null pointer if no buffer exists yet
+        return UnsafeRawPointer(bitPattern: 0)!
+    }
+    
+    public var mtlBuffer: MTLBuffer?
     public var size: Int = 0
     public var stride: Int = 0
     public var dimensions: [PDALDimensionInfo] = []
@@ -351,7 +364,8 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
     public func makeBuffer(device: any MTLDevice, options: MTLResourceOptions) -> (any MTLBuffer)? {
         let totalByteLength = pointCount * stride
         let options: MTLResourceOptions = .storageModeShared
-        return device.makeBuffer(length: totalByteLength, options: options)
+        mtlBuffer = device.makeBuffer(length: totalByteLength, options: options)
+        return mtlBuffer
     }
     
 
@@ -674,26 +688,26 @@ public enum PDALDimensionTypeHelper {
 extension PDALDimensionInfo {
     /// Returns the human-readable name for this dimension's type
     public var typeName: String {
-        PDALDimensionTypeHelper.name(for: sourceType)
+        PDALDimensionTypeHelper.name(for: outputType)
     }
 
     /// Returns the size in bytes for this dimension's type
     public var typeByteSize: Int {
-        PDALDimensionTypeHelper.byteSize(for: sourceType)
+        PDALDimensionTypeHelper.byteSize(for: outputType)
     }
 
     /// Returns whether this dimension's type is floating point
     public var isFloatingPoint: Bool {
-        PDALDimensionTypeHelper.isFloatingPoint(sourceType)
+        PDALDimensionTypeHelper.isFloatingPoint(outputType)
     }
 
     /// Returns whether this dimension's type is a signed integer
     public var isSignedInteger: Bool {
-        PDALDimensionTypeHelper.isSignedInteger(sourceType)
+        PDALDimensionTypeHelper.isSignedInteger(outputType)
     }
 
     /// Returns whether this dimension's type is an unsigned integer
     public var isUnsignedInteger: Bool {
-        PDALDimensionTypeHelper.isUnsignedInteger(sourceType)
+        PDALDimensionTypeHelper.isUnsignedInteger(outputType)
     }
 }
