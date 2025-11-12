@@ -589,3 +589,111 @@ extension PointCloud {
         )
     }
 }
+
+// MARK: - PDAL Dimension Type Helpers
+
+/// Helper utilities for working with PDAL Dimension Types
+public enum PDALDimensionTypeHelper {
+
+    /// Returns the human-readable name for a PDAL dimension type
+    public static func name(for type: pdal.Dimension.`Type`) -> String {
+        switch type {
+        case .None:
+            return "None"
+        case .Unsigned8:
+            return "UInt8"
+        case .Signed8:
+            return "Int8"
+        case .Unsigned16:
+            return "UInt16"
+        case .Signed16:
+            return "Int16"
+        case .Unsigned32:
+            return "UInt32"
+        case .Signed32:
+            return "Int32"
+        case .Unsigned64:
+            return "UInt64"
+        case .Signed64:
+            return "Int64"
+        case .Float:
+            return "Float"
+        case .Double:
+            return "Double"
+        default:
+            return "Unknown(\(type.rawValue))"
+        }
+    }
+
+    /// Returns the size in bytes for a PDAL dimension type
+    public static func byteSize(for type: pdal.Dimension.`Type`) -> Int {
+        switch type {
+        case .None:
+            return 0
+        case .Unsigned8, .Signed8:
+            return 1
+        case .Unsigned16, .Signed16:
+            return 2
+        case .Unsigned32, .Signed32, .Float:
+            return 4
+        case .Unsigned64, .Signed64, .Double:
+            return 8
+        default:
+            return 0
+        }
+    }
+
+    /// Returns whether the type is a floating point type
+    public static func isFloatingPoint(_ type: pdal.Dimension.`Type`) -> Bool {
+        return type == .Float || type == .Double
+    }
+
+    /// Returns whether the type is a signed integer type
+    public static func isSignedInteger(_ type: pdal.Dimension.`Type`) -> Bool {
+        switch type {
+        case .Signed8, .Signed16, .Signed32, .Signed64:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Returns whether the type is an unsigned integer type
+    public static func isUnsignedInteger(_ type: pdal.Dimension.`Type`) -> Bool {
+        switch type {
+        case .Unsigned8, .Unsigned16, .Unsigned32, .Unsigned64:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+// MARK: - PDALDimensionInfo Extension
+
+extension PDALDimensionInfo {
+    /// Returns the human-readable name for this dimension's type
+    public var typeName: String {
+        PDALDimensionTypeHelper.name(for: sourceType)
+    }
+
+    /// Returns the size in bytes for this dimension's type
+    public var typeByteSize: Int {
+        PDALDimensionTypeHelper.byteSize(for: sourceType)
+    }
+
+    /// Returns whether this dimension's type is floating point
+    public var isFloatingPoint: Bool {
+        PDALDimensionTypeHelper.isFloatingPoint(sourceType)
+    }
+
+    /// Returns whether this dimension's type is a signed integer
+    public var isSignedInteger: Bool {
+        PDALDimensionTypeHelper.isSignedInteger(sourceType)
+    }
+
+    /// Returns whether this dimension's type is an unsigned integer
+    public var isUnsignedInteger: Bool {
+        PDALDimensionTypeHelper.isUnsignedInteger(sourceType)
+    }
+}
