@@ -264,7 +264,21 @@ int pdal_read_binary(const std::string& reader_name_backup, const std::string& f
 #include <pdal/Streamable.hpp>
 #include <pdal/filters/StreamCallbackFilter.hpp>
 
-int pdal_load_info(const std::string& reader_name_backup, const std::string& filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox){
+// Structure to hold PointView and PointTable together
+// CRITICAL: PointTable MUST remain alive for PointView to be valid
+// The PointView references memory owned by the PointTable
+struct PointViewContext {
+    pdal::PointViewPtr view;
+    std::shared_ptr<pdal::PointTable> table;  // Keep the table alive!
+    pdal::PointLayoutPtr layout;
+
+    PointViewContext(pdal::PointViewPtr v, std::shared_ptr<pdal::PointTable> t)
+        : view(v), table(t), layout(v->layout()) {
+        std::cerr << "DEBUG: PointViewContext created with " << layout->dims().size() << " dimensions" << std::endl;
+    }
+};
+
+int pdal_load_info(const std::string& reader_name_backup, const std::string& filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PDALPointViewPtr* outView){
     try {
         StageFactory factory;
         Stage* filter = nullptr;
@@ -272,14 +286,17 @@ int pdal_load_info(const std::string& reader_name_backup, const std::string& fil
 
         Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter);
         if (!finalStage) return -4;
-        
-        PointTable table;
-        finalStage->prepare(table);
-        PointViewSet viewSet = finalStage->execute(table);
-        
+
+        // CRITICAL: Use shared_ptr to keep the table alive
+        auto table = std::make_shared<PointTable>();
+        finalStage->prepare(*table);
+        PointViewSet viewSet = finalStage->execute(*table);
+
         if (viewSet.empty()) return -5;
         PointViewPtr view = *viewSet.begin();
         pdal::PointLayoutPtr layout = view->layout();
+
+        std::cerr << "DEBUG: pdal_load_info - layout has " << layout->dims().size() << " dimensions" << std::endl;
 
         PDALDimensionInfo* specs;
         size_t stride = createDimensionSpecs(layout, &specs, dimCount);
@@ -290,11 +307,21 @@ int pdal_load_info(const std::string& reader_name_backup, const std::string& fil
         *outCount = pointCount;
         *outStride = stride;
         *dimList = specs;
+
+        // Return the PointView if requested (for later streaming)
+        if (outView) {
+            // CRITICAL: Keep both view AND table alive
+            PointViewContext* ctx = new PointViewContext(view, table);
+            *outView = static_cast<PDALPointViewPtr>(ctx);
+            std::cerr << "DEBUG: Created context and returning view pointer" << std::endl;
+        }
+
         return 0;
     } catch (const pdal_error& e) {
         std::cerr << "PDAL Error: " << e.what() << std::endl;
         return -2;
     } catch (const std::exception& e) {
+        std::cerr << "Error in pdal_load_info: " << e.what() << std::endl;
         return -3;
     } catch (...) {
         return -6;
@@ -533,6 +560,112 @@ int pdal_read_binary_stream_progressive(
     }
 }
 
+// New function: Stream from an existing PointViewPtr (avoids re-reading the file)
+int pdal_read_binary_stream_from_view(
+    PDALPointViewPtr viewPtr,
+    size_t chunkSize,
+    ProgressCallback onChunk,
+    void* context)
+{
+    try {
+        using namespace pdal;
+
+        if (!viewPtr) {
+            return -9; // Invalid view pointer
+        }
+        if (!onChunk) {
+            return -7; // Invalid callback
+        }
+        if (chunkSize == 0) {
+            return -8; // Invalid chunk size
+        }
+
+        // Cast back to PointViewContext
+        PointViewContext* ctx = static_cast<PointViewContext*>(viewPtr);
+        PointViewPtr view = ctx->view;
+        pdal::PointLayoutPtr layout = ctx->layout;
+
+        if (!view) {
+            return -9; // Invalid view
+        }
+
+        // Build dimension specs
+        PDALDimensionInfo* specs;
+        size_t dimCount;
+        size_t stride = createDimensionSpecs(layout, &specs, &dimCount);
+        auto dims = layout->dims();
+
+        size_t totalPoints = view->size();
+        size_t currentPoint = 0;
+
+        // Allocate chunk buffer
+        size_t bufferSize = chunkSize * stride;
+        std::vector<char> chunkBuffer(bufferSize);
+
+        while (currentPoint < totalPoints) {
+            size_t pointsInChunk = std::min(chunkSize, totalPoints - currentPoint);
+            std::memset(chunkBuffer.data(), 0, chunkBuffer.size());
+
+            // Copy points into chunk buffer
+            for (size_t i = 0; i < pointsInChunk; ++i) {
+                size_t pointIdx = currentPoint + i;
+                char* pointBase = chunkBuffer.data() + (i * stride);
+
+                for (size_t dimIdx = 0; dimIdx < dims.size(); ++dimIdx) {
+                    auto dimId = dims[dimIdx];
+                    auto sourceType = specs[dimIdx].sourceType;
+                    char* destPtr = pointBase + specs[dimIdx].offset;
+
+                    if (sourceType == Dimension::Type::Double) {
+                        view->getField(destPtr, dimId, Dimension::Type::Float, pointIdx);
+                    } else {
+                        view->getField(destPtr, dimId, sourceType, pointIdx);
+                    }
+                }
+            }
+
+            // Call the callback
+            bool isComplete = (currentPoint + pointsInChunk >= totalPoints);
+            bool shouldContinue = onChunk(
+                chunkBuffer.data(),
+                pointsInChunk,
+                stride,
+                isComplete,
+                currentPoint + pointsInChunk,
+                totalPoints,
+                context
+            );
+
+            currentPoint += pointsInChunk;
+
+            if (!shouldContinue) {
+                delete[] specs;
+                return 0; // User cancelled
+            }
+        }
+
+        delete[] specs;
+        return 0;
+
+    } catch (const pdal::pdal_error& e) {
+        std::cerr << "PDAL Error: " << e.what() << std::endl;
+        return -2;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return -3;
+    } catch (...) {
+        return -6;
+    }
+}
+
+// Free the PointViewPtr
+void pdal_free_point_view(PDALPointViewPtr viewPtr) {
+    if (viewPtr) {
+        PointViewContext* ctx = static_cast<PointViewContext*>(viewPtr);
+        delete ctx;
+    }
+}
+
 #else
 // iOS stub implementation
 int pdal_read_binary_stream_progressive(
@@ -544,5 +677,18 @@ int pdal_read_binary_stream_progressive(
     PDALBounds& bbox)
 {
     return -1; // Not implemented on iOS
+}
+
+int pdal_read_binary_stream_from_view(
+    PDALPointViewPtr viewPtr,
+    size_t chunkSize,
+    ProgressCallback onChunk,
+    void* context)
+{
+    return -1; // Not implemented on iOS
+}
+
+void pdal_free_point_view(PDALPointViewPtr viewPtr) {
+    // No-op on iOS
 }
 #endif
