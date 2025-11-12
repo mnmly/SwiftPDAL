@@ -52,8 +52,12 @@ struct StreamingExample {
             chunkSize: 10000  // Load 10k points at a time
         )
 
+        // Load metadata first to get dimensions
+        try stream.loadInfo(readerName: "readers.las")
+
         var totalPoints = 0
         var chunkCount = 0
+        var firstStreamingPoints: [(x: Float, y: Float, z: Float)] = []
 
         for try await progress in stream.load() {
             chunkCount += 1
@@ -63,18 +67,91 @@ struct StreamingExample {
             print("   Chunk \(chunkCount): \(progress.chunk.pointCount) points loaded")
             print("   Total so far: \(totalPoints) points")
 
+            // Capture first 10 points from streaming (from first chunk only)
+            if firstStreamingPoints.isEmpty && progress.chunk.pointCount > 0 {
+                let data = progress.chunk.data
+                let stride = progress.chunk.stride
+                let pointsToCapture = min(10, progress.chunk.pointCount)
+
+                // Find X, Y, Z dimensions - try both progress.dimensions and stream.dimensions
+                let dims = !progress.dimensions.isEmpty ? progress.dimensions : stream.dimensions
+                print("   📍 Dimension count: \(dims.count), Names: \(dims.map { String($0.name) })")
+
+                let xDim = dims.first { String($0.name) == "X" }
+                let yDim = dims.first { String($0.name) == "Y" }
+                let zDim = dims.first { String($0.name) == "Z" }
+
+                if let xDim, let yDim, let zDim {
+                    print("   📍 X offset: \(xDim.offset), Y offset: \(yDim.offset), Z offset: \(zDim.offset), Stride: \(stride)")
+                    for i in 0..<pointsToCapture {
+                        let pointOffset = i * stride
+                        let x = data.load(fromByteOffset: pointOffset + xDim.offset, as: Float.self)
+                        let y = data.load(fromByteOffset: pointOffset + yDim.offset, as: Float.self)
+                        let z = data.load(fromByteOffset: pointOffset + zDim.offset, as: Float.self)
+                        firstStreamingPoints.append((x, y, z))
+                    }
+                } else {
+                    print("   ⚠️  Could not find X, Y, Z dimensions")
+                    print("   Available dimensions: \(dims.map { String($0.name) })")
+                }
+            }
+
             if progress.chunk.isComplete {
                 print("   ✅ Loading complete!")
             }
         }
 
-        // Access final bounds
-        if let bounds = stream.loadedBounds {
-            print("\n   Final Results:")
-            print("   └─ Total points: \(totalPoints)")
-            print("   └─ Total chunks: \(chunkCount)")
-            print("   └─ Bounds: [\(bounds.min.x), \(bounds.min.y), \(bounds.min.z)]")
-            print("               to [\(bounds.max.x), \(bounds.max.y), \(bounds.max.z)]")
+        print("\n   Final Results:")
+        print("   └─ Total points: \(totalPoints)")
+        print("   └─ Total chunks: \(chunkCount)")
+        print("   └─ Bounds: [\(stream.bounds.min.x), \(stream.bounds.min.y), \(stream.bounds.min.z)]")
+        print("               to [\(stream.bounds.max.x), \(stream.bounds.max.y), \(stream.bounds.max.z)]")
+
+        // Now load with regular PointCloud.read and compare
+        print("\n   📊 Comparing with regular PointCloud.read()...")
+        var regularCloud = try PointCloud.read(from: path, readerName: "readers.las")
+        defer { regularCloud.cleanup() }
+        print("   Regular cloud point count: \(regularCloud.pointCount)")
+
+        // Find X, Y, Z dimensions in regular cloud
+        let dims = regularCloud.dimensions
+        print("   Regular cloud dimensions: \(dims.map { String($0.name) })")
+        let xDim = dims.first { String($0.name) == "X" }
+        let yDim = dims.first { String($0.name) == "Y" }
+        let zDim = dims.first { String($0.name) == "Z" }
+
+        if let xDim, let yDim, let zDim {
+            print("   Regular X offset: \(xDim.offset), Y offset: \(yDim.offset), Z offset: \(zDim.offset), Stride: \(regularCloud.stride)")
+            print("\n   First 10 points comparison:")
+            print("   ┌─────┬─────────────────────────────────┬─────────────────────────────────┬───────┐")
+            print("   │ Idx │          Streaming              │           Regular               │ Match │")
+            print("   ├─────┼─────────────────────────────────┼─────────────────────────────────┼───────┤")
+
+            var allMatch = true
+            for i in 0..<min(10, firstStreamingPoints.count) {
+                let pointOffset = i * regularCloud.stride
+                let regX = regularCloud.data.load(fromByteOffset: pointOffset + xDim.offset, as: Float.self)
+                let regY = regularCloud.data.load(fromByteOffset: pointOffset + yDim.offset, as: Float.self)
+                let regZ = regularCloud.data.load(fromByteOffset: pointOffset + zDim.offset, as: Float.self)
+
+                let stream = firstStreamingPoints[i]
+                let matches = abs(stream.x - regX) < 0.0001 &&
+                             abs(stream.y - regY) < 0.0001 &&
+                             abs(stream.z - regZ) < 0.0001
+
+                allMatch = allMatch && matches
+                let matchIcon = matches ? "✓" : "✗"
+
+                print(String(format: "   │ %-3d │ (%.3f, %.3f, %.3f) │ (%.3f, %.3f, %.3f) │   %@   │",
+                    i, stream.x, stream.y, stream.z, regX, regY, regZ, matchIcon))
+            }
+            print("   └─────┴─────────────────────────────────┴─────────────────────────────────┴───────┘")
+
+            if allMatch {
+                print("   ✅ All points match! Streaming is fetching data correctly.")
+            } else {
+                print("   ⚠️  Some points don't match. There may be an issue.")
+            }
         }
     }
 
@@ -178,12 +255,10 @@ struct StreamingExample {
         }
 
         // Get final bounds (calculated by PDAL during streaming)
-        if let bounds = stream.loadedBounds {
-            print("\n   ✅ Memory-efficient processing complete")
-            print("   └─ Processed \(totalProcessed) points using streaming")
-            print("   └─ Peak memory: only ~\(stream.chunkSize) points in memory at once")
-            print("   └─ Final bounds: [\(bounds.min.x), \(bounds.min.y), \(bounds.min.z)]")
-        }
+        print("\n   ✅ Memory-efficient processing complete")
+        print("   └─ Processed \(totalProcessed) points using streaming")
+        print("   └─ Peak memory: only ~\(stream.chunkSize) points in memory at once")
+        print("   └─ Final bounds: [\(stream.bounds.min.x), \(stream.bounds.min.y), \(stream.bounds.min.z)]")
     }
 }
 

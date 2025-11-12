@@ -86,73 +86,123 @@ int pdal_pipeline_get_metadata_json(PDALPipeline pipeline_ptr, char* buffer, siz
 
 void pdal_free_data(const char* data, PDALDimensionInfo* dimList) { delete[] data; delete[] dimList; }
 
-int pdal_read_binary(const std::string& reader_name_backup, const std::string& filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox){
-    
-    try {
-        
-        StageFactory factory;
-        std::string inferredReaderName = factory.inferReaderDriver(filename);
-        std::string reader_name = reader_name_backup;
-        if (!inferredReaderName.empty()) {
-            reader_name = inferredReaderName;
+// Helper function to create and configure the PDAL stage pipeline
+static Stage* createConfiguredStage(
+    const std::string& reader_name_backup,
+    const std::string& filename,
+    StageFactory& factory,
+    Stage** outFilter,
+    Stage** outFlipFilter)
+{
+    std::string inferredReaderName = factory.inferReaderDriver(filename);
+    std::string reader_name = reader_name_backup;
+    if (!inferredReaderName.empty()) {
+        reader_name = inferredReaderName;
+    }
+
+    Stage* reader = factory.createStage(reader_name);
+    if (!reader) return nullptr;
+
+    Options options;
+    options.add("filename", filename);
+    if (filename.ends_with(".xyz")) {
+        options.add("skip", 0);
+        options.add("separator", " ");
+        options.add("header", "X Y Z Red Green Blue");
+    }
+
+    bool needsTransform = filename.ends_with(".xyz") || reader_name == "readers.ply";
+    reader->setOptions(options);
+
+    Stage* finalStage = reader;
+
+    if (needsTransform) {
+        *outFlipFilter = factory.createStage("filters.transformation");
+        if (!*outFlipFilter) return nullptr;
+        Options flipOptions;
+        flipOptions.add("matrix", "1  0  0  0  "    // X unchanged
+                        "0 0  1  0  "    // Y flipped (multiply by -1)
+                        "0  -1  0  0  "    // Z unchanged
+                        "0  0  0  1");    // Homogeneous coordinate
+        (*outFlipFilter)->setOptions(flipOptions);
+        (*outFlipFilter)->setInput(*reader);
+        finalStage = *outFlipFilter;
+    } else if (reader_name == "readers.las") {
+        *outFilter = factory.createStage("filters.reprojection");
+        *outFlipFilter = factory.createStage("filters.transformation");
+        if (!*outFilter || !*outFlipFilter) return nullptr;
+
+        Options filterOptions;
+        filterOptions.add("out_srs", "EPSG:3857");
+        (*outFilter)->setOptions(filterOptions);
+        (*outFilter)->setInput(*reader);
+
+        Options flipOptions;
+        flipOptions.add("matrix", "1  0  0  0  "    // X unchanged
+                        "0 0  1  0  "    // Y flipped (multiply by -1)
+                        "0  -1  0  0  "    // Z unchanged
+                        "0  0  0  1");    // Homogeneous coordinate
+        (*outFlipFilter)->setOptions(flipOptions);
+        (*outFlipFilter)->setInput(**outFilter);
+        finalStage = *outFlipFilter;
+    }
+
+    return finalStage;
+}
+
+// Helper function to create dimension specs and calculate stride
+static size_t createDimensionSpecs(
+    pdal::PointLayoutPtr layout,
+    PDALDimensionInfo** outSpecs,
+    size_t* outDimCount)
+{
+    auto dims = layout->dims();
+    PDALDimensionInfo* specs = new PDALDimensionInfo[dims.size()];
+
+    size_t currentOffset = 0;
+    for (size_t i = 0; i < dims.size(); i++) {
+        auto dim = dims[i];
+        specs[i].sourceType = layout->dimType(dim);
+        specs[i].name = layout->dimName(dim);
+        specs[i].offset = currentOffset;
+        if (specs[i].sourceType == Dimension::Type::Double) {
+            specs[i].outputSize = Dimension::size(Dimension::Type::Float);
+        } else {
+            specs[i].outputSize = layout->dimSize(dim);
         }
-        Stage* reader = factory.createStage(reader_name);
+        currentOffset += specs[i].outputSize;
+    }
+
+    // Calculate stride with 16-byte alignment
+    size_t stride = ((currentOffset + 15) / 16) * 16;
+
+    *outSpecs = specs;
+    *outDimCount = dims.size();
+    return stride;
+}
+
+// Helper function to extract bounds from view
+static void extractBounds(pdal::PointViewPtr view, PDALBounds& bbox) {
+    BOX3D _bbox;
+    view->calculateBounds(_bbox);
+
+    bbox.min_x = _bbox.minx;
+    bbox.min_y = _bbox.miny;
+    bbox.min_z = _bbox.minz;
+    bbox.max_x = _bbox.maxx;
+    bbox.max_y = _bbox.maxy;
+    bbox.max_z = _bbox.maxz;
+}
+
+int pdal_read_binary(const std::string& reader_name_backup, const std::string& filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox){
+
+    try {
+        StageFactory factory;
         Stage* filter = nullptr;
         Stage* flipFilter = nullptr;
-        bool needsTransform = false;
 
-        if (!reader) return -4;
-
-        Options options;
-        options.add("filename", filename);
-        if (filename.ends_with(".xyz")) {
-            options.add("skip", 0);
-            options.add("separator", " ");
-            options.add("header", "X Y Z Red Green Blue");
-        }
-        
-        if (filename.ends_with(".xyz") || reader_name == "readers.ply") {
-            needsTransform = true;
-        }
-        
-//        needsTransform = true;
-        
-        reader->setOptions(options);
-        
-        Stage* finalStage;
-        
-        if (needsTransform) {
-            flipFilter = factory.createStage("filters.transformation");
-            if (!flipFilter) return -4;
-            Options flipOptions;
-            flipOptions.add("matrix", "1  0  0  0  "    // X unchanged
-                            "0 0  1  0  "    // Y flipped (multiply by -1)
-                            "0  -1  0  0  "    // Z unchanged
-                            "0  0  0  1");    // Homogeneous coordinate
-            flipFilter->setOptions(flipOptions);
-            flipFilter->setInput(*reader);  // Connect flip filter after reprojection
-            finalStage = flipFilter;
-        } else if (reader_name == "readers.las") {
-            filter = factory.createStage("filters.reprojection");
-            flipFilter = factory.createStage("filters.transformation");
-            if (!filter || !flipFilter) return -4;
-            
-            Options filterOptions;
-            filterOptions.add("out_srs", "EPSG:3857");
-            filter->setOptions(filterOptions);
-            filter->setInput(*reader);
-            
-            Options flipOptions;
-            flipOptions.add("matrix", "1  0  0  0  "    // X unchanged
-                            "0 0  1  0  "    // Y flipped (multiply by -1)
-                            "0  -1  0  0  "    // Z unchanged
-                            "0  0  0  1");    // Homogeneous coordinate
-            flipFilter->setOptions(flipOptions);
-            flipFilter->setInput(*filter);  // Connect flip filter after reprojection
-            finalStage = flipFilter;
-        } else {
-            finalStage = reader;
-        }
+        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter);
+        if (!finalStage) return -4;
         
         PointTable table;
         finalStage->prepare(table);
@@ -161,44 +211,19 @@ int pdal_read_binary(const std::string& reader_name_backup, const std::string& f
         if (viewSet.empty()) return -5;
         PointViewPtr view = *viewSet.begin();
         pdal::PointLayoutPtr layout = view->layout();
-        
-        auto dims = layout->dims();
 
-        PDALDimensionInfo* specs = new PDALDimensionInfo[dims.size()];
+        PDALDimensionInfo* specs;
+        size_t stride = createDimensionSpecs(layout, &specs, dimCount);
 
         size_t pointCount = view->size();
-        size_t currentOffset = 0;
-
-        for (size_t i = 0; i < dims.size(); i++) {
-            auto dim = dims[i];
-            PDALDimensionInfo info;
-            specs[i].sourceType = view->dimType(dim);
-            specs[i].name = view->dimName(dim);
-            specs[i].offset = currentOffset;
-            if (specs[i].sourceType == Dimension::Type::Double) {
-                specs[i].outputSize = Dimension::size(Dimension::Type::Float);
-            } else {
-                specs[i].outputSize = view->dimSize(dim);
-            }
-            currentOffset += specs[i].outputSize;
-        }
-        
-        size_t stride = ((currentOffset + 15) / 16) * 16;
         size_t totalSize = pointCount * stride;
-        
+
         char* storage = new char[totalSize];
         std::memset(storage, 0, totalSize);  // Zero out padding bytes
-        
-        BOX3D _bbox;
-        view->calculateBounds(_bbox);
-        
-        bbox.min_x = _bbox.minx;
-        bbox.min_y = _bbox.miny;
-        bbox.min_z = _bbox.minz;
-        
-        bbox.max_x = _bbox.maxx;
-        bbox.max_y = _bbox.maxy;
-        bbox.max_z = _bbox.maxz;
+
+        extractBounds(view, bbox);
+
+        auto dims = layout->dims();
 
         for (size_t pointIdx = 0; pointIdx < pointCount; ++pointIdx) {
             char* pointBase = storage + (pointIdx * stride);
@@ -219,7 +244,6 @@ int pdal_read_binary(const std::string& reader_name_backup, const std::string& f
         *outCount = pointCount;
         *outStride = stride;
         *dimList = specs;
-        *dimCount = dims.size();
         return 0;
     } catch (const pdal_error& e) {
         std::cerr << "PDAL Error: " << e.what() << std::endl;
@@ -239,6 +263,45 @@ int pdal_read_binary(const std::string& reader_name_backup, const std::string& f
 
 #include <pdal/Streamable.hpp>
 #include <pdal/filters/StreamCallbackFilter.hpp>
+
+int pdal_load_info(const std::string& reader_name_backup, const std::string& filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox){
+    try {
+        StageFactory factory;
+        Stage* filter = nullptr;
+        Stage* flipFilter = nullptr;
+
+        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter);
+        if (!finalStage) return -4;
+        
+        PointTable table;
+        finalStage->prepare(table);
+        PointViewSet viewSet = finalStage->execute(table);
+        
+        if (viewSet.empty()) return -5;
+        PointViewPtr view = *viewSet.begin();
+        pdal::PointLayoutPtr layout = view->layout();
+
+        PDALDimensionInfo* specs;
+        size_t stride = createDimensionSpecs(layout, &specs, dimCount);
+
+        size_t pointCount = view->size();
+        extractBounds(view, bbox);
+
+        *outCount = pointCount;
+        *outStride = stride;
+        *dimList = specs;
+        return 0;
+    } catch (const pdal_error& e) {
+        std::cerr << "PDAL Error: " << e.what() << std::endl;
+        return -2;
+    } catch (const std::exception& e) {
+        return -3;
+    } catch (...) {
+        return -6;
+    }
+}
+
+
 
 class ProgressivePointLoader {
 private:
@@ -329,10 +392,6 @@ public:
 
         // Chunk is full - deliver it
         if (currentPointIndex >= chunkSize) {
-            std::cerr << "DEBUG: About to call callback, chunk=" << currentPointIndex
-                      << " total=" << totalPointsProcessed
-                      << " callback=" << (void*)callback << std::endl;
-
             ChunkData chunk;
             chunk.data = chunkBuffer.data();
             chunk.pointCount = currentPointIndex;
@@ -341,9 +400,15 @@ public:
             chunk.totalPointsSoFar = totalPointsProcessed;
             chunk.estimatedTotalPoints = 0; // Unknown during streaming
 
-            std::cerr << "DEBUG: Calling callback now..." << std::endl;
-            bool shouldContinue = callback(chunk, dimSpecs.data(), dimSpecs.size(), callbackContext);
-            std::cerr << "DEBUG: Callback returned: " << shouldContinue << std::endl;
+            bool shouldContinue = callback(
+                chunk.data,
+                chunk.pointCount,
+                chunk.stride,
+                chunk.isComplete,
+                chunk.totalPointsSoFar,
+                chunk.estimatedTotalPoints,
+                callbackContext
+            );
 
             // Reset for next chunk
             currentPointIndex = 0;
@@ -365,7 +430,15 @@ public:
             chunk.totalPointsSoFar = totalPointsProcessed;
             chunk.estimatedTotalPoints = totalPointsProcessed;
 
-            callback(chunk, dimSpecs.data(), dimSpecs.size(), callbackContext);
+            callback(
+                chunk.data,
+                chunk.pointCount,
+                chunk.stride,
+                chunk.isComplete,
+                chunk.totalPointsSoFar,
+                chunk.estimatedTotalPoints,
+                callbackContext
+            );
         }
     }
 
@@ -377,6 +450,9 @@ public:
     size_t getTotalPoints() const { return totalPointsProcessed; }
 };
 
+
+
+
 int pdal_read_binary_stream_progressive(
     const std::string& reader_name_backup,
     const std::string& filename,
@@ -387,64 +463,16 @@ int pdal_read_binary_stream_progressive(
 {
     try {
         using namespace pdal;
-        
+
         if (!onChunk) return -7; // Invalid callback
         if (chunkSize == 0) return -8; // Invalid chunk size
 
         StageFactory factory;
-        std::string inferredReaderName = factory.inferReaderDriver(filename);
-        std::string reader_name = !inferredReaderName.empty() ?
-            inferredReaderName : reader_name_backup;
-
-        Stage* reader = factory.createStage(reader_name);
-        if (!reader) return -4;
-
-        // Configure reader (matching pdal_read_binary configuration)
-        Options options;
-        options.add("filename", filename);
-        if (filename.ends_with(".xyz")) {
-            options.add("skip", 0);
-            options.add("separator", " ");
-            options.add("header", "X Y Z Red Green Blue");
-        }
-        reader->setOptions(options);
-
-        // Setup transformation pipeline (matching pdal_read_binary logic)
-        Stage* finalStage = reader;
         Stage* filter = nullptr;
         Stage* flipFilter = nullptr;
-        bool needsTransform = filename.ends_with(".xyz") || reader_name == "readers.ply";
 
-        if (needsTransform) {
-            flipFilter = factory.createStage("filters.transformation");
-            if (!flipFilter) return -4;
-            Options flipOptions;
-            flipOptions.add("matrix", "1  0  0  0  "
-                                     "0  0  1  0  "
-                                     "0 -1  0  0  "
-                                     "0  0  0  1");
-            flipFilter->setOptions(flipOptions);
-            flipFilter->setInput(*reader);
-            finalStage = flipFilter;
-        } else if (reader_name == "readers.las") {
-            filter = factory.createStage("filters.reprojection");
-            flipFilter = factory.createStage("filters.transformation");
-            if (!filter || !flipFilter) return -4;
-
-            Options filterOptions;
-            filterOptions.add("out_srs", "EPSG:3857");
-            filter->setOptions(filterOptions);
-            filter->setInput(*reader);
-
-            Options flipOptions;
-            flipOptions.add("matrix", "1  0  0  0  "
-                                     "0  0  1  0  "
-                                     "0 -1  0  0  "
-                                     "0  0  0  1");
-            flipFilter->setOptions(flipOptions);
-            flipFilter->setInput(*filter);
-            finalStage = flipFilter;
-        }
+        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter);
+        if (!finalStage) return -4;
 
         // Create progressive loader
         ProgressivePointLoader loader(chunkSize, onChunk, context);

@@ -3,7 +3,22 @@ import Foundation
 import Metal
 import simd
 
-public struct PointCloud {
+public protocol PointCloudData {
+    var filePath: String { get }
+    var pointCount: Int { get }
+    var bounds: Bounds { get }
+    var stride: Int { get }
+    var dimensions: [PDALDimensionInfo] { get }
+    
+    mutating func makeBuffer(device: MTLDevice, options: MTLResourceOptions) -> MTLBuffer?
+}
+    
+public struct Bounds {
+    public let min: simd_float3
+    public let max: simd_float3
+}
+
+public struct PointCloud: PointCloudData {
 
     public let filePath: String
     public let pointCount: Int
@@ -12,10 +27,6 @@ public struct PointCloud {
     public let size: Int
     public let stride: Int
     public let dimensions: [PDALDimensionInfo]
-    public struct Bounds {
-        public let min: simd_float3
-        public let max: simd_float3
-    }
 
     private var dataFreed: Bool = false
 
@@ -165,15 +176,22 @@ public enum PointCloudError: Error {
 nonisolated(unsafe) private var streamingCallbackGlobal: ((ChunkData, UnsafePointer<PDALDimensionInfo>?, Int) -> Bool)?
 
 public struct PointCloudChunk: @unchecked Sendable {
-    public let data: UnsafeRawPointer
+    private let ownedData: Data  // Owns a copy of the data
     public let pointCount: Int
     public let stride: Int
     public let isComplete: Bool
     public let totalPointsSoFar: Int
     public let estimatedTotalPoints: Int
 
+    public var data: UnsafeRawPointer {
+        ownedData.withUnsafeBytes { $0.baseAddress! }
+    }
+
     init(from chunkData: ChunkData) {
-        self.data = UnsafeRawPointer(chunkData.data)
+        // CRITICAL: Copy the data immediately since the C++ buffer will be reused
+        let byteCount = chunkData.pointCount * chunkData.stride
+        self.ownedData = Data(bytes: chunkData.data!, count: byteCount)
+
         self.pointCount = chunkData.pointCount
         self.stride = chunkData.stride
         self.isComplete = chunkData.isComplete
@@ -197,22 +215,73 @@ public struct StreamingProgress: Sendable {
 }
 
 /// Handles streaming point cloud loading with progressive updates
-public final class StreamingPointCloud: @unchecked Sendable {
+public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
     public let filePath: String
     public let readerName: String
     public let chunkSize: Int
 
     private let boundsLock = NSLock()
-    private var _bounds: PointCloud.Bounds?
-
+    
+    //
+    public var pointCount: Int = 0
+    public var bounds: Bounds = .init(min: .zero, max: .zero)
+    public var data: UnsafeRawPointer? = nil
+    public var size: Int = 0
+    public var stride: Int = 0
+    public var dimensions: [PDALDimensionInfo] = []
+    
     public init(
         filePath: String,
         readerName: String = "readers.text",
-        chunkSize: Int = 10000
+        chunkSize: Int = 100000
     ) {
         self.filePath = filePath
         self.readerName = readerName
         self.chunkSize = chunkSize
+    }
+    
+    public func loadInfo(readerName: String = "readers.text") throws {
+        
+        let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
+        let paths = PointCloud.getPaths(isTesting: isTesting)
+        setenv("PROJ_DATA", paths.projDBURL, 1)
+        setenv("PDAL_DRIVER_PATH", paths.driversURL, 1)
+        
+        var outCount: Int = 0
+        var outStride: Int = 0
+        var dimList: UnsafeMutablePointer<PDALDimensionInfo>?
+        var dimCount: Int = 0
+        var bbox = PDALBounds()
+        
+        let result = pdal_load_info(
+                    std.string(readerName),
+                    std.string(filePath),
+                    &outCount,
+                    &outStride,
+                    &dimList,
+                    &dimCount,
+                    &bbox
+                )
+
+        guard result == 0 else {
+            throw PointCloudError.readFailed("Failed to read point cloud from \(filePath)")
+        }
+
+        let bounds = Bounds(
+            min: simd_float3(bbox.min_x, bbox.min_y, bbox.min_z),
+            max: simd_float3(bbox.max_x, bbox.max_y, bbox.max_z)
+        )
+
+        let dimensions: [PDALDimensionInfo] = if let dimList = dimList, dimCount > 0 {
+            Array(UnsafeBufferPointer(start: dimList, count: dimCount))
+        } else {
+            []
+        }
+        
+        self.stride = outStride
+        self.pointCount = outCount
+        self.dimensions = dimensions
+        self.bounds = bounds
     }
 
     /// Stream point cloud chunks progressively
@@ -240,10 +309,6 @@ public final class StreamingPointCloud: @unchecked Sendable {
                         continuation.yield(progress)
                         return !Task.isCancelled
                     }
-
-                    // Store bounds for access after streaming completes
-                    self?.setBounds(bounds)
-
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -251,19 +316,13 @@ public final class StreamingPointCloud: @unchecked Sendable {
             }
         }
     }
-
-    private func setBounds(_ bounds: PointCloud.Bounds) {
-        boundsLock.lock()
-        defer { boundsLock.unlock() }
-        _bounds = bounds
+    
+    public func makeBuffer(device: any MTLDevice, options: MTLResourceOptions) -> (any MTLBuffer)? {
+        let totalByteLength = pointCount * stride
+        let options: MTLResourceOptions = .storageModeShared
+        return device.makeBuffer(length: totalByteLength, options: options)
     }
-
-    /// Access bounds after streaming completes
-    public var loadedBounds: PointCloud.Bounds? {
-        boundsLock.lock()
-        defer { boundsLock.unlock() }
-        return _bounds
-    }
+    
 
     // MARK: - Internal Implementation
 
@@ -272,11 +331,10 @@ public final class StreamingPointCloud: @unchecked Sendable {
         readerName: String,
         chunkSize: Int,
         onProgress: @escaping (StreamingProgress) -> Bool
-    ) throws -> PointCloud.Bounds {
+    ) throws -> Bounds {
         let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
         let paths = PointCloud.getPaths(isTesting: isTesting)
-        print("-=---------------------------")
-        print(isTesting)
+        
         setenv("PROJ_DATA", paths.projDBURL, 1)
         setenv("PDAL_DRIVER_PATH", paths.driversURL, 1)
 
@@ -307,9 +365,10 @@ public final class StreamingPointCloud: @unchecked Sendable {
             }
         }
 
-        // Create a box to hold our callback
+        // Create a box to hold our callback and dimensions
         final class CallbackContext {
             let box: CallbackBox
+            var dimensions: [PDALDimensionInfo] = []
             init(box: CallbackBox) {
                 self.box = box
             }
@@ -324,16 +383,35 @@ public final class StreamingPointCloud: @unchecked Sendable {
         }
 
         // C-compatible callback function that uses context pointer
-        let callback: @convention(c) (ChunkData, UnsafePointer<PDALDimensionInfo>?, Int, UnsafeMutableRawPointer?) -> Bool = { chunkData, dimInfo, dimCount, ctx in
-            print("DEBUG Swift: C callback invoked, dimCount=\(dimCount)")
+        // Parameters match the flattened C callback signature
+        let callback: @convention(c) (
+            UnsafePointer<CChar>?,  // data
+            Int,                     // pointCount
+            Int,                     // stride
+            Bool,                    // isComplete
+            Int,                     // totalPointsSoFar
+            Int,                     // estimatedTotalPoints
+            UnsafeMutableRawPointer? // context
+        ) -> Bool = { data, pointCount, stride, isComplete, totalPointsSoFar, estimatedTotalPoints, ctx in
             guard let ctx = ctx else {
                 print("DEBUG Swift: No context!")
                 return false
             }
+            // Reconstruct ChunkData from individual parameters
+            let chunkData = ChunkData(
+                data: data,
+                pointCount: pointCount,
+                stride: stride,
+                isComplete: isComplete,
+                totalPointsSoFar: totalPointsSoFar,
+                estimatedTotalPoints: estimatedTotalPoints
+            )
+//            print(totalPointsSoFar, estimatedTotalPoints, isComplete)
             let context = Unmanaged<CallbackContext>.fromOpaque(ctx).takeUnretainedValue()
-            return context.box.handle(chunkData: chunkData, dimInfo: dimInfo, dimCount: dimCount)
+            // Use dimensions stored in context
+            return context.box.handle(chunkData: chunkData, dimInfo: nil, dimCount: context.dimensions.count)
         }
-
+        
         // Call C++ function with context-based callback
         let result = pdal_read_binary_stream_progressive(
             std.string(readerName),
@@ -360,7 +438,7 @@ public final class StreamingPointCloud: @unchecked Sendable {
             throw PointCloudError.streamingFailed("Failed to read point cloud from \(path): \(errorMessage)")
         }
 
-        return PointCloud.Bounds(
+        return Bounds(
             min: simd_float3(bbox.min_x, bbox.min_y, bbox.min_z),
             max: simd_float3(bbox.max_x, bbox.max_y, bbox.max_z)
         )
