@@ -17,6 +17,36 @@ public protocol PointCloudData {
 public struct Bounds {
     public let min: simd_float3
     public let max: simd_float3
+
+    /// Transform the bounds by a 4x4 transformation matrix
+    /// - Parameter transform: The transformation matrix to apply
+    /// - Returns: A new Bounds with transformed min and max corners
+    public func transformed(by transform: simd_float4x4) -> Bounds {
+        // Transform the min and max corners
+        let minHomogeneous = simd_float4(min.x, min.y, min.z, 1.0)
+        let maxHomogeneous = simd_float4(max.x, max.y, max.z, 1.0)
+
+        let transformedMin = transform * minHomogeneous
+        let transformedMax = transform * maxHomogeneous
+
+        // Convert back to 3D coordinates (divide by w)
+        let min3D = simd_float3(
+            transformedMin.x / transformedMin.w,
+            transformedMin.y / transformedMin.w,
+            transformedMin.z / transformedMin.w
+        )
+        let max3D = simd_float3(
+            transformedMax.x / transformedMax.w,
+            transformedMax.y / transformedMax.w,
+            transformedMax.z / transformedMax.w
+        )
+
+        // After transformation, min and max might swap, so recalculate
+        return Bounds(
+            min: simd_min(min3D, max3D),
+            max: simd_max(min3D, max3D)
+        )
+    }
 }
 
 public struct PointCloud: PointCloudData {
@@ -157,7 +187,7 @@ public struct PointCloud: PointCloudData {
 
 // MARK: - PointCloud Extension
 
-extension PointCloud {
+extension PointCloudData {
     public func buildOctree(maxPointsPerNode: Int = 100, maxDepth: Int = 8, useMortonOrder: Bool = true) -> Octree {
         Octree(
             pointCloud: self,

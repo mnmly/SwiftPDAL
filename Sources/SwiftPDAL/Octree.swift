@@ -270,13 +270,13 @@ public class Octree {
     private var root: OctreeNode
     private let maxPointsPerNode: Int
     private let maxDepth: Int
-    private let pointCloud: PointCloud
+    private let pointCloud: any PointCloudData
 
     // For accessing point positions efficiently
     private let positions: UnsafeBufferPointer<simd_float3>?
 
     public init(
-        pointCloud: PointCloud,
+        pointCloud: any PointCloudData,
         maxPointsPerNode: Int = 100,
         maxDepth: Int = 8,
         useMortonOrder: Bool = true
@@ -314,7 +314,7 @@ public class Octree {
         positions?.deallocate()
     }
     
-    private static func extractPositions(from pointCloud: PointCloud) -> UnsafeBufferPointer<simd_float3>? {
+    private static func extractPositions(from pointCloud: any PointCloudData) -> UnsafeBufferPointer<simd_float3>? {
         // Find X, Y, Z dimensions
         guard let xDim = pointCloud.dimensions.first(where: { String($0.name) == "X" }),
               let yDim = pointCloud.dimensions.first(where: { String($0.name) == "Y" }),
