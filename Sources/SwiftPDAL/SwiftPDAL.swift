@@ -47,6 +47,11 @@ public struct Bounds {
             max: simd_max(min3D, max3D)
         )
     }
+    
+    public init(min: simd_float3, max: simd_float3) {
+        self.min = min
+        self.max = max
+    }
 }
 
 public struct PointCloud: PointCloudData {
@@ -168,6 +173,7 @@ public struct PointCloud: PointCloudData {
         let deallocator: (@Sendable (UnsafeMutableRawPointer, Int) -> Void)? = { (pointer, length) in
             pdal_free_data(UnsafePointer<CChar>(OpaquePointer(pointer)), nil)
         }
+        
         // Create the buffer using the "no copy" initializer
         let buffer = device.makeBuffer(
             bytesNoCopy: mutableDataPtr,
@@ -668,7 +674,37 @@ public enum PDALDimensionTypeHelper {
             return "Unknown(\(type.rawValue))"
         }
     }
-
+    
+    /// Returns the Metal shader language type name for a PDAL dimension type
+    public static func mtlName(for type: pdal.Dimension.`Type`) -> String {
+        switch type {
+        case .None:
+            return "void"
+        case .Unsigned8:
+            return "uchar"
+        case .Signed8:
+            return "char"
+        case .Unsigned16:
+            return "ushort"
+        case .Signed16:
+            return "short"
+        case .Unsigned32:
+            return "uint"
+        case .Signed32:
+            return "int"
+        case .Unsigned64:
+            return "ulong"
+        case .Signed64:
+            return "long"
+        case .Float:
+            return "float"
+        case .Double:
+            return "double"
+        default:
+            return "void /* Unknown(\(type.rawValue)) */"
+        }
+    }
+    
     /// Returns the size in bytes for a PDAL dimension type
     public static func byteSize(for type: pdal.Dimension.`Type`) -> Int {
         switch type {
@@ -719,6 +755,11 @@ extension PDALDimensionInfo {
     /// Returns the human-readable name for this dimension's type
     public var typeName: String {
         PDALDimensionTypeHelper.name(for: outputType)
+    }
+    
+    /// Returns the human-readable name for this dimension's type
+    public var mtlTypeName: String {
+        PDALDimensionTypeHelper.mtlName(for: outputType)
     }
 
     /// Returns the size in bytes for this dimension's type

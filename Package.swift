@@ -11,7 +11,12 @@ let package = Package(
     products: [
         .library(
             name: "SwiftPDAL",
-            targets: ["SwiftPDAL"]
+            targets: ["SwiftPDAL"],
+        ),
+        .library(
+            name: "SwiftPDAL Dynamic",
+            type: .dynamic,
+            targets: ["SwiftPDAL"],
         ),
         .executable(
             name: "OctreeRenderingExample",
@@ -28,13 +33,17 @@ let package = Package(
     ],
     targets: [
         // Binary targets for frameworks
+        // TODO: Replace URL with actual GitHub Release URL after uploading
+        // Example: https://github.com/mnmly/SwiftPDAL/releases/download/v1.0.0/gdal.xcframework.zip
         .binaryTarget(
             name: "gdal",
-            path: "Frameworks/gdal.xcframework"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-v3.12/gdal.xcframework.zip",
+            checksum: "e374d54681f1aad30084eb870070c466ce3c08f1c01f0a72ac71842a712260b7"
         ),
         .binaryTarget(
             name: "pdalcpp",
-            path: "Frameworks/pdalcpp.xcframework"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/pdalcpp-v2.9/pdalcpp.xcframework.zip",
+            checksum: "58921a58da064cfdcb3857559a75a0cc9218c1c9816491e863724158788a22a8"
         ),
 
         // C++ wrapper target for PDAL

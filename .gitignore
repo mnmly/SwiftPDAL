@@ -96,3 +96,9 @@ iOSInjectionProject/
 # Credentials
 .netrc
 .vscode
+
+# Binary frameworks (hosted externally via SPM)
+Frameworks/gdal.xcframework
+Frameworks/gdal.xcframework.zip
+Frameworks/pdalcpp.xcframework
+Frameworks/pdalcpp.xcframework.zip

@@ -111,11 +111,11 @@ static Stage* createConfiguredStage(
         options.add("header", "X Y Z Red Green Blue");
     }
 
-    bool needsTransform = filename.ends_with(".xyz") || reader_name == "readers.ply";
+    bool needsTransform = filename.ends_with(".xyz") || reader_name == "readers.ply" || reader_name == "readers.las";
     reader->setOptions(options);
 
     Stage* finalStage = reader;
-
+    bool requiresReprojection = false;
     if (needsTransform) {
         *outFlipFilter = factory.createStage("filters.transformation");
         if (!*outFlipFilter) return nullptr;
@@ -127,7 +127,7 @@ static Stage* createConfiguredStage(
         (*outFlipFilter)->setOptions(flipOptions);
         (*outFlipFilter)->setInput(*reader);
         finalStage = *outFlipFilter;
-    } else if (reader_name == "readers.las") {
+    } else if (requiresReprojection) {
         *outFilter = factory.createStage("filters.reprojection");
         *outFlipFilter = factory.createStage("filters.transformation");
         if (!*outFilter || !*outFlipFilter) return nullptr;
@@ -150,7 +150,15 @@ static Stage* createConfiguredStage(
     return finalStage;
 }
 
-// Helper function to create dimension specs and calculate stride
+/**
+ * @brief Helper function to calculate the next aligned offset (C-style)
+ */
+static inline size_t alignUp(size_t offset, size_t alignment)
+{
+    // A common and fast way to calculate (offset + alignment - 1) / alignment * alignment
+    return (offset + alignment - 1) & ~(alignment - 1);
+}
+
 static size_t createDimensionSpecs(
     pdal::PointLayoutPtr layout,
     PDALDimensionInfo** outSpecs,
@@ -160,25 +168,54 @@ static size_t createDimensionSpecs(
     PDALDimensionInfo* specs = new PDALDimensionInfo[dims.size()];
 
     size_t currentOffset = 0;
+    size_t maxAlignment = 1; // Keep track of largest alignment for final stride
+
     for (size_t i = 0; i < dims.size(); i++) {
         auto dim = dims[i];
         specs[i].sourceType = layout->dimType(dim);
         specs[i].outputType = specs[i].sourceType;
         specs[i].name = layout->dimName(dim);
-        specs[i].offset = currentOffset;
+
         if (specs[i].sourceType == Dimension::Type::Double) {
             specs[i].outputType = Dimension::Type::Float;
         }
-        specs[i].outputSize = Dimension::size(specs[i].outputType);
-        currentOffset += specs[i].outputSize;
-    }
 
-    // Calculate stride with 16-byte alignment
-    size_t stride = ((currentOffset + 15) / 16) * 16;
+        size_t outputSize = Dimension::size(specs[i].outputType);
+        
+        // Determine alignment: this is just the size of the type
+        // e.g., float (size 4) -> align 4
+        //       ushort (size 2) -> align 2
+        //       uchar (size 1) -> align 1
+        size_t alignment = outputSize;
+
+        // Keep track of the largest alignment needed
+        if (alignment > maxAlignment) {
+            maxAlignment = alignment;
+        }
+
+        // --- BUG 1 FIX ---
+        // Align the current offset *before* placing the field
+        currentOffset = alignUp(currentOffset, alignment);
+
+        specs[i].offset = currentOffset; // Store the correct, aligned offset
+        specs[i].outputSize = outputSize;
+        
+        currentOffset += specs[i].outputSize; // Move to the end of this field
+    }
 
     *outSpecs = specs;
     *outDimCount = dims.size();
-    return stride;
+
+    // --- BUG 2 FIX ---
+    // The final stride of the struct must be a multiple of its
+    // largest member's alignment (which is 4 bytes for float).
+    // This will correctly calculate 44.
+    size_t structStride = alignUp(currentOffset, maxAlignment);
+    
+    // DO NOT 16-BYTE ALIGN. This was the bug.
+    // size_t stride = ((currentOffset + 15) / 16) * 16;
+    
+    return structStride; // This will now return 44
 }
 
 // Helper function to extract bounds from view
