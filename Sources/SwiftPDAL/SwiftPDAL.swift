@@ -226,12 +226,21 @@ public struct PointCloudChunk: @unchecked Sendable {
     public var data: UnsafeRawPointer {
         ownedData.withUnsafeBytes { $0.baseAddress! }
     }
+    
+    public init(data: Data, pointCount: Int, stride: Int, isComplete: Bool, totalPointsSoFar: Int, estimatedTotalPoints: Int) {
+        self.ownedData = Data(data)
+        self.pointCount = pointCount
+        self.stride = stride
+        self.isComplete = isComplete
+        self.totalPointsSoFar = totalPointsSoFar
+        self.estimatedTotalPoints = estimatedTotalPoints
 
-    init(from chunkData: ChunkData) {
+    }
+
+    public init(from chunkData: ChunkData) {
         // CRITICAL: Copy the data immediately since the C++ buffer will be reused
         let byteCount = chunkData.pointCount * chunkData.stride
         self.ownedData = Data(bytes: chunkData.data!, count: byteCount)
-
         self.pointCount = chunkData.pointCount
         self.stride = chunkData.stride
         self.isComplete = chunkData.isComplete
@@ -244,6 +253,11 @@ public struct StreamingProgress: Sendable {
     public let chunk: PointCloudChunk
     public let dimensions: [PDALDimensionInfo]
 
+    public init(chunk: PointCloudChunk, dimensions: [PDALDimensionInfo]) {
+        self.chunk = chunk
+        self.dimensions = dimensions
+    }
+    
     public var progress: Double {
         guard estimatedTotalPoints > 0 else { return 0.0 }
         return Double(chunk.totalPointsSoFar) / Double(chunk.estimatedTotalPoints)

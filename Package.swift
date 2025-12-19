@@ -32,13 +32,10 @@ let package = Package(
         ),
     ],
     targets: [
-        // Binary targets for frameworks
-        // TODO: Replace URL with actual GitHub Release URL after uploading
-        // Example: https://github.com/mnmly/SwiftPDAL/releases/download/v1.0.0/gdal.xcframework.zip
         .binaryTarget(
             name: "gdal",
             url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-v3.12/gdal.xcframework.zip",
-            checksum: "e374d54681f1aad30084eb870070c466ce3c08f1c01f0a72ac71842a712260b7"
+            checksum: "9b4cdaac0cd6d75d7d8550360bc6e3427361d588ffdf7b040b8b9f3e8d5cbb41"
         ),
         .binaryTarget(
             name: "pdalcpp",
