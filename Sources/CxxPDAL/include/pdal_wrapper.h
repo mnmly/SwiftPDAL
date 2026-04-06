@@ -38,7 +38,7 @@
 typedef struct {
     pdal::Dimension::Type sourceType;
     pdal::Dimension::Type outputType;
-    std::string name;
+    const char* name;           // Changed from std::string
     size_t outputSize;
     size_t offset;
 } PDALDimensionInfo;
@@ -61,7 +61,7 @@ int pdal_pipeline_get_metadata_json(PDALPipeline pipeline, char* buffer, size_t 
 // New function to read LAS file and extract points as separate arrays
 int pdal_read_binary(const std::string& reader_name_backup, const std::string& filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox);
 
-void pdal_free_data(const char* data, PDALDimensionInfo* dimList);
+void pdal_free_data(const char* data, PDALDimensionInfo* dimList, size_t dimCount);
 
 // ============================================================================
 // STREAMING API
@@ -75,6 +75,10 @@ typedef struct {
     bool isComplete;            // True if this is the final chunk
     size_t totalPointsSoFar;    // Total points delivered so far (including this chunk)
     size_t estimatedTotalPoints;// Estimated total (0 if unknown)
+    PDALBounds currentBounds;   // Bounds computed so far (progressively updated)
+    PDALDimensionInfo* dimensions;  // Pointer to dimension array
+    size_t dimensionCount;          // Number of dimensions  
+    bool isFirstChunk;              // True if this is the first chunk
 } ChunkData;
 
 
@@ -89,15 +93,8 @@ int pdal_load_info(const std::string& reader_name_backup, const std::string& fil
 
 // C-compatible callback function type for streaming chunks with context pointer
 // Returns: true to continue loading, false to cancel
-// Using raw parameters instead of ChunkData struct for Swift @convention(c) compatibility
 // Note: Dimension info is retrieved separately via context, not passed in each callback
-typedef bool (*ProgressCallback)(const char* data,
-                                  size_t pointCount,
-                                  size_t stride,
-                                  bool isComplete,
-                                  size_t totalPointsSoFar,
-                                  size_t estimatedTotalPoints,
-                                  void* context);
+typedef bool (*ProgressCallback)(const ChunkData* chunk, void* context);
 
 // Streaming reader function - calls callback for each chunk of points
 // Parameters:
@@ -105,7 +102,9 @@ typedef bool (*ProgressCallback)(const char* data,
 //   filename: Path to point cloud file
 //   chunkSize: Number of points per chunk (e.g., 10000)
 //   onChunk: Callback function called for each chunk
+//   context: User context pointer passed to callback
 //   bbox: Output parameter for bounds
+//   dimensionMapJSON: Optional JSON string mapping dimension names (e.g., "{\"band_1\":\"Z\"}")
 // Returns: 0 on success, negative error code on failure
 int pdal_read_binary_stream_progressive(
     const std::string& reader_name_backup,
@@ -113,7 +112,8 @@ int pdal_read_binary_stream_progressive(
     size_t chunkSize,
     ProgressCallback onChunk,
     void* context,
-    PDALBounds& bbox);
+    PDALBounds& bbox,
+    const char* dimensionMapJSON = nullptr);
 
 // Streaming reader that reuses a pre-loaded PointViewPtr from pdal_load_info
 // This avoids re-reading the file - use this after calling pdal_load_info
@@ -122,12 +122,14 @@ int pdal_read_binary_stream_progressive(
 //   chunkSize: Number of points per chunk (e.g., 10000)
 //   onChunk: Callback function called for each chunk
 //   context: User context pointer passed to callback
+//   dimensionMapJSON: Optional JSON string mapping dimension names (e.g., "{\"band_1\":\"Z\"}")
 // Returns: 0 on success, negative error code on failure
 int pdal_read_binary_stream_from_view(
     PDALPointViewPtr view,
     size_t chunkSize,
     ProgressCallback onChunk,
-    void* context);
+    void* context,
+    const char* dimensionMapJSON = nullptr);
 
 // Free a PointViewPtr obtained from pdal_load_info
 void pdal_free_point_view(PDALPointViewPtr view);

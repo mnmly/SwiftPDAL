@@ -29,6 +29,8 @@
 #include <sstream>
 #include <cstring>
 #include <vector>
+#include <algorithm>
+#include <limits>
 
 using namespace pdal;
 #endif
@@ -84,68 +86,183 @@ int pdal_pipeline_get_metadata_json(PDALPipeline pipeline_ptr, char* buffer, siz
     }
 }
 
-void pdal_free_data(const char* data, PDALDimensionInfo* dimList) { delete[] data; delete[] dimList; }
+void pdal_free_data(const char* data, PDALDimensionInfo* dimList, size_t dimCount) {
+    delete[] data;
+    if (dimList) {
+        for (size_t i = 0; i < dimCount; i++) {
+            free((void*)dimList[i].name);  // Free each string
+        }
+        delete[] dimList;
+    }
+}
 
-// Helper function to create and configure the PDAL stage pipeline
+// Helper class to parse and manage dimension name mappings
+class DimensionMapper {
+private:
+    std::map<std::string, std::string> mappings;  // originalName -> standardName
+
+public:
+    DimensionMapper(const char* jsonString = nullptr) {
+        if (!jsonString || std::strlen(jsonString) == 0) {
+            return;
+        }
+
+        try {
+            // Parse JSON manually (simple key-value pairs)
+            // Expected format: [{"band_1":"Z"}, {"band_2":"X"}]
+            // For simplicity, we'll use a basic parser
+            std::string json(jsonString);
+
+            // Remove whitespace
+            json.erase(std::remove_if(json.begin(), json.end(), ::isspace), json.end());
+
+            // Parse array of objects
+            size_t pos = 0;
+            while ((pos = json.find('{', pos)) != std::string::npos) {
+                size_t endPos = json.find('}', pos);
+                if (endPos == std::string::npos) break;
+
+                std::string objStr = json.substr(pos + 1, endPos - pos - 1);
+
+                // Parse key:value pair
+                size_t colonPos = objStr.find(':');
+                if (colonPos != std::string::npos) {
+                    std::string key = objStr.substr(0, colonPos);
+                    std::string value = objStr.substr(colonPos + 1);
+
+                    // Remove quotes
+                    key.erase(std::remove(key.begin(), key.end(), '\"'), key.end());
+                    value.erase(std::remove(value.begin(), value.end(), '\"'), value.end());
+
+                    if (!key.empty() && !value.empty()) {
+                        mappings[key] = value;
+                    }
+                }
+
+                pos = endPos + 1;
+            }
+        } catch (...) {
+            std::cerr << "Error parsing dimension map JSON" << std::endl;
+            mappings.clear();
+        }
+    }
+
+    // Resolve a standard dimension name to its actual name in the file
+    // e.g., resolveDimension("Z") might return "band_1" if mapped
+    std::string resolveDimension(const std::string& standardName) const {
+        // Look for reverse mapping: find originalName where value == standardName
+        for (const auto& pair : mappings) {
+            if (strcasecmp(pair.second.c_str(), standardName.c_str()) == 0) {
+                return pair.first;  // Return original name
+            }
+        }
+        return standardName;  // No mapping, return standard name
+    }
+
+    bool isEmpty() const {
+        return mappings.empty();
+    }
+};
+
 static Stage* createConfiguredStage(
     const std::string& reader_name_backup,
     const std::string& filename,
     StageFactory& factory,
     Stage** outFilter,
-    Stage** outFlipFilter)
+    Stage** outFlipFilter,
+    const char* dimensionMapJSON = nullptr, // New parameter
+    bool applyTransformation = true)
 {
+    // 1. Resolve Reader
     std::string inferredReaderName = factory.inferReaderDriver(filename);
-    std::string reader_name = reader_name_backup;
-    if (!inferredReaderName.empty()) {
-        reader_name = inferredReaderName;
-    }
+    std::string reader_name = (filename.ends_with(".pts")) ? "readers.text" :
+                              (!inferredReaderName.empty() ? inferredReaderName : reader_name_backup);
 
     Stage* reader = factory.createStage(reader_name);
     if (!reader) return nullptr;
 
+    // 2. Configure Reader Options
     Options options;
     options.add("filename", filename);
     if (filename.ends_with(".xyz")) {
         options.add("skip", 0);
         options.add("separator", " ");
         options.add("header", "X Y Z Red Green Blue");
+    } else if (filename.ends_with(".pts")) {
+        options.add("skip", 1);
+        options.add("separator", " ");
+        options.add("header", "X Y Z Intensity Red Green Blue");
     }
-
-    bool needsTransform = filename.ends_with(".xyz") || reader_name == "readers.ply" || reader_name == "readers.las";
     reader->setOptions(options);
 
     Stage* finalStage = reader;
-    bool requiresReprojection = false;
-    if (needsTransform) {
-        *outFlipFilter = factory.createStage("filters.transformation");
-        if (!*outFlipFilter) return nullptr;
-        Options flipOptions;
-        flipOptions.add("matrix", "1  0  0  0  "    // X unchanged
-                        "0 0  1  0  "    // Y flipped (multiply by -1)
-                        "0  -1  0  0  "    // Z unchanged
-                        "0  0  0  1");    // Homogeneous coordinate
-        (*outFlipFilter)->setOptions(flipOptions);
-        (*outFlipFilter)->setInput(*reader);
-        finalStage = *outFlipFilter;
-    } else if (requiresReprojection) {
-        *outFilter = factory.createStage("filters.reprojection");
-        *outFlipFilter = factory.createStage("filters.transformation");
-        if (!*outFilter || !*outFlipFilter) return nullptr;
-
-        Options filterOptions;
-        filterOptions.add("out_srs", "EPSG:3857");
-        (*outFilter)->setOptions(filterOptions);
-        (*outFilter)->setInput(*reader);
-
-        Options flipOptions;
-        flipOptions.add("matrix", "1  0  0  0  "    // X unchanged
-                        "0 0  1  0  "    // Y flipped (multiply by -1)
-                        "0  -1  0  0  "    // Z unchanged
-                        "0  0  0  1");    // Homogeneous coordinate
-        (*outFlipFilter)->setOptions(flipOptions);
-        (*outFlipFilter)->setInput(**outFilter);
-        finalStage = *outFlipFilter;
+    
+    // 2. Handle Dimension Mapping (Fix for the "0 Y" issue)
+    DimensionMapper mapper(dimensionMapJSON);
+    std::string originalZ = "Z";
+    if (!mapper.isEmpty()) {
+        // Find which original name (e.g., "band_1") is supposed to be "Z"
+        originalZ = mapper.resolveDimension("Z");
     }
+    
+    // Add this after reader configuration to drop NoData points
+    Options rangeOptions;
+    rangeOptions.add("limits", originalZ + "!(-9999:-9999)");
+    Stage* rangeFilter = factory.createStage("filters.range");
+    rangeFilter->setOptions(rangeOptions);
+    rangeFilter->setInput(*finalStage);
+    finalStage = rangeFilter;
+
+    // If the mapper found a specific mapping (e.g., "band_1" instead of just "Z")
+    if (originalZ != "Z") {
+        Stage* assignFilter = factory.createStage("filters.assign");
+        if (assignFilter) {
+            Options assignOptions;
+            // Using the "value" syntax from your examples
+            // Resulting string: "Z = band_1"
+            assignOptions.add("value", "Z = " + originalZ);
+            
+            assignFilter->setOptions(assignOptions);
+            assignFilter->setInput(*finalStage);
+            finalStage = assignFilter;
+        }
+    }
+    
+
+    // 3. Logic: Reprojection
+    bool needsTransformOnly = applyTransformation &&
+                             (filename.ends_with(".xyz") || reader_name == "readers.ply" || reader_name == "readers.las" || reader_name == "readers.text");
+
+    if (!needsTransformOnly) {
+        *outFilter = factory.createStage("filters.reprojection");
+        if (*outFilter) {
+            Options filterOptions;
+            filterOptions.add("out_srs", "EPSG:3857");
+            (*outFilter)->setOptions(filterOptions);
+            (*outFilter)->setInput(*finalStage);
+            finalStage = *outFilter;
+        }
+    }
+
+    // 4. Transformation (The Matrix Flip)
+    *outFlipFilter = factory.createStage("filters.transformation");
+    if (!*outFlipFilter) return nullptr;
+
+    Options flipOptions;
+    if (*outFilter) {
+        flipOptions.add("matrix", "1  0  0  0  "
+                                 "0  1  0  0  "
+                                 "0  0  -1  0  "
+                                 "0  0  0  1");
+    } else {
+        flipOptions.add("matrix", "1  0  0  0  "
+                                 "0  0  1  0  "
+                                 "0 -1  0  0  "
+                                 "0  0  0  1");
+    }
+    (*outFlipFilter)->setOptions(flipOptions);
+    (*outFlipFilter)->setInput(*finalStage);
+    finalStage = *outFlipFilter;
 
     return finalStage;
 }
@@ -174,7 +291,7 @@ static size_t createDimensionSpecs(
         auto dim = dims[i];
         specs[i].sourceType = layout->dimType(dim);
         specs[i].outputType = specs[i].sourceType;
-        specs[i].name = layout->dimName(dim);
+        specs[i].name = strdup(layout->dimName(dim).c_str());  // Allocate C string
 
         if (specs[i].sourceType == Dimension::Type::Double) {
             specs[i].outputType = Dimension::Type::Float;
@@ -320,7 +437,6 @@ int pdal_load_info(const std::string& reader_name_backup, const std::string& fil
         Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter);
         if (!finalStage) return -4;
 
-        // CRITICAL: Use shared_ptr to keep the table alive
         auto table = std::make_shared<PointTable>();
         finalStage->prepare(*table);
         PointViewSet viewSet = finalStage->execute(*table);
@@ -329,13 +445,11 @@ int pdal_load_info(const std::string& reader_name_backup, const std::string& fil
         PointViewPtr view = *viewSet.begin();
         pdal::PointLayoutPtr layout = view->layout();
 
-        std::cerr << "DEBUG: pdal_load_info - layout has " << layout->dims().size() << " dimensions" << std::endl;
-
         PDALDimensionInfo* specs;
         size_t stride = createDimensionSpecs(layout, &specs, dimCount);
 
         size_t pointCount = view->size();
-        extractBounds(view, bbox);
+        // extractBounds(view, bbox);
 
         *outCount = pointCount;
         *outStride = stride;
@@ -346,7 +460,6 @@ int pdal_load_info(const std::string& reader_name_backup, const std::string& fil
             // CRITICAL: Keep both view AND table alive
             PointViewContext* ctx = new PointViewContext(view, table);
             *outView = static_cast<PDALPointViewPtr>(ctx);
-            std::cerr << "DEBUG: Created context and returning view pointer" << std::endl;
         }
 
         return 0;
@@ -370,21 +483,41 @@ private:
     size_t currentPointIndex;
     size_t totalPointsProcessed;
     size_t stride;
-    std::vector<PDALDimensionInfo> dimSpecs;
+    PDALDimensionInfo* dimSpecs;
+    size_t dimCount;
     std::vector<pdal::Dimension::Id> dimIds;  // Store dimension IDs
     ProgressCallback callback;
     void* callbackContext;
     bool initialized;
+    bool isFirstChunk;  // NEW: Track first chunk
+    DimensionMapper dimMapper;  // NEW: Dimension name mapper
+
+    // Bounds tracking
+    pdal::Dimension::Id xDimId, yDimId, zDimId;
+    bool hasBounds;
+    float minX, minY, minZ;
+    float maxX, maxY, maxZ;
 
 public:
-    ProgressivePointLoader(size_t pointsPerChunk, ProgressCallback cb, void* ctx)
+    ProgressivePointLoader(size_t pointsPerChunk, ProgressCallback cb, void* ctx, const char* dimensionMapJSON = nullptr)
         : chunkSize(pointsPerChunk)
         , currentPointIndex(0)
         , totalPointsProcessed(0)
         , stride(0)
+        , dimSpecs(nullptr)
+        , dimCount(0)
         , callback(cb)
         , callbackContext(ctx)
         , initialized(false)
+        , isFirstChunk(true)  // NEW
+        , dimMapper(dimensionMapJSON)  // NEW: Initialize dimension mapper
+        , hasBounds(false)
+        , minX(std::numeric_limits<double>::max())
+        , minY(std::numeric_limits<double>::max())
+        , minZ(std::numeric_limits<double>::max())
+        , maxX(std::numeric_limits<double>::lowest())
+        , maxY(std::numeric_limits<double>::lowest())
+        , maxZ(std::numeric_limits<double>::lowest())
     {}
 
     // Must be called after prepare() to initialize dimensions from layout
@@ -395,24 +528,50 @@ public:
 
         auto dims = layout->dims();
         dimIds = dims;
+        dimCount = dims.size();
+        
+        // Allocate C-compatible array
+        dimSpecs = new PDALDimensionInfo[dimCount];
+
+        // Find X, Y, Z dimension IDs for bounds tracking
+        // Use dimension mapper to resolve names
+        std::string xName = dimMapper.resolveDimension("X");
+        std::string yName = dimMapper.resolveDimension("Y");
+        std::string zName = dimMapper.resolveDimension("Z");
+
+        xDimId = layout->findDim(xName);
+        yDimId = layout->findDim(yName);
+        zDimId = layout->findDim(zName);
+        hasBounds = (xDimId != Dimension::Id::Unknown &&
+                     yDimId != Dimension::Id::Unknown &&
+                     zDimId != Dimension::Id::Unknown);
 
         size_t currentOffset = 0;
-        for (auto dim : dims) {
-            PDALDimensionInfo info;
-            info.sourceType = layout->dimType(dim);
-            info.outputType = info.sourceType;
-            info.name = layout->dimName(dim);
-            info.offset = currentOffset;
-            if (info.sourceType == Dimension::Type::Double) {
-                info.outputType = Dimension::Type::Float;
+        size_t maxAlignment = 1;
+
+        for (size_t i = 0; i < dimCount; i++) {
+            auto dim = dims[i];
+            dimSpecs[i].sourceType = layout->dimType(dim);
+            dimSpecs[i].outputType = dimSpecs[i].sourceType;
+            dimSpecs[i].name = strdup(layout->dimName(dim).c_str());
+            dimSpecs[i].offset = currentOffset;
+            if (dimSpecs[i].sourceType == Dimension::Type::Double) {
+                dimSpecs[i].outputType = Dimension::Type::Float;
             }
-            info.outputSize = Dimension::size(info.outputType);
-            currentOffset += info.outputSize;
-            dimSpecs.push_back(info);
+            dimSpecs[i].outputSize = Dimension::size(dimSpecs[i].outputType);
+            // Proper alignment
+            size_t alignment = dimSpecs[i].outputSize;
+            if (alignment > maxAlignment) {
+                maxAlignment = alignment;
+            }
+            currentOffset = (currentOffset + alignment - 1) & ~(alignment - 1);
+            dimSpecs[i].offset = currentOffset;
+            currentOffset += dimSpecs[i].outputSize;
         }
 
         // Calculate stride with 16-byte alignment (matching pdal_read_binary)
-        stride = ((currentOffset + 15) / 16) * 16;
+//        stride = ((currentOffset + 15) / 16) * 16;
+        stride = (currentOffset + maxAlignment - 1) & ~(maxAlignment - 1);
 
         // Allocate chunk buffer
         chunkBuffer.resize(chunkSize * stride);
@@ -429,10 +588,28 @@ public:
             return false;
         }
 
+        // Track bounds per point
+        if (hasBounds) {
+            float x = point.getFieldAs<float>(xDimId);
+            float y = point.getFieldAs<float>(yDimId);
+            float z = point.getFieldAs<float>(zDimId);
+
+            minX = fmin(minX, x);
+            minY = fmin(minY, y);
+            minZ = fmin(minZ, z);
+            maxX = fmax(maxX, x);
+            maxY = fmax(maxY, y);
+            maxZ = fmax(maxZ, z);
+        }
+        
+        auto x = point.getFieldAs<float>(xDimId);
+        auto y = point.getFieldAs<float>(yDimId);
+        auto z = point.getFieldAs<float>(zDimId);
+
         // Write point data to current position in chunk
         char* pointBase = chunkBuffer.data() + (currentPointIndex * stride);
 
-        for (size_t dimIdx = 0; dimIdx < dimSpecs.size(); ++dimIdx) {
+        for (size_t dimIdx = 0; dimIdx < dimCount; ++dimIdx) {
             auto& spec = dimSpecs[dimIdx];
             char* destPtr = pointBase + spec.offset;
             auto dimId = dimIds[dimIdx];
@@ -451,18 +628,17 @@ public:
             chunk.isComplete = false;
             chunk.totalPointsSoFar = totalPointsProcessed;
             chunk.estimatedTotalPoints = 0; // Unknown during streaming
-
-            bool shouldContinue = callback(
-                chunk.data,
-                chunk.pointCount,
-                chunk.stride,
-                chunk.isComplete,
-                chunk.totalPointsSoFar,
-                chunk.estimatedTotalPoints,
-                callbackContext
-            );
+            getBounds(chunk.currentBounds);
+            
+            chunk.dimensions = dimSpecs;
+            chunk.dimensionCount = dimCount;
+            chunk.isFirstChunk = isFirstChunk;
+            
+            bool shouldContinue = callback(&chunk, callbackContext);
 
             // Reset for next chunk
+            isFirstChunk = false;  // No longer first chunk
+
             currentPointIndex = 0;
             std::memset(chunkBuffer.data(), 0, chunkBuffer.size());
 
@@ -481,25 +657,54 @@ public:
             chunk.isComplete = true;
             chunk.totalPointsSoFar = totalPointsProcessed;
             chunk.estimatedTotalPoints = totalPointsProcessed;
+            getBounds(chunk.currentBounds);
+            
+            chunk.dimensions = dimSpecs;
+            chunk.dimensionCount = dimCount;
+            chunk.isFirstChunk = isFirstChunk;
+            
+            callback(&chunk, callbackContext);
+            isFirstChunk = false;
 
-            callback(
-                chunk.data,
-                chunk.pointCount,
-                chunk.stride,
-                chunk.isComplete,
-                chunk.totalPointsSoFar,
-                chunk.estimatedTotalPoints,
-                callbackContext
-            );
         }
     }
 
-    const std::vector<PDALDimensionInfo>& getDimensionSpecs() const {
+    const PDALDimensionInfo* getDimensionSpecs() const {
         return dimSpecs;
+    }
+    
+    size_t getDimensionCount() const {
+        return dimCount;
     }
 
     size_t getStride() const { return stride; }
     size_t getTotalPoints() const { return totalPointsProcessed; }
+
+    // Get computed bounds
+    void getBounds(PDALBounds& bbox) const {
+        if (hasBounds) {
+            bbox.min_x = minX;
+            bbox.min_y = minY;
+            bbox.min_z = minZ;
+            bbox.max_x = maxX;
+            bbox.max_y = maxY;
+            bbox.max_z = maxZ;
+        } else {
+            bbox.min_x = bbox.min_y = bbox.min_z = 0.0f;
+            bbox.max_x = bbox.max_y = bbox.max_z = 0.0f;
+        }
+    }
+    
+    ~ProgressivePointLoader() {
+        if (dimSpecs) {
+            for (size_t i = 0; i < dimCount; i++) {
+                if (dimSpecs[i].name) {
+                    free((void*)dimSpecs[i].name);
+                }
+            }
+            delete[] dimSpecs;
+        }
+    }
 };
 
 
@@ -511,7 +716,8 @@ int pdal_read_binary_stream_progressive(
     size_t chunkSize,
     ProgressCallback onChunk,
     void* context,
-    PDALBounds& bbox)
+    PDALBounds& bbox,
+    const char* dimensionMapJSON)
 {
     try {
         using namespace pdal;
@@ -523,11 +729,17 @@ int pdal_read_binary_stream_progressive(
         Stage* filter = nullptr;
         Stage* flipFilter = nullptr;
 
-        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter);
+        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter, dimensionMapJSON);
         if (!finalStage) return -4;
 
-        // Create progressive loader
-        ProgressivePointLoader loader(chunkSize, onChunk, context);
+        bool isStreamable = finalStage->pipelineStreamable();
+
+        auto nonStreamables = finalStage->findNonstreamable();
+
+
+
+        // Create progressive loader with dimension mapping
+        ProgressivePointLoader loader(chunkSize, onChunk, context, dimensionMapJSON);
 
         // Setup streaming callback filter
         StreamCallbackFilter streamFilter;
@@ -549,28 +761,8 @@ int pdal_read_binary_stream_progressive(
         // Flush any remaining points
         loader.flushFinalChunk();
 
-        // Calculate bounds - we need to do a second pass for accurate bounds
-        // Alternative: track bounds during streaming (adds overhead per point)
-        PointTable boundTable;
-        finalStage->prepare(boundTable);
-        PointViewSet boundViewSet = finalStage->execute(boundTable);
-
-        if (!boundViewSet.empty()) {
-            PointViewPtr view = *boundViewSet.begin();
-            BOX3D _bbox;
-            view->calculateBounds(_bbox);
-
-            bbox.min_x = _bbox.minx;
-            bbox.min_y = _bbox.miny;
-            bbox.min_z = _bbox.minz;
-            bbox.max_x = _bbox.maxx;
-            bbox.max_y = _bbox.maxy;
-            bbox.max_z = _bbox.maxz;
-        } else {
-            // If bound calculation fails, set to invalid bounds
-            bbox.min_x = bbox.min_y = bbox.min_z = 0.0;
-            bbox.max_x = bbox.max_y = bbox.max_z = 0.0;
-        }
+        // Get bounds computed during streaming (avoids second pass)
+        loader.getBounds(bbox);
 
         return 0;
 
@@ -590,7 +782,8 @@ int pdal_read_binary_stream_from_view(
     PDALPointViewPtr viewPtr,
     size_t chunkSize,
     ProgressCallback onChunk,
-    void* context)
+    void* context,
+    const char* dimensionMapJSON)
 {
     try {
         using namespace pdal;
@@ -622,6 +815,29 @@ int pdal_read_binary_stream_from_view(
 
         size_t totalPoints = view->size();
         size_t currentPoint = 0;
+        bool isFirstChunk = true;  // Track first chunk
+
+        // Initialize bounds tracking with dimension mapping
+        DimensionMapper dimMapper(dimensionMapJSON);
+        std::string xName = dimMapper.resolveDimension("X");
+        std::string yName = dimMapper.resolveDimension("Y");
+        std::string zName = dimMapper.resolveDimension("Z");
+
+        Dimension::Id xDimId = layout->findDim(xName);
+        Dimension::Id yDimId = layout->findDim(yName);
+        Dimension::Id zDimId = layout->findDim(zName);
+        bool hasBounds = (xDimId != Dimension::Id::Unknown &&
+                         yDimId != Dimension::Id::Unknown &&
+                         zDimId != Dimension::Id::Unknown);
+
+        PDALBounds currentBounds;
+        if (hasBounds) {
+            currentBounds.min_x = currentBounds.min_y = currentBounds.min_z = std::numeric_limits<float>::max();
+            currentBounds.max_x = currentBounds.max_y = currentBounds.max_z = std::numeric_limits<float>::lowest();
+        } else {
+            currentBounds.min_x = currentBounds.min_y = currentBounds.min_z = 0.0f;
+            currentBounds.max_x = currentBounds.max_y = currentBounds.max_z = 0.0f;
+        }
 
         // Allocate chunk buffer
         size_t bufferSize = chunkSize * stride;
@@ -631,10 +847,24 @@ int pdal_read_binary_stream_from_view(
             size_t pointsInChunk = std::min(chunkSize, totalPoints - currentPoint);
             std::memset(chunkBuffer.data(), 0, chunkBuffer.size());
 
-            // Copy points into chunk buffer
+            // Copy points into chunk buffer and update bounds
             for (size_t i = 0; i < pointsInChunk; ++i) {
                 size_t pointIdx = currentPoint + i;
                 char* pointBase = chunkBuffer.data() + (i * stride);
+
+                // Update bounds
+                if (hasBounds) {
+                    float x = view->getFieldAs<float>(xDimId, pointIdx);
+                    float y = view->getFieldAs<float>(yDimId, pointIdx);
+                    float z = view->getFieldAs<float>(zDimId, pointIdx);
+
+                    currentBounds.min_x = fmin(currentBounds.min_x, x);
+                    currentBounds.min_y = fmin(currentBounds.min_y, y);
+                    currentBounds.min_z = fmin(currentBounds.min_z, z);
+                    currentBounds.max_x = fmax(currentBounds.max_x, x);
+                    currentBounds.max_y = fmax(currentBounds.max_y, y);
+                    currentBounds.max_z = fmax(currentBounds.max_z, z);
+                }
 
                 for (size_t dimIdx = 0; dimIdx < dims.size(); ++dimIdx) {
                     auto dimId = dims[dimIdx];
@@ -645,25 +875,37 @@ int pdal_read_binary_stream_from_view(
             }
 
             // Call the callback
-            bool isComplete = (currentPoint + pointsInChunk >= totalPoints);
-            bool shouldContinue = onChunk(
-                chunkBuffer.data(),
-                pointsInChunk,
-                stride,
-                isComplete,
-                currentPoint + pointsInChunk,
-                totalPoints,
-                context
-            );
+            ChunkData chunk;
+            chunk.data = chunkBuffer.data();
+            chunk.pointCount = pointsInChunk;
+            chunk.stride = stride;
+            chunk.isComplete = (currentPoint + pointsInChunk >= totalPoints);
+            chunk.totalPointsSoFar = currentPoint + pointsInChunk;
+            chunk.estimatedTotalPoints = totalPoints;
+            chunk.currentBounds = currentBounds;
+            chunk.dimensions = specs;
+            chunk.dimensionCount = dimCount;
+            chunk.isFirstChunk = isFirstChunk;
 
+            bool shouldContinue = onChunk(&chunk, context);
+
+            isFirstChunk = false;
             currentPoint += pointsInChunk;
 
             if (!shouldContinue) {
+                // Free dimension specs before returning
+                for (size_t i = 0; i < dimCount; i++) {
+                    if (specs[i].name) free((void*)specs[i].name);
+                }
                 delete[] specs;
-                return 0; // User cancelled
+                return 0;
             }
         }
 
+        // Free dimension specs
+        for (size_t i = 0; i < dimCount; i++) {
+            if (specs[i].name) free((void*)specs[i].name);
+        }
         delete[] specs;
         return 0;
 
@@ -694,7 +936,8 @@ int pdal_read_binary_stream_progressive(
     size_t chunkSize,
     ProgressCallback onChunk,
     void* context,
-    PDALBounds& bbox)
+    PDALBounds& bbox,
+    const char* dimensionMapJSON)
 {
     return -1; // Not implemented on iOS
 }
@@ -703,7 +946,8 @@ int pdal_read_binary_stream_from_view(
     PDALPointViewPtr viewPtr,
     size_t chunkSize,
     ProgressCallback onChunk,
-    void* context)
+    void* context,
+    const char* dimensionMapJSON)
 {
     return -1; // Not implemented on iOS
 }
