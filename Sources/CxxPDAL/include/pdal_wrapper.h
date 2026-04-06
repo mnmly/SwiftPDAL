@@ -28,7 +28,7 @@
 #define PDAL_DIM_RETURN_NUMBER      (1 << 7)  // 0x0080
 #define PDAL_DIM_NUMBER_OF_RETURNS  (1 << 8)  // 0x0100
 #define PDAL_DIM_CLASSIFICATION     (1 << 9)  // 0x0200
-#define PDAL_DIM
+#define PDAL_DIM_SCAN_DIRECTION     (1 << 10) // 0x0400
 #define PDAL_DIM_EDGE_OF_FLIGHT     (1 << 11) // 0x0800
 #define PDAL_DIM_SCAN_ANGLE         (1 << 12) // 0x1000
 #define PDAL_DIM_USER_DATA          (1 << 13) // 0x2000
@@ -59,7 +59,7 @@ int pdal_pipeline_execute(PDALPipeline pipeline);
 int pdal_pipeline_get_metadata_json(PDALPipeline pipeline, char* buffer, size_t buffer_size);
 
 // New function to read LAS file and extract points as separate arrays
-int pdal_read_binary(const std::string& reader_name_backup, const std::string& filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox);
+int pdal_read_binary(const char* reader_name_backup, const char* filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox);
 
 void pdal_free_data(const char* data, PDALDimensionInfo* dimList, size_t dimCount);
 
@@ -88,7 +88,7 @@ typedef void* PDALPointViewPtr;
 // Load file info and retain the PointViewPtr for later streaming
 // Returns 0 on success, negative error code on failure
 // IMPORTANT: You must call pdal_free_point_view() when done to free the PointViewPtr
-int pdal_load_info(const std::string& reader_name_backup, const std::string& filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PDALPointViewPtr* outView);
+int pdal_load_info(const char* reader_name_backup, const char* filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PDALPointViewPtr* outView);
 
 
 // C-compatible callback function type for streaming chunks with context pointer
@@ -107,8 +107,8 @@ typedef bool (*ProgressCallback)(const ChunkData* chunk, void* context);
 //   dimensionMapJSON: Optional JSON string mapping dimension names (e.g., "{\"band_1\":\"Z\"}")
 // Returns: 0 on success, negative error code on failure
 int pdal_read_binary_stream_progressive(
-    const std::string& reader_name_backup,
-    const std::string& filename,
+    const char* reader_name_backup,
+    const char* filename,
     size_t chunkSize,
     ProgressCallback onChunk,
     void* context,
@@ -137,5 +137,24 @@ void pdal_free_point_view(PDALPointViewPtr view);
 // Function to destroy the PDAL Pipeline and release resources
 void pdal_pipeline_destroy(PDALPipeline pipeline);
 
+// ============================================================================
+// ERROR CODES
+// ============================================================================
+
+enum PDALError {
+    PDAL_OK = 0,
+    PDAL_ERR_NOT_IMPLEMENTED = -1,
+    PDAL_ERR_PDAL = -2,
+    PDAL_ERR_STD_EXCEPTION = -3,
+    PDAL_ERR_CREATE_STAGE = -4,
+    PDAL_ERR_NO_POINTS = -5,
+    PDAL_ERR_UNKNOWN = -6,
+    PDAL_ERR_INVALID_CALLBACK = -7,
+    PDAL_ERR_INVALID_CHUNK_SIZE = -8,
+    PDAL_ERR_INVALID_VIEW_POINTER = -9
+};
+
+// Helper function to get error message from error code
+const char* pdal_error_message(int error_code);
 
 #endif // PDAL_WRAPPER_H

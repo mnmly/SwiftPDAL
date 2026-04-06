@@ -40,7 +40,7 @@ PDALPipeline pdal_pipeline_create() {
 }
 
 int pdal_pipeline_parse_json(PDALPipeline pipeline_ptr, const char* json_string) {
-    if (!pipeline_ptr || !json_string) return -1; // Error code
+    if (!pipeline_ptr || !json_string) return PDAL_ERR_NOT_IMPLEMENTED; 
 
     pdal::PipelineManager* pipeline = static_cast<pdal::PipelineManager*>(pipeline_ptr);
     std::stringstream ss(json_string);
@@ -49,12 +49,12 @@ int pdal_pipeline_parse_json(PDALPipeline pipeline_ptr, const char* json_string)
         return 0; // Success
     } catch (const pdal_error& e) {
         // Log error if needed
-        return -2; // PDAL Error Code
+        return PDAL_ERR_PDAL; // PDAL Error Code
     }
 }
 
 int pdal_pipeline_execute(PDALPipeline pipeline_ptr) {
-    if (!pipeline_ptr) return -1;
+    if (!pipeline_ptr) return PDAL_ERR_NOT_IMPLEMENTED;
 
     pdal::PipelineManager* pipeline = static_cast<pdal::PipelineManager*>(pipeline_ptr);
     try {
@@ -62,12 +62,12 @@ int pdal_pipeline_execute(PDALPipeline pipeline_ptr) {
         return 0; // Success
     } catch (const pdal_error& e) {
         // Log error if needed
-        return -2; // PDAL Error Code
+        return PDAL_ERR_PDAL; // PDAL Error Code
     }
 }
 
 int pdal_pipeline_get_metadata_json(PDALPipeline pipeline_ptr, char* buffer, size_t buffer_size) {
-    if (!pipeline_ptr || !buffer || buffer_size == 0) return -1;
+    if (!pipeline_ptr || !buffer || buffer_size == 0) return PDAL_ERR_NOT_IMPLEMENTED;
 
     pdal::PipelineManager* pipeline = static_cast<pdal::PipelineManager*>(pipeline_ptr);
     std::stringstream ss;
@@ -77,12 +77,12 @@ int pdal_pipeline_get_metadata_json(PDALPipeline pipeline_ptr, char* buffer, siz
         std::string metadata_json = ss.str();
 
         if (metadata_json.length() + 1 > buffer_size) {
-            return -3; // Buffer too small
+            return PDAL_ERR_STD_EXCEPTION; // Buffer too small
         }
         strcpy(buffer, metadata_json.c_str()); // Use strcpy carefully!
         return 0; // Success
     } catch (const pdal_error& e) {
-        return -2; // PDAL Error Code
+        return PDAL_ERR_PDAL; // PDAL Error Code
     }
 }
 
@@ -348,7 +348,7 @@ static void extractBounds(pdal::PointViewPtr view, PDALBounds& bbox) {
     bbox.max_z = _bbox.maxz;
 }
 
-int pdal_read_binary(const std::string& reader_name_backup, const std::string& filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox){
+int pdal_read_binary(const char* reader_name_backup, const char* filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox){
 
     try {
         StageFactory factory;
@@ -356,13 +356,13 @@ int pdal_read_binary(const std::string& reader_name_backup, const std::string& f
         Stage* flipFilter = nullptr;
 
         Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter);
-        if (!finalStage) return -4;
+        if (!finalStage) return PDAL_ERR_CREATE_STAGE;
         
         PointTable table;
         finalStage->prepare(table);
         PointViewSet viewSet = finalStage->execute(table);
         
-        if (viewSet.empty()) return -5;
+        if (viewSet.empty()) return PDAL_ERR_NO_POINTS;
         PointViewPtr view = *viewSet.begin();
         pdal::PointLayoutPtr layout = view->layout();
 
@@ -397,11 +397,11 @@ int pdal_read_binary(const std::string& reader_name_backup, const std::string& f
         return 0;
     } catch (const pdal_error& e) {
         std::cerr << "PDAL Error: " << e.what() << std::endl;
-        return -2;
+        return PDAL_ERR_PDAL;
     } catch (const std::exception& e) {
-        return -3;
+        return PDAL_ERR_STD_EXCEPTION;
     } catch (...) {
-        return -6;
+        return PDAL_ERR_UNKNOWN;
     }
 }
 
@@ -428,20 +428,20 @@ struct PointViewContext {
     }
 };
 
-int pdal_load_info(const std::string& reader_name_backup, const std::string& filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PDALPointViewPtr* outView){
+int pdal_load_info(const char* reader_name_backup, const char* filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PDALPointViewPtr* outView){
     try {
         StageFactory factory;
         Stage* filter = nullptr;
         Stage* flipFilter = nullptr;
 
         Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter);
-        if (!finalStage) return -4;
+        if (!finalStage) return PDAL_ERR_CREATE_STAGE;
 
         auto table = std::make_shared<PointTable>();
         finalStage->prepare(*table);
         PointViewSet viewSet = finalStage->execute(*table);
 
-        if (viewSet.empty()) return -5;
+        if (viewSet.empty()) return PDAL_ERR_NO_POINTS;
         PointViewPtr view = *viewSet.begin();
         pdal::PointLayoutPtr layout = view->layout();
 
@@ -465,12 +465,12 @@ int pdal_load_info(const std::string& reader_name_backup, const std::string& fil
         return 0;
     } catch (const pdal_error& e) {
         std::cerr << "PDAL Error: " << e.what() << std::endl;
-        return -2;
+        return PDAL_ERR_PDAL;
     } catch (const std::exception& e) {
         std::cerr << "Error in pdal_load_info: " << e.what() << std::endl;
-        return -3;
+        return PDAL_ERR_STD_EXCEPTION;
     } catch (...) {
-        return -6;
+        return PDAL_ERR_UNKNOWN;
     }
 }
 
@@ -497,6 +497,9 @@ private:
     bool hasBounds;
     float minX, minY, minZ;
     float maxX, maxY, maxZ;
+    
+    // Cache for current point coordinates (avoid duplicate reads)
+    float currentX = 0.0f, currentY = 0.0f, currentZ = 0.0f;
 
 public:
     ProgressivePointLoader(size_t pointsPerChunk, ProgressCallback cb, void* ctx, const char* dimensionMapJSON = nullptr)
@@ -588,24 +591,27 @@ public:
             return false;
         }
 
-        // Track bounds per point
+        // Read coordinates once for both bounds tracking and dimension extraction
+        float x, y, z;
         if (hasBounds) {
-            float x = point.getFieldAs<float>(xDimId);
-            float y = point.getFieldAs<float>(yDimId);
-            float z = point.getFieldAs<float>(zDimId);
-
+            x = point.getFieldAs<float>(xDimId);
+            y = point.getFieldAs<float>(yDimId);
+            z = point.getFieldAs<float>(zDimId);
+            
+            // Update bounds with cached values
             minX = fmin(minX, x);
             minY = fmin(minY, y);
             minZ = fmin(minZ, z);
             maxX = fmax(maxX, x);
             maxY = fmax(maxY, y);
             maxZ = fmax(maxZ, z);
+            
+            // Cache for potential future use
+            currentX = x;
+            currentY = y;
+            currentZ = z;
         }
         
-        auto x = point.getFieldAs<float>(xDimId);
-        auto y = point.getFieldAs<float>(yDimId);
-        auto z = point.getFieldAs<float>(zDimId);
-
         // Write point data to current position in chunk
         char* pointBase = chunkBuffer.data() + (currentPointIndex * stride);
 
@@ -711,8 +717,8 @@ public:
 
 
 int pdal_read_binary_stream_progressive(
-    const std::string& reader_name_backup,
-    const std::string& filename,
+    const char* reader_name_backup,
+    const char* filename,
     size_t chunkSize,
     ProgressCallback onChunk,
     void* context,
@@ -722,15 +728,15 @@ int pdal_read_binary_stream_progressive(
     try {
         using namespace pdal;
 
-        if (!onChunk) return -7; // Invalid callback
-        if (chunkSize == 0) return -8; // Invalid chunk size
+        if (!onChunk) return PDAL_ERR_INVALID_CALLBACK; // Invalid callback
+        if (chunkSize == 0) return PDAL_ERR_INVALID_CHUNK_SIZE; // Invalid chunk size
 
         StageFactory factory;
         Stage* filter = nullptr;
         Stage* flipFilter = nullptr;
 
         Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter, dimensionMapJSON);
-        if (!finalStage) return -4;
+        if (!finalStage) return PDAL_ERR_CREATE_STAGE;
 
         bool isStreamable = finalStage->pipelineStreamable();
 
@@ -768,12 +774,12 @@ int pdal_read_binary_stream_progressive(
 
     } catch (const pdal::pdal_error& e) {
         std::cerr << "PDAL Error: " << e.what() << std::endl;
-        return -2;
+        return PDAL_ERR_PDAL;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
-        return -3;
+        return PDAL_ERR_STD_EXCEPTION;
     } catch (...) {
-        return -6;
+        return PDAL_ERR_UNKNOWN;
     }
 }
 
@@ -789,13 +795,13 @@ int pdal_read_binary_stream_from_view(
         using namespace pdal;
 
         if (!viewPtr) {
-            return -9; // Invalid view pointer
+            return PDAL_ERR_INVALID_VIEW_POINTER;
         }
         if (!onChunk) {
-            return -7; // Invalid callback
+            return PDAL_ERR_INVALID_CALLBACK;
         }
         if (chunkSize == 0) {
-            return -8; // Invalid chunk size
+            return PDAL_ERR_INVALID_CHUNK_SIZE;
         }
 
         // Cast back to PointViewContext
@@ -804,7 +810,7 @@ int pdal_read_binary_stream_from_view(
         pdal::PointLayoutPtr layout = ctx->layout;
 
         if (!view) {
-            return -9; // Invalid view
+            return PDAL_ERR_INVALID_VIEW_POINTER;
         }
 
         // Build dimension specs
@@ -911,12 +917,12 @@ int pdal_read_binary_stream_from_view(
 
     } catch (const pdal::pdal_error& e) {
         std::cerr << "PDAL Error: " << e.what() << std::endl;
-        return -2;
+        return PDAL_ERR_PDAL;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
-        return -3;
+        return PDAL_ERR_STD_EXCEPTION;
     } catch (...) {
-        return -6;
+        return PDAL_ERR_UNKNOWN;
     }
 }
 
@@ -939,20 +945,36 @@ int pdal_read_binary_stream_progressive(
     PDALBounds& bbox,
     const char* dimensionMapJSON)
 {
-    return -1; // Not implemented on iOS
+    return PDAL_ERR_NOT_IMPLEMENTED; // Not implemented on iOS
 }
 
 int pdal_read_binary_stream_from_view(
-    PDALPointViewPtr viewPtr,
+    PDALPointViewPtr view,
     size_t chunkSize,
     ProgressCallback onChunk,
     void* context,
     const char* dimensionMapJSON)
 {
-    return -1; // Not implemented on iOS
+    return PDAL_ERR_NOT_IMPLEMENTED; // Not implemented on iOS
 }
 
 void pdal_free_point_view(PDALPointViewPtr viewPtr) {
     // No-op on iOS
+}
+
+const char* pdal_error_message(int error_code) {
+    switch (error_code) {
+        case PDAL_OK: return "OK";
+        case PDAL_ERR_NOT_IMPLEMENTED: return "Not implemented on this platform";
+        case PDAL_ERR_PDAL: return "PDAL error occurred";
+        case PDAL_ERR_STD_EXCEPTION: return "Standard exception occurred";
+        case PDAL_ERR_CREATE_STAGE: return "Failed to create stage";
+        case PDAL_ERR_NO_POINTS: return "No points in view";
+        case PDAL_ERR_UNKNOWN: return "Unknown error";
+        case PDAL_ERR_INVALID_CALLBACK: return "Invalid callback";
+        case PDAL_ERR_INVALID_CHUNK_SIZE: return "Invalid chunk size";
+        case PDAL_ERR_INVALID_VIEW_POINTER: return "Invalid view pointer";
+        default: return "Unknown error code";
+    }
 }
 #endif

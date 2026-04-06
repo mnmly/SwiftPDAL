@@ -22,7 +22,7 @@ class OctreeRenderer {
 
     // Octree
     var octree: Octree?
-    var pointCloudBounds: PointCloud.Bounds?
+    var pointCloudBounds: Bounds?
 
     // Camera
     var camera: Camera

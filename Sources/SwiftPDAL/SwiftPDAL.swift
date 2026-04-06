@@ -22,29 +22,33 @@ public struct Bounds {
     /// - Parameter transform: The transformation matrix to apply
     /// - Returns: A new Bounds with transformed min and max corners
     public func transformed(by transform: simd_float4x4) -> Bounds {
-        // Transform the min and max corners
-        let minHomogeneous = simd_float4(min.x, min.y, min.z, 1.0)
-        let maxHomogeneous = simd_float4(max.x, max.y, max.z, 1.0)
+        // Transform all 8 corners of the AABB
+        let c0 = simd_float4(min.x, min.y, min.z, 1.0)
+        let c1 = simd_float4(max.x, min.y, min.z, 1.0)
+        let c2 = simd_float4(min.x, max.y, min.z, 1.0)
+        let c3 = simd_float4(max.x, max.y, min.z, 1.0)
+        let c4 = simd_float4(min.x, min.y, max.z, 1.0)
+        let c5 = simd_float4(max.x, min.y, max.z, 1.0)
+        let c6 = simd_float4(min.x, max.y, max.z, 1.0)
+        let c7 = simd_float4(max.x, max.y, max.z, 1.0)
 
-        let transformedMin = transform * minHomogeneous
-        let transformedMax = transform * maxHomogeneous
+        let t0 = transform * c0; let t1 = transform * c1
+        let t2 = transform * c2; let t3 = transform * c3
+        let t4 = transform * c4; let t5 = transform * c5
+        let t6 = transform * c6; let t7 = transform * c7
 
-        // Convert back to 3D coordinates (divide by w)
-        let min3D = simd_float3(
-            transformedMin.x / transformedMin.w,
-            transformedMin.y / transformedMin.w,
-            transformedMin.z / transformedMin.w
-        )
-        let max3D = simd_float3(
-            transformedMax.x / transformedMax.w,
-            transformedMax.y / transformedMax.w,
-            transformedMax.z / transformedMax.w
-        )
+        func unproject(_ p: simd_float4) -> simd_float3 {
+            simd_float3(p.x/p.w, p.y/p.w, p.z/p.w)
+        }
 
-        // After transformation, min and max might swap, so recalculate
+        let tc0 = unproject(t0); let tc1 = unproject(t1)
+        let tc2 = unproject(t2); let tc3 = unproject(t3)
+        let tc4 = unproject(t4); let tc5 = unproject(t5)
+        let tc6 = unproject(t6); let tc7 = unproject(t7)
+
         return Bounds(
-            min: simd_min(min3D, max3D),
-            max: simd_max(min3D, max3D)
+            min: simd_min(simd_min(tc0, tc1), simd_min(tc2, simd_min(tc3, simd_min(tc4, simd_min(tc5, simd_min(tc6, tc7)))))),
+            max: simd_max(simd_max(tc0, tc1), simd_max(tc2, simd_max(tc3, simd_max(tc4, simd_max(tc5, simd_max(tc6, tc7))))))
         )
     }
     
@@ -117,8 +121,8 @@ public struct PointCloud: PointCloudData {
         var bbox = PDALBounds()
         
         let result = pdal_read_binary(
-                    std.string(readerName),
-                    std.string(path),
+                    readerName.cString(using: .utf8)!.withUnsafeBufferPointer { $0.baseAddress! },
+                    path.cString(using: .utf8)!.withUnsafeBufferPointer { $0.baseAddress! },
                     &outData,
                     &outSize,
                     &outCount,
@@ -241,7 +245,7 @@ public struct PointCloudChunk: @unchecked Sendable {
     public let currentBounds: Bounds
 
     public var data: UnsafeRawPointer {
-        ownedData.withUnsafeBytes { $0.baseAddress! }
+        ownedData.withUnsafeBytes { $0.baseAddress.unsafelyUnwrapped }
     }
 
     public init(data: Data, pointCount: Int, stride: Int, isComplete: Bool, totalPointsSoFar: Int, estimatedTotalPoints: Int, currentBounds: Bounds) {
@@ -309,8 +313,7 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
         if let mtlBuffer {
             return UnsafeRawPointer(mtlBuffer.contents())
         }
-        // Return a null pointer if no buffer exists yet
-        return UnsafeRawPointer(bitPattern: 0)!
+        fatalError("StreamingPointCloud.data: No buffer available")
     }
 
     public var mtlBuffer: MTLBuffer?
@@ -365,8 +368,8 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
         var outView: UnsafeMutableRawPointer? = nil
 
         let result = pdal_load_info(
-                    std.string(readerName),
-                    std.string(filePath),
+                    readerName.cString(using: .utf8)!.withUnsafeBufferPointer { $0.baseAddress! },
+                    filePath.cString(using: .utf8)!.withUnsafeBufferPointer { $0.baseAddress! },
                     &outCount,
                     &outStride,
                     &dimList,
@@ -458,7 +461,6 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
     
     public func makeBuffer(device: any MTLDevice, options: MTLResourceOptions) -> (any MTLBuffer)? {
         let totalByteLength = pointCount * stride
-        let options: MTLResourceOptions = .storageModeShared
         mtlBuffer = device.makeBuffer(length: totalByteLength, options: options)
         return mtlBuffer
     }
@@ -476,12 +478,8 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
         let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
         let paths = PointCloud.getPaths(isTesting: isTesting)
 
-        setenv("PROJ_DATA", paths.projDBURL, 1)
-        setenv("PDAL_DRIVER_PATH", paths.driversURL, 1)
-
         var bbox = PDALBounds()
 
-        // Box to hold our Swift closure and mutable state
         final class CallbackBox {
             var onProgress: (StreamingProgress) -> Bool
             var savedDimensions: [DimensionInfo]?
@@ -491,7 +489,6 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
             }
 
             func handle(chunkData: ChunkData, dimInfo: UnsafePointer<PDALDimensionInfo>?, dimCount: Int) -> Bool {
-                // In handle():
                 if savedDimensions == nil && chunkData.dimensionCount > 0 {
                     if let dims = chunkData.dimensions {
                         savedDimensions = (0..<chunkData.dimensionCount).map { i in
@@ -510,7 +507,6 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
             }
         }
 
-        // Create a box to hold our callback and dimensions
         final class CallbackContext {
             let box: CallbackBox
             var dimensions: [PDALDimensionInfo] = []
@@ -527,25 +523,21 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
             Unmanaged<CallbackContext>.fromOpaque(contextPtr).release()
         }
 
-        // C-compatible callback function that uses context pointer
         let callback: @convention(c) (
-            UnsafePointer<ChunkData>?, // chunk
-            UnsafeMutableRawPointer?   // context
+            UnsafePointer<ChunkData>?,
+            UnsafeMutableRawPointer?
         ) -> Bool = { chunk, ctx in
             guard let ctx = ctx, let chunk = chunk else {
-                print("DEBUG Swift: No context or chunk!")
                 return false
             }
             let chunkData = chunk.pointee
             let context = Unmanaged<CallbackContext>.fromOpaque(ctx).takeUnretainedValue()
-            // Use dimensions stored in context
             return context.box.handle(chunkData: chunkData, dimInfo: nil, dimCount: context.dimensions.count)
         }
         
-        // Call C++ function with context-based callback
         let result = pdal_read_binary_stream_progressive(
-                std.string(readerName),
-                std.string(path),
+                readerName.cString(using: .utf8)!.withUnsafeBufferPointer { $0.baseAddress! },
+                path.cString(using: .utf8)!.withUnsafeBufferPointer { $0.baseAddress! },
                 chunkSize,
                 callback,
                 contextPtr,
@@ -581,7 +573,6 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
         dimensionMapJSON: String?,
         onProgress: @escaping (StreamingProgress) -> Bool
     ) throws {
-        // Box to hold our Swift closure and mutable state
         final class CallbackBox {
             var onProgress: (StreamingProgress) -> Bool
             var savedDimensions: [DimensionInfo]?
@@ -591,7 +582,6 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
             }
 
             func handle(chunkData: ChunkData, dimInfo: UnsafePointer<PDALDimensionInfo>?, dimCount: Int) -> Bool {
-                // Save dimensions on first call
                 if savedDimensions == nil && chunkData.dimensionCount > 0 {
                     if let dims = chunkData.dimensions {
                         savedDimensions = (0..<chunkData.dimensionCount).map { i in
@@ -684,6 +674,35 @@ extension PointCloud {
 }
 
 // MARK: - PDAL Dimension Type Helpers
+
+/// Error codes for PDAL operations
+public enum PDALError: Int {
+    case ok = 0
+    case notImplemented = -1
+    case pdalError = -2
+    case stdException = -3
+    case createStageFailed = -4
+    case noPoints = -5
+    case unknown = -6
+    case invalidCallback = -7
+    case invalidChunkSize = -8
+    case invalidViewPointer = -9
+    
+    public var message: String {
+        switch self {
+        case .ok: return "OK"
+        case .notImplemented: return "Not implemented on this platform"
+        case .pdalError: return "PDAL error occurred"
+        case .stdException: return "Standard exception occurred"
+        case .createStageFailed: return "Failed to create stage"
+        case .noPoints: return "No points in view"
+        case .unknown: return "Unknown error"
+        case .invalidCallback: return "Invalid callback"
+        case .invalidChunkSize: return "Invalid chunk size"
+        case .invalidViewPointer: return "Invalid view pointer"
+        }
+    }
+}
 
 /// Helper utilities for working with PDAL Dimension Types
 public enum PDALDimensionTypeHelper {

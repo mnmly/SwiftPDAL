@@ -24,7 +24,7 @@ class Camera {
         updatePosition()
     }
 
-    func centerOn(bounds: PointCloud.Bounds) {
+    func centerOn(bounds: Bounds) {
         // Calculate center
         target = (bounds.min + bounds.max) * 0.5
 

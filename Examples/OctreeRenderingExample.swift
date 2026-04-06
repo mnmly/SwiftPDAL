@@ -148,7 +148,7 @@ struct OctreeRenderingExample {
         print()
     }
 
-    static func testFrustumCulling(octree: Octree, bounds: PointCloud.Bounds) {
+    static func testFrustumCulling(octree: Octree, bounds: Bounds) {
         print("👁️  Testing frustum culling...")
 
         // Create a simple frustum from camera parameters
