@@ -14,7 +14,7 @@ public protocol PointCloudData {
     mutating func makeBuffer(device: MTLDevice, options: MTLResourceOptions) -> MTLBuffer?
 }
     
-public struct Bounds {
+public struct Bounds: Sendable {
     public let min: simd_float3
     public let max: simd_float3
 
@@ -135,17 +135,12 @@ public final class PointCloud: PointCloudData {
         var dimCount: Int = 0
         var bbox = PDALBounds()
         
-        guard let readerCString = readerName.cString(using: .utf8),
-              let pathCString = path.cString(using: .utf8) else {
-            throw PointCloudError.readFailed("Failed to convert strings to C strings")
-        }
-        
         var result: Int32 = 0
-        withUnsafePointer(to: readerCString) { readerPtr in
-            withUnsafePointer(to: pathCString) { pathPtr in
+        readerName.withCString { readerPtr in
+            path.withCString { pathPtr in
                 result = pdal_read_binary(
-                    readerCString,
-                    pathCString,
+                    readerPtr,
+                    pathPtr,
                     &outData,
                     &outSize,
                     &outCount,
@@ -155,10 +150,6 @@ public final class PointCloud: PointCloudData {
                     &bbox
                 )
             }
-        }
-
-        guard result == 0, let data = outData else {
-            throw PointCloudError.readFailed("Failed to read point cloud from \(path)")
         }
 
         guard result == 0, let data = outData else {
@@ -240,19 +231,6 @@ public final class PointCloud: PointCloudData {
     }
 }
 
-// MARK: - PointCloud Extension
-
-extension PointCloudData {
-    public func buildOctree(maxPointsPerNode: Int = 100, maxDepth: Int = 8, useMortonOrder: Bool = true) -> Octree {
-        Octree(
-            pointCloud: self,
-            maxPointsPerNode: maxPointsPerNode,
-            maxDepth: maxDepth,
-            useMortonOrder: useMortonOrder
-        )
-    }
-}
-
 public enum PointCloudError: Error {
     case readFailed(String)
     case streamingFailed(String)
@@ -264,7 +242,7 @@ public enum PointCloudError: Error {
 // Note: Marked nonisolated(unsafe) because PDAL streaming is synchronous single-threaded
 nonisolated(unsafe) private var streamingCallbackGlobal: ((ChunkData, UnsafePointer<PDALDimensionInfo>?, Int) -> Bool)?
 
-public struct PointCloudChunk: @unchecked Sendable {
+public struct PointCloudChunk: Sendable {
     private let ownedData: Data  // Owns a copy of the data
     public let pointCount: Int
     public let stride: Int
@@ -336,9 +314,12 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
     // Swift ARC integrates with std::shared_ptr reference counting automatically
     private var pointViewContext: PointViewContextPtr? = nil
 
-    //
+    private var _bounds: Bounds = .init(min: .zero, max: .zero)
+    public var bounds: Bounds {
+        get { boundsLock.withLock { _bounds } }
+        set { boundsLock.withLock { _bounds = newValue } }
+    }
     public var pointCount: Int = 0
-    public var bounds: Bounds = .init(min: .zero, max: .zero)
     public var data: UnsafeRawPointer {
         if let mtlBuffer {
             return UnsafeRawPointer(mtlBuffer.contents())
@@ -451,9 +432,7 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
                             chunkSize: chunkSize,
                             dimensionMap: dimMap
                         ) { progress in
-                            self?.boundsLock.withLock {
-                                self?.bounds = progress.chunk.currentBounds
-                            }
+                            self?.bounds = progress.chunk.currentBounds
                             continuation.yield(progress)
                             return !Task.isCancelled
                         }
@@ -464,9 +443,7 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
                             chunkSize: chunkSize,
                             dimensionMap: dimMap
                         ) { progress in
-                            self?.boundsLock.withLock {
-                                self?.bounds = progress.chunk.currentBounds
-                            }
+                            self?.bounds = progress.chunk.currentBounds
                             continuation.yield(progress)
                             return !Task.isCancelled
                         }
@@ -496,7 +473,7 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
         onProgress: @escaping (StreamingProgress) -> Bool
     ) throws -> Bounds {
         let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
-        let paths = PointCloud.getPaths(isTesting: isTesting)
+        let _ = PointCloud.getPaths(isTesting: isTesting)
 
         var bbox = PDALBounds()
 
@@ -669,6 +646,7 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
             case -7: errorMessage = "Invalid callback"
             case -8: errorMessage = "Invalid chunk size"
             case -9: errorMessage = "Invalid view pointer"
+            case -10: errorMessage = "Memory allocation failed"
             default: errorMessage = "Unknown error code: \(result)"
             }
             throw PointCloudError.streamingFailed("Failed to stream from view: \(errorMessage)")
@@ -712,6 +690,7 @@ public enum PDALError: Int {
     case invalidCallback = -7
     case invalidChunkSize = -8
     case invalidViewPointer = -9
+    case allocFailed = -10
     
     public var message: String {
         switch self {
@@ -725,6 +704,7 @@ public enum PDALError: Int {
         case .invalidCallback: return "Invalid callback"
         case .invalidChunkSize: return "Invalid chunk size"
         case .invalidViewPointer: return "Invalid view pointer"
+        case .allocFailed: return "Memory allocation failed"
         }
     }
 }

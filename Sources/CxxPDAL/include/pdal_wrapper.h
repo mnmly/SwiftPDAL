@@ -172,7 +172,8 @@ enum PDALError {
     PDAL_ERR_UNKNOWN = -6,
     PDAL_ERR_INVALID_CALLBACK = -7,
     PDAL_ERR_INVALID_CHUNK_SIZE = -8,
-    PDAL_ERR_INVALID_VIEW_POINTER = -9
+    PDAL_ERR_INVALID_VIEW_POINTER = -9,
+    PDAL_ERR_ALLOC_FAILED = -10
 };
 
 // Helper function to get error message from error code

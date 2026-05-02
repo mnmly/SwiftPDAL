@@ -18,18 +18,6 @@ let package = Package(
             type: .dynamic,
             targets: ["SwiftPDAL"],
         ),
-        .executable(
-            name: "OctreeRenderingExample",
-            targets: ["OctreeRenderingExample"]
-        ),
-        .executable(
-            name: "StreamingExample",
-            targets: ["StreamingExample"]
-        ),
-        .executable(
-            name: "MetalOctreeViewer",
-            targets: ["MetalOctreeViewer"]
-        ),
     ],
     targets: [
         .binaryTarget(
@@ -76,39 +64,6 @@ let package = Package(
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
                 .define("SWIFTPDAL_TESTING")
-            ]
-        ),
-
-        .executableTarget(
-            name: "OctreeRenderingExample",
-            dependencies: ["SwiftPDAL"],
-            path: "Examples",
-            sources: ["OctreeRenderingExample.swift"],
-            swiftSettings: [
-                .interoperabilityMode(.Cxx)
-            ]
-        ),
-
-        .executableTarget(
-            name: "StreamingExample",
-            dependencies: ["SwiftPDAL"],
-            path: "Examples",
-            sources: ["StreamingExample.swift"],
-            swiftSettings: [
-                .interoperabilityMode(.Cxx),
-                .define("SWIFTPDAL_TESTING")
-            ]
-        ),
-
-        .executableTarget(
-            name: "MetalOctreeViewer",
-            dependencies: ["SwiftPDAL"],
-            path: "Examples/MetalOctreeViewer",
-            resources: [
-                .process("Shaders.metal")
-            ],
-            swiftSettings: [
-                .interoperabilityMode(.Cxx)
             ]
         ),
     ],

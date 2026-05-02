@@ -8,6 +8,9 @@
 // pdal_wrapper.cpp
 #include "include/pdal_wrapper.h"
 
+#include <cstdlib>
+#include <unistd.h>
+
 // Platform-specific includes
 #if defined(PDAL_IOS)
 // iOS minimal implementation
@@ -97,7 +100,7 @@ int pdal_pipeline_get_metadata_json(PDALPipeline pipeline_ptr, char* buffer, siz
 }
 
 void pdal_free_data(const char* data, PDALDimensionInfo* dimList, size_t dimCount) {
-    delete[] data;
+    if (data) free(const_cast<char*>(data));
     if (dimList) {
         for (size_t i = 0; i < dimCount; i++) {
             free((void*)dimList[i].name);  // Free each string
@@ -318,7 +321,12 @@ int pdal_read_binary(const char* reader_name_backup, const char* filename, const
         size_t pointCount = view->size();
         size_t totalSize = pointCount * stride;
 
-        char* storage = new char[totalSize];
+        void* alignedPtr = nullptr;
+        int alignResult = posix_memalign(&alignedPtr, sysconf(_SC_PAGESIZE), totalSize);
+        if (alignResult != 0 || !alignedPtr) {
+            return PDAL_ERR_ALLOC_FAILED;
+        }
+        char* storage = static_cast<char*>(alignedPtr);
         std::memset(storage, 0, totalSize);  // Zero out padding bytes
 
         extractBounds(view, bbox);
@@ -886,6 +894,7 @@ const char* pdal_error_message(int error_code) {
         case PDAL_ERR_INVALID_CALLBACK: return "Invalid callback";
         case PDAL_ERR_INVALID_CHUNK_SIZE: return "Invalid chunk size";
         case PDAL_ERR_INVALID_VIEW_POINTER: return "Invalid view pointer";
+        case PDAL_ERR_ALLOC_FAILED: return "Memory allocation failed";
         default: return "Unknown error code";
     }
 }
