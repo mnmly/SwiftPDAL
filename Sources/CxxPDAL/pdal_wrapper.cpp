@@ -48,8 +48,11 @@ int pdal_pipeline_parse_json(PDALPipeline pipeline_ptr, const char* json_string)
         pipeline->readPipeline(ss);
         return 0; // Success
     } catch (const pdal_error& e) {
-        // Log error if needed
-        return PDAL_ERR_PDAL; // PDAL Error Code
+        return PDAL_ERR_PDAL;
+    } catch (const std::exception& e) {
+        return PDAL_ERR_STD_EXCEPTION;
+    } catch (...) {
+        return PDAL_ERR_UNKNOWN;
     }
 }
 
@@ -61,8 +64,11 @@ int pdal_pipeline_execute(PDALPipeline pipeline_ptr) {
         pipeline->execute();
         return 0; // Success
     } catch (const pdal_error& e) {
-        // Log error if needed
-        return PDAL_ERR_PDAL; // PDAL Error Code
+        return PDAL_ERR_PDAL;
+    } catch (const std::exception& e) {
+        return PDAL_ERR_STD_EXCEPTION;
+    } catch (...) {
+        return PDAL_ERR_UNKNOWN;
     }
 }
 
@@ -79,10 +85,14 @@ int pdal_pipeline_get_metadata_json(PDALPipeline pipeline_ptr, char* buffer, siz
         if (metadata_json.length() + 1 > buffer_size) {
             return PDAL_ERR_STD_EXCEPTION; // Buffer too small
         }
-        strcpy(buffer, metadata_json.c_str()); // Use strcpy carefully!
+        strcpy(buffer, metadata_json.c_str());
         return 0; // Success
     } catch (const pdal_error& e) {
-        return PDAL_ERR_PDAL; // PDAL Error Code
+        return PDAL_ERR_PDAL;
+    } catch (const std::exception& e) {
+        return PDAL_ERR_STD_EXCEPTION;
+    } catch (...) {
+        return PDAL_ERR_UNKNOWN;
     }
 }
 
@@ -96,73 +106,14 @@ void pdal_free_data(const char* data, PDALDimensionInfo* dimList, size_t dimCoun
     }
 }
 
-// Helper class to parse and manage dimension name mappings
-class DimensionMapper {
-private:
-    std::map<std::string, std::string> mappings;  // originalName -> standardName
-
-public:
-    DimensionMapper(const char* jsonString = nullptr) {
-        if (!jsonString || std::strlen(jsonString) == 0) {
-            return;
-        }
-
-        try {
-            // Parse JSON manually (simple key-value pairs)
-            // Expected format: [{"band_1":"Z"}, {"band_2":"X"}]
-            // For simplicity, we'll use a basic parser
-            std::string json(jsonString);
-
-            // Remove whitespace
-            json.erase(std::remove_if(json.begin(), json.end(), ::isspace), json.end());
-
-            // Parse array of objects
-            size_t pos = 0;
-            while ((pos = json.find('{', pos)) != std::string::npos) {
-                size_t endPos = json.find('}', pos);
-                if (endPos == std::string::npos) break;
-
-                std::string objStr = json.substr(pos + 1, endPos - pos - 1);
-
-                // Parse key:value pair
-                size_t colonPos = objStr.find(':');
-                if (colonPos != std::string::npos) {
-                    std::string key = objStr.substr(0, colonPos);
-                    std::string value = objStr.substr(colonPos + 1);
-
-                    // Remove quotes
-                    key.erase(std::remove(key.begin(), key.end(), '\"'), key.end());
-                    value.erase(std::remove(value.begin(), value.end(), '\"'), value.end());
-
-                    if (!key.empty() && !value.empty()) {
-                        mappings[key] = value;
-                    }
-                }
-
-                pos = endPos + 1;
-            }
-        } catch (...) {
-            std::cerr << "Error parsing dimension map JSON" << std::endl;
-            mappings.clear();
+static std::string resolveDimension(const DimensionMap& mappings, const std::string& standardName) {
+    for (const auto& pair : mappings) {
+        if (strcasecmp(pair.second.c_str(), standardName.c_str()) == 0) {
+            return pair.first;
         }
     }
-
-    // Resolve a standard dimension name to its actual name in the file
-    // e.g., resolveDimension("Z") might return "band_1" if mapped
-    std::string resolveDimension(const std::string& standardName) const {
-        // Look for reverse mapping: find originalName where value == standardName
-        for (const auto& pair : mappings) {
-            if (strcasecmp(pair.second.c_str(), standardName.c_str()) == 0) {
-                return pair.first;  // Return original name
-            }
-        }
-        return standardName;  // No mapping, return standard name
-    }
-
-    bool isEmpty() const {
-        return mappings.empty();
-    }
-};
+    return standardName;
+}
 
 static Stage* createConfiguredStage(
     const std::string& reader_name_backup,
@@ -170,7 +121,7 @@ static Stage* createConfiguredStage(
     StageFactory& factory,
     Stage** outFilter,
     Stage** outFlipFilter,
-    const char* dimensionMapJSON = nullptr, // New parameter
+    const DimensionMap& dimensionMap = {},
     bool applyTransformation = true)
 {
     // 1. Resolve Reader
@@ -198,13 +149,8 @@ static Stage* createConfiguredStage(
     Stage* finalStage = reader;
     
     // 2. Handle Dimension Mapping (Fix for the "0 Y" issue)
-    DimensionMapper mapper(dimensionMapJSON);
-    std::string originalZ = "Z";
-    if (!mapper.isEmpty()) {
-        // Find which original name (e.g., "band_1") is supposed to be "Z"
-        originalZ = mapper.resolveDimension("Z");
-    }
-    
+    std::string originalZ = dimensionMap.empty() ? "Z" : resolveDimension(dimensionMap, "Z");
+
     // Add this after reader configuration to drop NoData points
     Options rangeOptions;
     rangeOptions.add("limits", originalZ + "!(-9999:-9999)");
@@ -414,21 +360,7 @@ int pdal_read_binary(const char* reader_name_backup, const char* filename, const
 #include <pdal/Streamable.hpp>
 #include <pdal/filters/StreamCallbackFilter.hpp>
 
-// Structure to hold PointView and PointTable together
-// CRITICAL: PointTable MUST remain alive for PointView to be valid
-// The PointView references memory owned by the PointTable
-struct PointViewContext {
-    pdal::PointViewPtr view;
-    std::shared_ptr<pdal::PointTable> table;  // Keep the table alive!
-    pdal::PointLayoutPtr layout;
-
-    PointViewContext(pdal::PointViewPtr v, std::shared_ptr<pdal::PointTable> t)
-        : view(v), table(t), layout(v->layout()) {
-        std::cerr << "DEBUG: PointViewContext created with " << layout->dims().size() << " dimensions" << std::endl;
-    }
-};
-
-int pdal_load_info(const char* reader_name_backup, const char* filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PDALPointViewPtr* outView){
+int pdal_load_info(const char* reader_name_backup, const char* filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PointViewContextPtr& outView){
     try {
         StageFactory factory;
         Stage* filter = nullptr;
@@ -455,12 +387,8 @@ int pdal_load_info(const char* reader_name_backup, const char* filename, size_t*
         *outStride = stride;
         *dimList = specs;
 
-        // Return the PointView if requested (for later streaming)
-        if (outView) {
-            // CRITICAL: Keep both view AND table alive
-            PointViewContext* ctx = new PointViewContext(view, table);
-            *outView = static_cast<PDALPointViewPtr>(ctx);
-        }
+        // Return the PointViewContext via shared_ptr for automatic lifetime management
+        outView = std::make_shared<PointViewContext>(view, table);
 
         return 0;
     } catch (const pdal_error& e) {
@@ -490,7 +418,7 @@ private:
     void* callbackContext;
     bool initialized;
     bool isFirstChunk;  // NEW: Track first chunk
-    DimensionMapper dimMapper;  // NEW: Dimension name mapper
+    DimensionMap dimMap;  // NEW: Dimension name mapping
 
     // Bounds tracking
     pdal::Dimension::Id xDimId, yDimId, zDimId;
@@ -502,7 +430,7 @@ private:
     float currentX = 0.0f, currentY = 0.0f, currentZ = 0.0f;
 
 public:
-    ProgressivePointLoader(size_t pointsPerChunk, ProgressCallback cb, void* ctx, const char* dimensionMapJSON = nullptr)
+    ProgressivePointLoader(size_t pointsPerChunk, ProgressCallback cb, void* ctx, const DimensionMap& dimensionMap = {})
         : chunkSize(pointsPerChunk)
         , currentPointIndex(0)
         , totalPointsProcessed(0)
@@ -513,7 +441,7 @@ public:
         , callbackContext(ctx)
         , initialized(false)
         , isFirstChunk(true)  // NEW
-        , dimMapper(dimensionMapJSON)  // NEW: Initialize dimension mapper
+        , dimMap(dimensionMap)  // NEW: Store dimension map
         , hasBounds(false)
         , minX(std::numeric_limits<double>::max())
         , minY(std::numeric_limits<double>::max())
@@ -537,10 +465,9 @@ public:
         dimSpecs = new PDALDimensionInfo[dimCount];
 
         // Find X, Y, Z dimension IDs for bounds tracking
-        // Use dimension mapper to resolve names
-        std::string xName = dimMapper.resolveDimension("X");
-        std::string yName = dimMapper.resolveDimension("Y");
-        std::string zName = dimMapper.resolveDimension("Z");
+        std::string xName = dimMap.empty() ? "X" : resolveDimension(dimMap, "X");
+        std::string yName = dimMap.empty() ? "Y" : resolveDimension(dimMap, "Y");
+        std::string zName = dimMap.empty() ? "Z" : resolveDimension(dimMap, "Z");
 
         xDimId = layout->findDim(xName);
         yDimId = layout->findDim(yName);
@@ -723,7 +650,7 @@ int pdal_read_binary_stream_progressive(
     ProgressCallback onChunk,
     void* context,
     PDALBounds& bbox,
-    const char* dimensionMapJSON)
+    const DimensionMap& dimensionMap)
 {
     try {
         using namespace pdal;
@@ -735,7 +662,7 @@ int pdal_read_binary_stream_progressive(
         Stage* filter = nullptr;
         Stage* flipFilter = nullptr;
 
-        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter, dimensionMapJSON);
+        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter, dimensionMap);
         if (!finalStage) return PDAL_ERR_CREATE_STAGE;
 
         bool isStreamable = finalStage->pipelineStreamable();
@@ -745,7 +672,7 @@ int pdal_read_binary_stream_progressive(
 
 
         // Create progressive loader with dimension mapping
-        ProgressivePointLoader loader(chunkSize, onChunk, context, dimensionMapJSON);
+        ProgressivePointLoader loader(chunkSize, onChunk, context, dimensionMap);
 
         // Setup streaming callback filter
         StreamCallbackFilter streamFilter;
@@ -783,18 +710,18 @@ int pdal_read_binary_stream_progressive(
     }
 }
 
-// New function: Stream from an existing PointViewPtr (avoids re-reading the file)
+// New function: Stream from an existing PointViewContext (avoids re-reading the file)
 int pdal_read_binary_stream_from_view(
-    PDALPointViewPtr viewPtr,
+    const PointViewContextPtr& viewCtx,
     size_t chunkSize,
     ProgressCallback onChunk,
     void* context,
-    const char* dimensionMapJSON)
+    const DimensionMap& dimensionMap)
 {
     try {
         using namespace pdal;
 
-        if (!viewPtr) {
+        if (!viewCtx) {
             return PDAL_ERR_INVALID_VIEW_POINTER;
         }
         if (!onChunk) {
@@ -804,10 +731,8 @@ int pdal_read_binary_stream_from_view(
             return PDAL_ERR_INVALID_CHUNK_SIZE;
         }
 
-        // Cast back to PointViewContext
-        PointViewContext* ctx = static_cast<PointViewContext*>(viewPtr);
-        PointViewPtr view = ctx->view;
-        pdal::PointLayoutPtr layout = ctx->layout;
+        PointViewPtr view = viewCtx->view;
+        pdal::PointLayoutPtr layout = viewCtx->layout;
 
         if (!view) {
             return PDAL_ERR_INVALID_VIEW_POINTER;
@@ -824,10 +749,9 @@ int pdal_read_binary_stream_from_view(
         bool isFirstChunk = true;  // Track first chunk
 
         // Initialize bounds tracking with dimension mapping
-        DimensionMapper dimMapper(dimensionMapJSON);
-        std::string xName = dimMapper.resolveDimension("X");
-        std::string yName = dimMapper.resolveDimension("Y");
-        std::string zName = dimMapper.resolveDimension("Z");
+        std::string xName = dimensionMap.empty() ? "X" : resolveDimension(dimensionMap, "X");
+        std::string yName = dimensionMap.empty() ? "Y" : resolveDimension(dimensionMap, "Y");
+        std::string zName = dimensionMap.empty() ? "Z" : resolveDimension(dimensionMap, "Z");
 
         Dimension::Id xDimId = layout->findDim(xName);
         Dimension::Id yDimId = layout->findDim(yName);
@@ -926,40 +850,28 @@ int pdal_read_binary_stream_from_view(
     }
 }
 
-// Free the PointViewPtr
-void pdal_free_point_view(PDALPointViewPtr viewPtr) {
-    if (viewPtr) {
-        PointViewContext* ctx = static_cast<PointViewContext*>(viewPtr);
-        delete ctx;
-    }
-}
-
 #else
 // iOS stub implementation
 int pdal_read_binary_stream_progressive(
-    const std::string& reader_name_backup,
-    const std::string& filename,
+    const char* reader_name_backup,
+    const char* filename,
     size_t chunkSize,
     ProgressCallback onChunk,
     void* context,
     PDALBounds& bbox,
-    const char* dimensionMapJSON)
+    const DimensionMap& dimensionMap)
 {
     return PDAL_ERR_NOT_IMPLEMENTED; // Not implemented on iOS
 }
 
 int pdal_read_binary_stream_from_view(
-    PDALPointViewPtr view,
+    const PointViewContextPtr& view,
     size_t chunkSize,
     ProgressCallback onChunk,
     void* context,
-    const char* dimensionMapJSON)
+    const DimensionMap& dimensionMap)
 {
     return PDAL_ERR_NOT_IMPLEMENTED; // Not implemented on iOS
-}
-
-void pdal_free_point_view(PDALPointViewPtr viewPtr) {
-    // No-op on iOS
 }
 
 const char* pdal_error_message(int error_code) {

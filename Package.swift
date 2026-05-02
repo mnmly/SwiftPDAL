@@ -34,13 +34,13 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "gdal",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-v3.12/gdal.xcframework.zip",
-            checksum: "9b4cdaac0cd6d75d7d8550360bc6e3427361d588ffdf7b040b8b9f3e8d5cbb41"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1/gdal.xcframework.zip",
+            checksum: "6beb1207e1cad7849191a5423e1f097bb9631747b30b96df3ff971de7ba2d187"
         ),
         .binaryTarget(
             name: "pdalcpp",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/pdalcpp-v2.9/pdalcpp.xcframework.zip",
-            checksum: "58921a58da064cfdcb3857559a75a0cc9218c1c9816491e863724158788a22a8"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1/pdalcpp.xcframework.zip",
+            checksum: "2b495d8754c0f6009226a11b5829501414d9b9f6739ad2fb75b539af244c34d3"
         ),
 
         // C++ wrapper target for PDAL
@@ -86,12 +86,6 @@ let package = Package(
             sources: ["OctreeRenderingExample.swift"],
             swiftSettings: [
                 .interoperabilityMode(.Cxx)
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../../../Frameworks/gdal.xcframework/macos-arm64/gdal.framework",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../Frameworks/gdal.xcframework/macos-arm64/gdal.framework"
-                ])
             ]
         ),
 
@@ -103,12 +97,6 @@ let package = Package(
             swiftSettings: [
                 .interoperabilityMode(.Cxx),
                 .define("SWIFTPDAL_TESTING")
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../../../Frameworks/gdal.xcframework/macos-arm64/gdal.framework",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../Frameworks/gdal.xcframework/macos-arm64/gdal.framework"
-                ])
             ]
         ),
 
@@ -121,12 +109,6 @@ let package = Package(
             ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx)
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../../../Frameworks/gdal.xcframework/macos-arm64/gdal.framework",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../Frameworks/gdal.xcframework/macos-arm64/gdal.framework"
-                ])
             ]
         ),
     ],

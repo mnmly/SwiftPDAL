@@ -6,6 +6,8 @@ import simd
 @main
 struct StreamingExample {
     static func main() async {
+        setenv("SWIFTPDAL_TESTING", "1", 1)
+
         print("=== Streaming Point Cloud Example ===\n")
 
         // Get the path to a test file
@@ -109,8 +111,7 @@ struct StreamingExample {
 
         // Now load with regular PointCloud.read and compare
         print("\n   📊 Comparing with regular PointCloud.read()...")
-        var regularCloud = try PointCloud.read(from: path, readerName: "readers.las")
-        defer { regularCloud.cleanup() }
+        let regularCloud = try PointCloud.read(from: path, readerName: "readers.las")
         print("   Regular cloud point count: \(regularCloud.pointCount)")
 
         // Find X, Y, Z dimensions in regular cloud

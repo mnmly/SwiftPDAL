@@ -21,8 +21,7 @@ struct OctreeRenderingExample {
 
         do {
             // Read the point cloud
-            var pointCloud = try PointCloud.read(from: plyPath, readerName: "readers.ply")
-            defer { pointCloud.cleanup() }
+            let pointCloud = try PointCloud.read(from: plyPath, readerName: "readers.ply")
 
             print("✅ Point cloud loaded successfully!")
             print("   Points: \(pointCloud.pointCount)")

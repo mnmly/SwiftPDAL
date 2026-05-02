@@ -85,8 +85,7 @@ struct MetalViewRepresentable: NSViewRepresentable {
                 return
             }
 
-            var pointCloud = try PointCloud.read(from: plyPath, readerName: "readers.ply")
-            defer { pointCloud.cleanup() }
+            let pointCloud = try PointCloud.read(from: plyPath, readerName: "readers.ply")
 
             // Build octree
             let octree = pointCloud.buildOctree(maxPointsPerNode: 1000, maxDepth: 1, useMortonOrder: true)

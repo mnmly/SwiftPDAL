@@ -12,6 +12,8 @@
 #include <stddef.h> // For size_t
 #include <stdint.h>
 #include <stdbool.h> // For bool type
+#include <map>
+#include <memory>
 #include <string>
 #include "pdal_common.h"
 #include "pdal/Dimension.hpp"
@@ -42,6 +44,28 @@ typedef struct {
     size_t outputSize;
     size_t offset;
 } PDALDimensionInfo;
+
+#include "pdal/PointView.hpp"
+#include "pdal/PointTable.hpp"
+#include "pdal/PointLayout.hpp"
+
+struct PointViewContext {
+    pdal::PointViewPtr view;
+    std::shared_ptr<pdal::PointTable> table;
+    pdal::PointLayoutPtr layout;
+
+    PointViewContext(pdal::PointViewPtr v, std::shared_ptr<pdal::PointTable> t)
+        : view(v), table(t), layout(v->layout()) {}
+};
+
+// Type aliases required for Swift C++ interop (unspecialized class templates not supported)
+using PointViewContextPtr = std::shared_ptr<PointViewContext>;
+using DimensionMap = std::map<std::string, std::string>;
+
+// Helper for Swift -> C++ DimensionMap bridging (avoids operator[] L-value issues)
+inline void insert_dimension(DimensionMap& map, const std::string& key, const std::string& value) {
+    map[key] = value;
+}
 
 // Opaque pointer type for PDAL Pipeline (C doesn't have classes directly)
 typedef void* PDALPipeline;
@@ -83,12 +107,11 @@ typedef struct {
 
 
 // Opaque pointer to a PointView (for reusing loaded point data)
-typedef void* PDALPointViewPtr;
 
-// Load file info and retain the PointViewPtr for later streaming
+// Load file info and retain the PointViewContext for later streaming
 // Returns 0 on success, negative error code on failure
-// IMPORTANT: You must call pdal_free_point_view() when done to free the PointViewPtr
-int pdal_load_info(const char* reader_name_backup, const char* filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PDALPointViewPtr* outView);
+// outView receives a shared_ptr that manages the PointViewContext lifetime automatically
+int pdal_load_info(const char* reader_name_backup, const char* filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PointViewContextPtr& outView);
 
 
 // C-compatible callback function type for streaming chunks with context pointer
@@ -104,7 +127,7 @@ typedef bool (*ProgressCallback)(const ChunkData* chunk, void* context);
 //   onChunk: Callback function called for each chunk
 //   context: User context pointer passed to callback
 //   bbox: Output parameter for bounds
-//   dimensionMapJSON: Optional JSON string mapping dimension names (e.g., "{\"band_1\":\"Z\"}")
+//   dimensionMap: Optional map mapping dimension names (e.g., {"band_1": "Z"})
 // Returns: 0 on success, negative error code on failure
 int pdal_read_binary_stream_progressive(
     const char* reader_name_backup,
@@ -113,26 +136,24 @@ int pdal_read_binary_stream_progressive(
     ProgressCallback onChunk,
     void* context,
     PDALBounds& bbox,
-    const char* dimensionMapJSON = nullptr);
+    const DimensionMap& dimensionMap = {});
 
-// Streaming reader that reuses a pre-loaded PointViewPtr from pdal_load_info
+// Streaming reader that reuses a pre-loaded PointViewContext from pdal_load_info
 // This avoids re-reading the file - use this after calling pdal_load_info
+// The shared_ptr manages the PointViewContext lifetime automatically
 // Parameters:
-//   view: PointViewPtr obtained from pdal_load_info
+//   view: PointViewContext obtained from pdal_load_info
 //   chunkSize: Number of points per chunk (e.g., 10000)
 //   onChunk: Callback function called for each chunk
 //   context: User context pointer passed to callback
-//   dimensionMapJSON: Optional JSON string mapping dimension names (e.g., "{\"band_1\":\"Z\"}")
+//   dimensionMap: Optional map mapping dimension names (e.g., {"band_1": "Z"})
 // Returns: 0 on success, negative error code on failure
 int pdal_read_binary_stream_from_view(
-    PDALPointViewPtr view,
+    const PointViewContextPtr& view,
     size_t chunkSize,
     ProgressCallback onChunk,
     void* context,
-    const char* dimensionMapJSON = nullptr);
-
-// Free a PointViewPtr obtained from pdal_load_info
-void pdal_free_point_view(PDALPointViewPtr view);
+    const DimensionMap& dimensionMap = {});
 
 // Function to destroy the PDAL Pipeline and release resources
 void pdal_pipeline_destroy(PDALPipeline pipeline);

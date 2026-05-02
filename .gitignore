@@ -4,6 +4,7 @@
 
 ## User settings
 xcuserdata/
+.xcdd
 
 ## compatibility with Xcode 8 and earlier (ignoring not required starting Xcode 9)
 *.xcscmblueprint
@@ -102,3 +103,6 @@ Frameworks/gdal.xcframework
 Frameworks/gdal.xcframework.zip
 Frameworks/pdalcpp.xcframework
 Frameworks/pdalcpp.xcframework.zip
+default.profraw
+References
+diff.txt

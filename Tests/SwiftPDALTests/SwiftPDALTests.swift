@@ -13,7 +13,7 @@ import CxxPDAL
         throw PointCloudError.readFailed("Test file not found in bundle")
     }
 
-    var pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
+    let pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
 
     // Verify we got points
     #expect(pointCloud.pointCount > 0)
@@ -31,7 +31,7 @@ import CxxPDAL
     }
 
     // Clean up
-    pointCloud.cleanup()
+
 }
 
 @Test func readE57File() async throws {
@@ -42,7 +42,7 @@ import CxxPDAL
         throw PointCloudError.readFailed("Test file not found in bundle")
     }
 
-    var pointCloud = try PointCloud.read(from: testFilePath)
+    let pointCloud = try PointCloud.read(from: testFilePath)
 
     // Verify we got points
     #expect(pointCloud.pointCount > 0)
@@ -60,7 +60,7 @@ import CxxPDAL
     }
 
     // Clean up
-    pointCloud.cleanup()
+
 }
 
 @Test func buildOctree() async throws {
@@ -75,7 +75,7 @@ import CxxPDAL
         throw PointCloudError.readFailed("Test file not found in bundle")
     }
 
-    var pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
+    let pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
 
     // Build octree
     let octree = pointCloud.buildOctree(maxPointsPerNode: 100, maxDepth: 10)
@@ -89,7 +89,7 @@ import CxxPDAL
     print("Octree built with \(stats.nodeCount) nodes, max depth: \(stats.maxDepth)")
 
     // Clean up
-    pointCloud.cleanup()
+
 }
 
 
@@ -105,7 +105,7 @@ import CxxPDAL
         throw PointCloudError.readFailed("Test file not found in bundle")
     }
 
-    var pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
+    let pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
 
     // Build octree with specific parameters
     let maxDepth = 8
@@ -126,7 +126,7 @@ import CxxPDAL
     print("  Max depth: \(stats.maxDepth)")
 
     // Clean up
-    pointCloud.cleanup()
+
 }
 
 @Test func getPointDataFromOctree() async throws {
@@ -141,7 +141,7 @@ import CxxPDAL
         throw PointCloudError.readFailed("Test file not found in bundle")
     }
 
-    var pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
+    let pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
 
     // Build octree
     let _ = pointCloud.buildOctree(maxPointsPerNode: 10, maxDepth: 20)
@@ -165,7 +165,7 @@ import CxxPDAL
 //    }
 
     // Clean up
-    pointCloud.cleanup()
+
 }
 
 @Test func mortonCodeEncodeDecode() async throws {
@@ -257,7 +257,7 @@ import CxxPDAL
         throw PointCloudError.readFailed("Test file not found in bundle")
     }
 
-    var pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
+    let pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
 
     // Build octree with Morton ordering
     let octreeWithMorton = Octree(
@@ -288,7 +288,7 @@ import CxxPDAL
     print("  Nodes: \(statsWithoutMorton.nodeCount), Max depth: \(statsWithoutMorton.maxDepth)")
 
     // Clean up
-    pointCloud.cleanup()
+
 }
 
 @Test func queryCellsWithLevels() async throws {
@@ -302,7 +302,7 @@ import CxxPDAL
         throw PointCloudError.readFailed("Test file not found in bundle")
     }
 
-    var pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
+    let pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
 
     let octree = Octree(
         pointCloud: pointCloud,
@@ -347,7 +347,7 @@ import CxxPDAL
 
     print("Found cells - Level 3: \(cellsAtLevel3.count), Level 4: \(cellsAtLevel4.count), Level 5: \(cellsAtLevel5.count)")
 
-    pointCloud.cleanup()
+
 }
 
 @Test func lodSelection() async throws {
@@ -377,7 +377,7 @@ import CxxPDAL
         throw PointCloudError.readFailed("Test file not found in bundle")
     }
 
-    var pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
+    let pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
 
     let octree = Octree(
         pointCloud: pointCloud,
@@ -405,7 +405,7 @@ import CxxPDAL
 
     print("All cells: \(allCells.count), LOD selected: \(selectedCells.count)")
 
-    pointCloud.cleanup()
+
 }
 
 @Test func executeFunctionForLevel() async throws {
@@ -419,7 +419,7 @@ import CxxPDAL
         throw PointCloudError.readFailed("Test file not found in bundle")
     }
 
-    var pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
+    let pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
 
     let octree = Octree(
         pointCloud: pointCloud,
@@ -441,7 +441,7 @@ import CxxPDAL
 
     print("Level 5 cells: \(cellCount), points: \(totalPoints)")
 
-    pointCloud.cleanup()
+
 }
 
 @Test func queryCellsWithClosure() async throws {
@@ -455,7 +455,7 @@ import CxxPDAL
         throw PointCloudError.readFailed("Test file not found in bundle")
     }
 
-    var pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
+    let pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
 
     let octree = Octree(
         pointCloud: pointCloud,
@@ -492,7 +492,7 @@ import CxxPDAL
 
     print("Found \(nearCells.count) cells within \(searchRadius) units of target")
 
-    pointCloud.cleanup()
+
 }
 
 @Test func getAllCellsMethods() async throws {
@@ -506,7 +506,7 @@ import CxxPDAL
         throw PointCloudError.readFailed("Test file not found in bundle")
     }
 
-    var pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
+    let pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
 
     let octree = Octree(
         pointCloud: pointCloud,
@@ -545,7 +545,7 @@ import CxxPDAL
     }
     print("Cells between levels 3-6: \(cellsRange.count)")
 
-    pointCloud.cleanup()
+
 }
 
 @Test func octreeCellBoundingBoxRendering() async throws {
@@ -559,7 +559,7 @@ import CxxPDAL
         throw PointCloudError.readFailed("Test file not found in bundle")
     }
 
-    var pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
+    let pointCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
 
     let octree = Octree(
         pointCloud: pointCloud,
@@ -573,7 +573,7 @@ import CxxPDAL
 
     guard let device = MTLCreateSystemDefaultDevice() else {
         print("Metal device not available, skipping Metal buffer tests")
-        pointCloud.cleanup()
+    
         return
     }
 
@@ -613,7 +613,7 @@ import CxxPDAL
     #expect(totalEdges == cells.count * 12)
     print("Total edges to render: \(totalEdges)")
 
-    pointCloud.cleanup()
+
 }
 
 // MARK: - Streaming Tests
@@ -628,7 +628,7 @@ import CxxPDAL
     var chunkCount = 0
     var totalPointsReceived = 0
     var lastChunk: PointCloudChunk?
-    var dimensions: [PDALDimensionInfo]?
+    var dimensions: [DimensionInfo]?
 
     // Use the new AsyncStream API
     let stream = StreamingPointCloud(
@@ -662,7 +662,7 @@ import CxxPDAL
     #expect(dimensions!.count > 0)
 
     // Verify bounds are valid after completion
-    let bounds = stream.loadedBounds!
+    let bounds = stream.bounds
     #expect(bounds.min.x < bounds.max.x)
     #expect(bounds.min.y < bounds.max.y)
     #expect(bounds.min.z < bounds.max.z)
@@ -715,7 +715,7 @@ import CxxPDAL
     }
 
     var firstChunkData: Data?
-    var firstChunkDimensions: [PDALDimensionInfo]?
+    var firstChunkDimensions: [DimensionInfo]?
 
     let stream = StreamingPointCloud(
         filePath: testFilePath,
@@ -806,12 +806,12 @@ import CxxPDAL
     }
 
     // Normal read
-    var normalCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
+    let normalCloud = try PointCloud.read(from: testFilePath, readerName: "readers.las")
 
     // Streaming read
     var streamingTotalPoints = 0
     var streamingStride = 0
-    var streamingDimensions: [PDALDimensionInfo]?
+    var streamingDimensions: [DimensionInfo]?
 
     let stream = StreamingPointCloud(
         filePath: testFilePath,
@@ -827,7 +827,7 @@ import CxxPDAL
         }
     }
 
-    let streamingBounds = stream.loadedBounds!
+    let streamingBounds = stream.bounds
 
     // Compare results
     #expect(streamingTotalPoints == normalCloud.pointCount)
@@ -848,7 +848,7 @@ import CxxPDAL
     print("  Stride - Normal: \(normalCloud.stride), Streaming: \(streamingStride)")
     print("  Dimensions - Normal: \(normalCloud.dimensions.count), Streaming: \(streamingDimensions?.count ?? 0)")
 
-    normalCloud.cleanup()
+
 }
 
 @Test func streamingReadE57File() async throws {
@@ -868,7 +868,7 @@ import CxxPDAL
         totalPoints = progress.chunk.totalPointsSoFar
     }
 
-    let bounds = stream.loadedBounds!
+    let bounds = stream.bounds
 
     #expect(chunkCount > 0)
     #expect(totalPoints > 0)
