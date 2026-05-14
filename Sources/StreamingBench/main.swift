@@ -82,11 +82,14 @@ struct StreamingBench {
             if Date().timeIntervalSince(lastReport) >= 1 {
                 let elapsed = Date().timeIntervalSince(start)
                 let snap = await source._debugSnapshot()
+                let totalTicks = snap.cacheHits + snap.cacheMisses
+                let hitRate = totalTicks > 0 ? Double(snap.cacheHits) / Double(totalTicks) * 100 : 0
                 print(String(
-                    format: "  t=%5.1fs  chunks=%5d  pts=%10llu  MB=%7.1f  rate=%6.0f chunks/s  %7.1f Mpts/s   resident=%d inFlight=%d wanted=%d",
+                    format: "  t=%5.1fs  chunks=%5d  pts=%10llu  MB=%7.1f  rate=%6.0f chunks/s  %7.1f Mpts/s   resident=%d inFlight=%d wanted=%d  cacheHits=%d (%.0f%%)",
                     elapsed, totalAdded, totalPointsLoaded, Double(bytesLoaded) / 1_048_576,
                     Double(totalAdded) / elapsed, Double(totalPointsLoaded) / elapsed / 1_000_000,
-                    snap.resident, snap.inFlight, snap.wanted
+                    snap.resident, snap.inFlight, snap.wanted,
+                    snap.cacheHits, hitRate
                 ))
                 lastReport = Date()
             }

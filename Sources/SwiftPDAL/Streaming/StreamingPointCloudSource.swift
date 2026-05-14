@@ -86,7 +86,7 @@ public struct StreamingSourceInfo: Sendable {
 /// All fields live in world-space; the streaming layer doesn't know about
 /// projection conventions (handedness, reverse-Z) — only the AABB-vs-frustum
 /// test on ``viewProjection`` and the distance-from-``position`` score.
-public struct StreamingCameraView: Sendable {
+public struct StreamingCameraView: Sendable, Equatable {
     /// World-space camera position used for distance scoring.
     public let position: SIMD3<Float>
     /// View-projection matrix used to derive 6 frustum planes.
@@ -758,7 +758,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
     }
 
     /// Test-only diagnostic snapshot of the driver's last tick.
-    public func _debugSnapshot() async -> (candidates: Int, wanted: Int, resident: Int, inFlight: Int) {
+    public func _debugSnapshot() async -> (candidates: Int, wanted: Int, resident: Int, inFlight: Int,
+                                           cacheHits: Int, cacheMisses: Int) {
         await driver.snapshot()
     }
 }
@@ -796,6 +797,16 @@ actor StreamingDriver {
     private var resident: [ChunkID: ResidentEntry] = [:]
     private var inFlight: Set<ChunkID> = []
     private var closed = false
+
+    // Wanted-set cache. `wanted` depends only on the camera view, the
+    // budget, and the immutable node hierarchy — eviction and in-flight
+    // residency state don't change it. Caching avoids the O(nodes)
+    // frustum scan + sort on every tick when the camera and budget are
+    // unchanged (static frames, idle periods).
+    private var cachedView: StreamingCameraView?
+    private var cachedBudget: Int = .min
+    private var cachedWanted: Set<ChunkID> = []
+    private var cachedCandidates: Int = 0
 
     init(
         handle: SendableCopcHandle,
@@ -850,17 +861,35 @@ actor StreamingDriver {
     private(set) var lastTickWanted: Int = 0
     private(set) var lastTickResident: Int = 0
     private(set) var lastTickInFlight: Int = 0
+    /// Cumulative wanted-set cache hits / misses since driver start.
+    private(set) var wantedCacheHits: Int = 0
+    private(set) var wantedCacheMisses: Int = 0
 
-    func snapshot() -> (candidates: Int, wanted: Int, resident: Int, inFlight: Int) {
-        (lastTickCandidates, lastTickWanted, lastTickResident, lastTickInFlight)
+    func snapshot() -> (candidates: Int, wanted: Int, resident: Int, inFlight: Int,
+                        cacheHits: Int, cacheMisses: Int) {
+        (lastTickCandidates, lastTickWanted, lastTickResident, lastTickInFlight,
+         wantedCacheHits, wantedCacheMisses)
     }
 
     func runOneTick() {
         if closed { return }
         guard let view = latestView else { return }
 
-        // 1. Score nodes against the camera + budget.
-        let wanted = computeWantedSet(view: view, budget: budgetBytes)
+        // 1. Score nodes against the camera + budget — cached when the
+        //    (view, budget) pair is unchanged from the previous tick.
+        let wanted: Set<ChunkID>
+        if let cv = cachedView, cv == view, cachedBudget == budgetBytes {
+            wanted = cachedWanted
+            lastTickCandidates = cachedCandidates
+            wantedCacheHits &+= 1
+        } else {
+            wanted = computeWantedSet(view: view, budget: budgetBytes)
+            cachedView = view
+            cachedBudget = budgetBytes
+            cachedWanted = wanted
+            cachedCandidates = lastTickCandidates
+            wantedCacheMisses &+= 1
+        }
         lastTickWanted = wanted.count
         lastTickResident = resident.count
         lastTickInFlight = inFlight.count
