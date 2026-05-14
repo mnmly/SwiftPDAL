@@ -453,6 +453,82 @@ final class UpdateQueue: @unchecked Sendable {
     }
 }
 
+// MARK: - Job queue
+
+/// Lock-protected FIFO of pending decode jobs.
+///
+/// The driver actor's tick enqueues ``ChunkID``s; persistent slot
+/// workers `await pop()` to drain them. When the queue is empty,
+/// `pop()` suspends on a continuation and resumes when the next
+/// `enqueue` lands or `close()` is called. Closing returns `nil` from
+/// any waiting `pop` so workers can exit cleanly.
+///
+/// The queue is non-actor so the driver can enqueue without an extra
+/// actor hop; concurrency control is a single `NSLock`.
+final class JobQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [ChunkID] = []
+    private var waiters: [CheckedContinuation<ChunkID?, Never>] = []
+    private var closed = false
+
+    func enqueue<S: Sequence>(_ ids: S) where S.Element == ChunkID {
+        var handoffs: [(CheckedContinuation<ChunkID?, Never>, ChunkID)] = []
+        lock.withLock {
+            if closed { return }
+            var leftover: [ChunkID] = []
+            for id in ids {
+                if !waiters.isEmpty {
+                    handoffs.append((waiters.removeFirst(), id))
+                } else {
+                    leftover.append(id)
+                }
+            }
+            if !leftover.isEmpty { pending.append(contentsOf: leftover) }
+        }
+        for (w, id) in handoffs { w.resume(returning: id) }
+    }
+
+    func pop() async -> ChunkID? {
+        return await withCheckedContinuation { (c: CheckedContinuation<ChunkID?, Never>) in
+            // Resolve immediately if we have a job (or are closed);
+            // otherwise park the continuation in `waiters` and let
+            // enqueue/close resume it later. Either way, no await
+            // happens while holding the lock.
+            enum Action { case resume(ChunkID?), wait }
+            let action: Action = lock.withLock {
+                if closed { return .resume(nil) }
+                if !pending.isEmpty { return .resume(pending.removeFirst()) }
+                waiters.append(c)
+                return .wait
+            }
+            switch action {
+            case .resume(let v): c.resume(returning: v)
+            case .wait: break
+            }
+        }
+    }
+
+    /// Drop any pending jobs matching the given IDs. Already-popped
+    /// jobs (in-flight on a worker) are not affected.
+    func remove(_ ids: Set<ChunkID>) {
+        if ids.isEmpty { return }
+        lock.withLock {
+            pending.removeAll { ids.contains($0) }
+        }
+    }
+
+    func close() {
+        let toResume: [CheckedContinuation<ChunkID?, Never>] = lock.withLock {
+            closed = true
+            let w = waiters
+            waiters.removeAll()
+            pending.removeAll()
+            return w
+        }
+        for w in toResume { w.resume(returning: nil) }
+    }
+}
+
 // MARK: - COPC source
 
 /// Concrete COPC-backed implementation of ``StreamingPointCloudSource``.
@@ -481,12 +557,29 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
 
     private let driver: StreamingDriver
     private let queue: UpdateQueue
+    private let jobs: JobQueue
+    private let handleBox: SendableCopcHandle
+    private let originShift: SIMD3<Double>
+    private let workerCount: Int
     private var driverTask: Task<Void, Never>?
+    private var workerTasks: [Task<Void, Never>] = []
 
-    private init(info: StreamingSourceInfo, driver: StreamingDriver, queue: UpdateQueue) {
+    private init(
+        info: StreamingSourceInfo,
+        driver: StreamingDriver,
+        queue: UpdateQueue,
+        jobs: JobQueue,
+        handle: SendableCopcHandle,
+        originShift: SIMD3<Double>,
+        workerCount: Int
+    ) {
         self.info = info
         self.driver = driver
         self.queue = queue
+        self.jobs = jobs
+        self.handleBox = handle
+        self.originShift = originShift
+        self.workerCount = workerCount
     }
 
     /// Open a COPC file and parse its octree hierarchy.
@@ -571,15 +664,27 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         )
 
         let queue = UpdateQueue()
+        let jobs = JobQueue()
+        let handleBox = SendableCopcHandle(raw: handle)
         let driver = StreamingDriver(
-            handle: handle,
+            handle: handleBox,
             nodes: nodes,
             originShift: originShift,
             options: options,
-            queue: queue
+            queue: queue,
+            jobs: jobs
         )
 
-        let source = CopcStreamingPointCloudSource(info: info, driver: driver, queue: queue)
+        let workerCount = max(1, options.decodeConcurrency)
+        let source = CopcStreamingPointCloudSource(
+            info: info,
+            driver: driver,
+            queue: queue,
+            jobs: jobs,
+            handle: handleBox,
+            originShift: originShift,
+            workerCount: workerCount
+        )
         source.startDriver()
         return source
     }
@@ -593,6 +698,26 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                 try? await Task.sleep(for: tickInterval)
             }
         }
+
+        let jobs = self.jobs
+        let handleBox = self.handleBox
+        let originShift = self.originShift
+        let workers = (0..<workerCount).map { slot in
+            Task.detached(priority: .utility) {
+                let slotIndex = Int32(slot)
+                while !Task.isCancelled {
+                    guard let id = await jobs.pop() else { break }
+                    let chunk = StreamingDriver.decodeAndPack(
+                        handle: handleBox.raw,
+                        slot: slotIndex,
+                        id: id,
+                        originShift: originShift
+                    )
+                    await driver.completeLoad(id: id, chunk: chunk)
+                }
+            }
+        }
+        workerTasks = workers
     }
 
     public func submit(view: StreamingCameraView) {
@@ -617,7 +742,19 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
 
     public func close() {
         driverTask?.cancel()
-        Task { await driver.shutdown() }
+        let jobs = self.jobs
+        let workers = self.workerTasks
+        let driver = self.driver
+        // Order: stop accepting new tick work, close the job queue (which
+        // wakes any idle workers with `nil`), wait for in-flight workers
+        // to finish their current chunk, then close the COPC handle.
+        // Skipping the worker drain would race the C-side `fstream`
+        // close against an ongoing decode.
+        Task.detached {
+            jobs.close()
+            for w in workers { await w.value }
+            await driver.shutdown()
+        }
     }
 
     /// Test-only diagnostic snapshot of the driver's last tick.
@@ -634,17 +771,19 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
 ///      immutable).
 ///   2. Each concurrent caller targets a distinct `slot` in the reader
 ///      pool, so per-reader `fstream` state is never shared.
-private struct SendableCopcHandle: @unchecked Sendable {
+struct SendableCopcHandle: @unchecked Sendable {
     let raw: copc_handle
 }
 
 actor StreamingDriver {
-    private let handle: copc_handle
+    private let handleBox: SendableCopcHandle
+    private var handle: copc_handle { handleBox.raw }
     private let nodes: [NodeMeta]
     private let nodeIndexByID: [ChunkID: Int]
     private let originShift: SIMD3<Double>
     private let options: StreamingOptions
     private let queue: UpdateQueue
+    private let jobs: JobQueue
     let tickInterval: Duration
 
     private var latestView: StreamingCameraView?
@@ -659,18 +798,20 @@ actor StreamingDriver {
     private var closed = false
 
     init(
-        handle: copc_handle,
+        handle: SendableCopcHandle,
         nodes: [NodeMeta],
         originShift: SIMD3<Double>,
         options: StreamingOptions,
-        queue: UpdateQueue
+        queue: UpdateQueue,
+        jobs: JobQueue
     ) {
-        self.handle = handle
+        self.handleBox = handle
         self.nodes = nodes
         self.nodeIndexByID = Dictionary(uniqueKeysWithValues: nodes.enumerated().map { ($1.id, $0) })
         self.originShift = originShift
         self.options = options
         self.queue = queue
+        self.jobs = jobs
         self.tickInterval = options.driverTickInterval
     }
 
@@ -678,7 +819,9 @@ actor StreamingDriver {
     func setBudget(_ b: Int) { budgetBytes = b }
 
     func cancel(_ ids: [ChunkID]) {
+        let set = Set(ids)
         for id in ids { inFlight.remove(id) }
+        jobs.remove(set)
     }
 
     func shutdown() {
@@ -687,6 +830,19 @@ actor StreamingDriver {
         swiftpdal_copc_close(handle)
         resident.removeAll()
         inFlight.removeAll()
+    }
+
+    /// Called by a worker task once a chunk has been decoded.
+    ///
+    /// Decoupled from the tick loop: a slow decode no longer stalls
+    /// subsequent ticks. Cancelled or evicted chunks (those removed
+    /// from `inFlight` after being scheduled) are dropped here.
+    func completeLoad(id: ChunkID, chunk: ResidentChunk?) {
+        if closed { return }
+        let wasInFlight = inFlight.remove(id) != nil
+        guard wasInFlight, let chunk else { return }
+        resident[id] = ResidentEntry(chunk: chunk, ticksSinceWanted: 0)
+        queue.enqueue(added: [chunk], removed: [])
     }
 
     /// Diagnostic counts for tests. Reset on each tick.
@@ -699,7 +855,7 @@ actor StreamingDriver {
         (lastTickCandidates, lastTickWanted, lastTickResident, lastTickInFlight)
     }
 
-    func runOneTick() async {
+    func runOneTick() {
         if closed { return }
         guard let view = latestView else { return }
 
@@ -709,7 +865,6 @@ actor StreamingDriver {
         lastTickResident = resident.count
         lastTickInFlight = inFlight.count
 
-        var tickAdded: [ResidentChunk] = []
         var tickRemoved: [ChunkID] = []
 
         // 2. Evict (with hysteresis).
@@ -728,58 +883,21 @@ actor StreamingDriver {
             }
         }
 
-        // 3. Dispatch loads for wanted-not-resident-not-in-flight, capped at
-        //    maxInFlightLoads per tick. Each batch of up to
-        //    decodeConcurrency chunks runs in parallel via a reader pool;
-        //    every child task targets a distinct slot in the pool, so
-        //    fstream-per-reader isolation is preserved.
+        if !tickRemoved.isEmpty {
+            queue.enqueue(added: [], removed: tickRemoved)
+        }
+
+        // 3. Enqueue new decode jobs for wanted-not-resident-not-in-flight,
+        //    capped at maxInFlightLoads per tick. Persistent worker tasks
+        //    owned by ``CopcStreamingPointCloudSource`` consume the queue;
+        //    completed chunks publish to ``UpdateQueue`` from
+        //    ``completeLoad(id:chunk:)`` continuously, so a slow decode
+        //    does not stall subsequent ticks.
         let needed = wanted.subtracting(resident.keys).subtracting(inFlight)
         let toLoad = Array(needed.prefix(options.maxInFlightLoads))
+        if toLoad.isEmpty { return }
         for id in toLoad { inFlight.insert(id) }
-
-        let concurrency = max(1, options.decodeConcurrency)
-        let handleBox = SendableCopcHandle(raw: self.handle)
-        let originShift = self.originShift
-
-        var batchStart = 0
-        while batchStart < toLoad.count {
-            if closed { break }
-            let batchEnd = min(batchStart + concurrency, toLoad.count)
-            let batch = Array(toLoad[batchStart..<batchEnd])
-            batchStart = batchEnd
-
-            let results: [(ChunkID, ResidentChunk?)] = await withTaskGroup(
-                of: (ChunkID, ResidentChunk?).self,
-                returning: [(ChunkID, ResidentChunk?)].self
-            ) { group in
-                for (slotOffset, id) in batch.enumerated() {
-                    let slot = Int32(slotOffset)
-                    group.addTask {
-                        let chunk = StreamingDriver.decodeAndPack(
-                            handle: handleBox.raw, slot: slot, id: id, originShift: originShift
-                        )
-                        return (id, chunk)
-                    }
-                }
-                var out: [(ChunkID, ResidentChunk?)] = []
-                out.reserveCapacity(batch.count)
-                for await r in group { out.append(r) }
-                return out
-            }
-
-            for (id, chunk) in results {
-                if !inFlight.contains(id) { continue }  // cancelled mid-flight
-                if let chunk {
-                    resident[id] = ResidentEntry(chunk: chunk, ticksSinceWanted: 0)
-                    tickAdded.append(chunk)
-                }
-                inFlight.remove(id)
-            }
-        }
-
-        if !tickAdded.isEmpty || !tickRemoved.isEmpty {
-            queue.enqueue(added: tickAdded, removed: tickRemoved)
-        }
+        jobs.enqueue(toLoad)
     }
 
     private func computeWantedSet(view: StreamingCameraView, budget: Int) -> Set<ChunkID> {
