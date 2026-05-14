@@ -1,3 +1,15 @@
+# copc-lib + laz-perf build artifacts. Producible via:
+#   scripts/build-copc-xcframework.sh  (shippable xcframework)
+#   or the cmake prefix build documented at Frameworks/copc-build/README.md
+# The xcframework itself (Frameworks/copclib.xcframework) is committed in
+# the same pattern as pdalcpp.xcframework; everything below is build cache.
+Frameworks/copc-build/include/
+Frameworks/copc-build/lib/
+
+# DocC build output. Regenerable via Scripts/build_docs.sh.
+# Remove this rule if GitHub Pages is set to serve from main:/docs.
+/docs/
+
 # Xcode
 #
 # gitignore contributors: remember to update Global/Xcode.gitignore, Objective-C.gitignore & Swift.gitignore

@@ -19,6 +19,9 @@ let package = Package(
             targets: ["SwiftPDAL"],
         ),
     ],
+    dependencies: [
+        .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.4.3"),
+    ],
     targets: [
         .binaryTarget(
             name: "gdal",
@@ -41,10 +44,32 @@ let package = Package(
             ]
         ),
 
+        // copc-lib + laz-perf packaged as a universal static xcframework.
+        // Build with: scripts/build-copc-xcframework.sh
+        // (output: Frameworks/copclib.xcframework). For development against
+        // the locally-built cmake prefix instead, see Frameworks/copc-build/README.md
+        // and swap this binaryTarget for the legacy unsafeFlags target there.
+        .binaryTarget(
+            name: "copclib",
+            path: "Frameworks/copclib.xcframework"
+        ),
+
+        // C++ bridge to copc-lib for out-of-core streaming.
+        .target(
+            name: "CxxCOPC",
+            dependencies: ["copclib"],
+            path: "Sources/CxxCOPC",
+            sources: ["copc_bridge.cpp"],
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .headerSearchPath("include"),
+            ]
+        ),
+
         // Swift target that uses the C++ wrapper
         .target(
             name: "SwiftPDAL",
-            dependencies: ["CxxPDAL"],
+            dependencies: ["CxxPDAL", "CxxCOPC"],
             resources: [
                 .copy("Resources/proj.db")
             ],
@@ -58,6 +83,7 @@ let package = Package(
             dependencies: ["SwiftPDAL"],
             resources: [
                 .copy("Resources/test.laz"),
+                .copy("Resources/test.copc.laz"),
                 .copy("Resources/bunnyFloat.e57"),
                 .copy("Resources/Stanford_Dragon.ply")
             ],
