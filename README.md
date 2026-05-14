@@ -184,6 +184,8 @@ This package includes and depends on:
 - **PDAL** - BSD 3-Clause License
 - **GDAL** - MIT/X License
 - **PROJ** - MIT License
+- **copc-lib** - BSD 3-Clause License
+- **laz-perf** - Apache 2.0 License
 
 See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for complete license information.
 
@@ -193,3 +195,5 @@ Built with:
 - [PDAL](https://pdal.io/) - Point Data Abstraction Library (BSD 3-Clause)
 - [GDAL](https://gdal.org/) - Geospatial Data Abstraction Library (MIT/X)
 - [PROJ](https://proj.org/) - Coordinate transformation library (MIT)
+- [copc-lib](https://github.com/RockRobotic/copc-lib) - COPC reader/writer used by the streaming source (BSD 3-Clause, © 2021 Rock Robotic)
+- [laz-perf](https://github.com/hobuinc/laz-perf) - LAZ codec linked inside `copclib.xcframework` (Apache 2.0, © 2022 Rapidlasso)

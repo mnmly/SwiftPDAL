@@ -65,3 +65,16 @@ COPC out-of-core path above.
 - ``DimensionInfo``
 - ``PDALDimensionTypeHelper``
 - ``PDALError``
+
+## Acknowledgements
+
+- **PDAL** (BSD 3-Clause, © Hobu Inc.) — bulk-read and pipeline-streaming
+  paths. <https://pdal.io>
+- **copc-lib** (BSD 3-Clause, © 2021 Rock Robotic, Inc.) — out-of-core
+  octree access for ``CopcStreamingPointCloudSource``.
+  <https://github.com/RockRobotic/copc-lib>
+- **laz-perf** (Apache 2.0, © 2022 Rapidlasso GmbH) — LAZ codec used by
+  copc-lib. <https://github.com/hobuinc/laz-perf>
+
+See [THIRD_PARTY_LICENSES.md](https://github.com/mnmly/SwiftPDAL/blob/main/THIRD_PARTY_LICENSES.md)
+for full license text.
