@@ -6,6 +6,11 @@
 Frameworks/copc-build/include/
 Frameworks/copc-build/lib/
 
+# Output of scripts/build-copc-xcframework.sh. Consumers download
+# copclib.xcframework.zip from the GitHub release referenced in Package.swift.
+Frameworks/copclib.xcframework/
+Frameworks/copclib.xcframework.zip
+
 # DocC build output. Regenerable via Scripts/build_docs.sh.
 # Remove this rule if GitHub Pages is set to serve from main:/docs.
 /docs/

@@ -45,13 +45,13 @@ let package = Package(
         ),
 
         // copc-lib + laz-perf packaged as a universal static xcframework.
-        // Build with: scripts/build-copc-xcframework.sh
-        // (output: Frameworks/copclib.xcframework). For development against
-        // the locally-built cmake prefix instead, see Frameworks/copc-build/README.md
-        // and swap this binaryTarget for the legacy unsafeFlags target there.
+        // Build with: scripts/build-copc-xcframework.sh (also computes the
+        // checksum below). For development against the locally-built cmake
+        // prefix instead, see Frameworks/copc-build/README.md.
         .binaryTarget(
             name: "copclib",
-            path: "Frameworks/copclib.xcframework"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/1.1.0/copclib.xcframework.zip",
+            checksum: "c4c1bf2c2eadf27d7e0194eab47beecc2e306661af3041dbbe0dc096514d8c7a"
         ),
 
         // C++ bridge to copc-lib for out-of-core streaming.
