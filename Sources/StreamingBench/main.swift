@@ -7,13 +7,14 @@ struct StreamingBench {
     static func main() async {
         let args = CommandLine.arguments
         guard args.count >= 2 else {
-            print("usage: StreamingBench <file.copc.laz> [decodeConcurrency=4] [seconds=20] [maxInFlightLoadsPerTick=16]")
+            print("usage: StreamingBench <file.copc.laz> [decodeConcurrency=4] [seconds=20] [maxInFlightLoadsPerTick=16] [budgetMB=8192]")
             exit(2)
         }
         let url = URL(fileURLWithPath: args[1])
         let concurrency = args.count > 2 ? Int(args[2]) ?? 4 : 4
         let seconds = args.count > 3 ? Double(args[3]) ?? 20 : 20
         let perTick = args.count > 4 ? Int(args[4]) ?? 16 : 16
+        let budgetMB = args.count > 5 ? Int(args[5]) ?? 8192 : 8192
 
         let opts = StreamingOptions(
             maxInFlightLoads: perTick,
@@ -60,7 +61,8 @@ struct StreamingBench {
             depthTolerance: 32
         )
         source.submit(view: view)
-        source.setBudget(1 << 33)   // 8 GB — effectively unlimited
+        source.setBudget(budgetMB * 1_048_576)
+        print("budget:       \(budgetMB) MB")
 
         var totalAdded = 0
         var totalPointsLoaded: UInt64 = 0

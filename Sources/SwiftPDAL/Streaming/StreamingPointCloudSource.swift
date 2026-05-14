@@ -269,6 +269,25 @@ public enum LODMode: Sendable {
     case sidecar(URL)
 }
 
+/// How the residency policy turns a camera view into a wanted set of
+/// chunks. Independent of the budget fill: regardless of mode, the
+/// wanted set is capped by the running budget and the eviction
+/// hysteresis still applies.
+public enum ResidencyPolicy: Sendable {
+    /// Two-pass fill (default). First admit chunks intersecting the
+    /// camera frustum, scored by distance, until the budget is full.
+    /// If headroom remains, do a second pass over the rejected
+    /// non-visible chunks (sorted by distance) to surround the camera
+    /// with a halo of nearby off-screen chunks — ready for the moment
+    /// the user turns their head.
+    case frustumFirstThenHalo
+    /// Ignore the frustum entirely and score every chunk by distance
+    /// from the camera position. Right choice for VR / free-camera
+    /// scrubbing, where any chunk near the camera could become visible
+    /// at any moment.
+    case distanceOnly
+}
+
 /// Configuration for ``CopcStreamingPointCloudSource``.
 public struct StreamingOptions: Sendable {
     /// Maximum chunks scheduled for decode per driver tick. Acts as the
@@ -293,6 +312,11 @@ public struct StreamingOptions: Sendable {
     /// Wall-clock interval between residency-policy ticks. Typical:
     /// 50–200 ms (camera state changes slowly relative to a 60 Hz frame).
     public var driverTickInterval: Duration
+    /// Strategy for translating the camera view into the wanted set.
+    /// See ``ResidencyPolicy``. Whole-file mode (every chunk wanted)
+    /// engages automatically whenever the file fits in the current
+    /// budget, regardless of this setting.
+    public var residencyPolicy: ResidencyPolicy
 
     /// Create a configuration.
     ///
@@ -303,13 +327,15 @@ public struct StreamingOptions: Sendable {
     ///   - prefetchRoot: Block on coarse nodes during first poll.
     ///   - evictionDelayTicks: Hysteresis frames.
     ///   - driverTickInterval: Tick cadence.
+    ///   - residencyPolicy: Wanted-set construction strategy.
     public init(
         maxInFlightLoads: Int = 4,
         decodeConcurrency: Int = 4,
         lodMode: LODMode = .perChunk,
         prefetchRoot: Bool = true,
         evictionDelayTicks: Int = 5,
-        driverTickInterval: Duration = .milliseconds(100)
+        driverTickInterval: Duration = .milliseconds(100),
+        residencyPolicy: ResidencyPolicy = .frustumFirstThenHalo
     ) {
         self.maxInFlightLoads = maxInFlightLoads
         self.decodeConcurrency = decodeConcurrency
@@ -317,6 +343,7 @@ public struct StreamingOptions: Sendable {
         self.prefetchRoot = prefetchRoot
         self.evictionDelayTicks = evictionDelayTicks
         self.driverTickInterval = driverTickInterval
+        self.residencyPolicy = residencyPolicy
     }
 }
 
@@ -781,6 +808,8 @@ actor StreamingDriver {
     private var handle: copc_handle { handleBox.raw }
     private let nodes: [NodeMeta]
     private let nodeIndexByID: [ChunkID: Int]
+    private let allNodeIDs: Set<ChunkID>
+    private let totalNodeBytes: Int
     private let originShift: SIMD3<Double>
     private let options: StreamingOptions
     private let queue: UpdateQueue
@@ -819,6 +848,8 @@ actor StreamingDriver {
         self.handleBox = handle
         self.nodes = nodes
         self.nodeIndexByID = Dictionary(uniqueKeysWithValues: nodes.enumerated().map { ($1.id, $0) })
+        self.allNodeIDs = Set(nodes.lazy.map(\.id))
+        self.totalNodeBytes = nodes.reduce(0) { $0 + $1.pointCount * 17 }
         self.originShift = originShift
         self.options = options
         self.queue = queue
@@ -930,29 +961,61 @@ actor StreamingDriver {
     }
 
     private func computeWantedSet(view: StreamingCameraView, budget: Int) -> Set<ChunkID> {
-        let planes = FrustumPlanes(viewProjection: view.viewProjection)
+        // Whole-file shortcut: if every node fits in the budget, every
+        // node is wanted. Skips the frustum scan and sort entirely.
+        if totalNodeBytes <= budget {
+            lastTickCandidates = nodes.count
+            return allNodeIDs
+        }
 
         struct Scored { let id: ChunkID; let score: Float; let bytes: Int }
-        var candidates: [Scored] = []
-        candidates.reserveCapacity(nodes.count)
+        var visible: [Scored] = []
+        var hidden: [Scored] = []
+        visible.reserveCapacity(nodes.count)
 
-        for node in nodes {
-            if !planes.intersects(min: node.minXYZ, max: node.maxXYZ) { continue }
-            let d = simd_length(node.center - view.position) + 1e-3
-            let score = 1.0 / d
-            let bytes = node.pointCount * 17
-            candidates.append(Scored(id: node.id, score: score, bytes: bytes))
+        switch options.residencyPolicy {
+        case .distanceOnly:
+            // No frustum gate — everything is a candidate.
+            for node in nodes {
+                let d = simd_length(node.center - view.position) + 1e-3
+                visible.append(Scored(id: node.id, score: 1 / d, bytes: node.pointCount * 17))
+            }
+        case .frustumFirstThenHalo:
+            let planes = FrustumPlanes(viewProjection: view.viewProjection)
+            for node in nodes {
+                let d = simd_length(node.center - view.position) + 1e-3
+                let s = Scored(id: node.id, score: 1 / d, bytes: node.pointCount * 17)
+                if planes.intersects(min: node.minXYZ, max: node.maxXYZ) {
+                    visible.append(s)
+                } else {
+                    hidden.append(s)
+                }
+            }
         }
-        lastTickCandidates = candidates.count
-        candidates.sort { $0.score > $1.score }
+        lastTickCandidates = visible.count + hidden.count
 
+        // Pass 1: nearest visible chunks fill the budget.
+        visible.sort { $0.score > $1.score }
         var wanted = Set<ChunkID>()
         var used = 0
-        for c in candidates {
+        for c in visible {
             if used + c.bytes > budget { continue }
             wanted.insert(c.id)
             used += c.bytes
         }
+
+        // Pass 2 (halo): fill remaining headroom from nearest non-visible
+        // chunks. Only reachable under .frustumFirstThenHalo; under
+        // .distanceOnly the hidden array is empty.
+        if !hidden.isEmpty && used < budget {
+            hidden.sort { $0.score > $1.score }
+            for c in hidden {
+                if used + c.bytes > budget { continue }
+                wanted.insert(c.id)
+                used += c.bytes
+            }
+        }
+
         return wanted
     }
 
