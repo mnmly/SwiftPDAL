@@ -271,9 +271,16 @@ public enum LODMode: Sendable {
 
 /// Configuration for ``CopcStreamingPointCloudSource``.
 public struct StreamingOptions: Sendable {
-    /// Maximum concurrent node decodes. Each consumes ~one LAZ-decompress
-    /// thread; setting this above the physical core count rarely helps.
+    /// Maximum chunks scheduled for decode per driver tick. Acts as the
+    /// per-tick work budget; the actual parallelism is bounded by
+    /// ``decodeConcurrency``.
     public var maxInFlightLoads: Int
+    /// Number of independent COPC ``FileReader`` instances opened against
+    /// the file. Each reader owns its own `fstream`, so up to this many
+    /// node decodes run concurrently on cooperative threads. Setting this
+    /// above the physical core count rarely helps; the underlying LAZ
+    /// decompression is single-threaded per chunk.
+    public var decodeConcurrency: Int
     /// LOD level source. See ``LODMode``.
     public var lodMode: LODMode
     /// If `true`, the first ``StreamingPointCloudSource/pollLatest()``
@@ -290,19 +297,22 @@ public struct StreamingOptions: Sendable {
     /// Create a configuration.
     ///
     /// - Parameters:
-    ///   - maxInFlightLoads: Concurrent decode ceiling.
+    ///   - maxInFlightLoads: Per-tick scheduling cap.
+    ///   - decodeConcurrency: Reader-pool size; max simultaneous decoders.
     ///   - lodMode: LOD assignment strategy.
     ///   - prefetchRoot: Block on coarse nodes during first poll.
     ///   - evictionDelayTicks: Hysteresis frames.
     ///   - driverTickInterval: Tick cadence.
     public init(
         maxInFlightLoads: Int = 4,
+        decodeConcurrency: Int = 4,
         lodMode: LODMode = .perChunk,
         prefetchRoot: Bool = true,
         evictionDelayTicks: Int = 5,
         driverTickInterval: Duration = .milliseconds(100)
     ) {
         self.maxInFlightLoads = maxInFlightLoads
+        self.decodeConcurrency = decodeConcurrency
         self.lodMode = lodMode
         self.prefetchRoot = prefetchRoot
         self.evictionDelayTicks = evictionDelayTicks
@@ -448,15 +458,19 @@ final class UpdateQueue: @unchecked Sendable {
 /// Concrete COPC-backed implementation of ``StreamingPointCloudSource``.
 ///
 /// On ``open(_:options:)`` the file's octree hierarchy is parsed into an
-/// in-memory snapshot. Node decodes are serialized through an internal
-/// actor (copc-lib's `FileReader` is not thread-safe — see
-/// `docs/streaming.md` for why we don't open multiple readers yet).
+/// in-memory snapshot and a pool of
+/// ``StreamingOptions/decodeConcurrency`` `FileReader` instances is
+/// opened against the file. copc-lib's `FileReader` owns an `fstream`
+/// that isn't thread-safe, so the driver assigns each concurrent decode
+/// a distinct reader slot — this is how the actor delegates parallel
+/// work without contending on a single reader.
 ///
 /// A detached driver `Task` wakes at
 /// ``StreamingOptions/driverTickInterval``, scores nodes against the
 /// latest camera + budget, dispatches up to
-/// ``StreamingOptions/maxInFlightLoads`` loads per tick, and publishes
-/// residency deltas to a lock-protected queue that
+/// ``StreamingOptions/maxInFlightLoads`` loads per tick (running them in
+/// batches of ``StreamingOptions/decodeConcurrency`` in parallel), and
+/// publishes residency deltas to a lock-protected queue that
 /// ``pollLatest()`` drains.
 ///
 /// - Important: Call ``close()`` when finished to release the file handle
@@ -492,7 +506,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         _ url: URL,
         options: StreamingOptions = .init()
     ) async throws -> CopcStreamingPointCloudSource {
-        guard let handle: copc_handle = url.path.withCString({ swiftpdal_copc_open($0) }) else {
+        let poolSize = Int32(max(1, options.decodeConcurrency))
+        guard let handle: copc_handle = url.path.withCString({ swiftpdal_copc_open($0, poolSize) }) else {
             throw StreamingSourceError.openFailed(url)
         }
 
@@ -613,6 +628,16 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
 
 // MARK: - Driver actor
 
+/// `@unchecked Sendable` wrapper for the opaque COPC handle so it can be
+/// captured by concurrent decode tasks. Safe because:
+///   1. The handle is read-only after open (hierarchy/header are
+///      immutable).
+///   2. Each concurrent caller targets a distinct `slot` in the reader
+///      pool, so per-reader `fstream` state is never shared.
+private struct SendableCopcHandle: @unchecked Sendable {
+    let raw: copc_handle
+}
+
 actor StreamingDriver {
     private let handle: copc_handle
     private let nodes: [NodeMeta]
@@ -704,19 +729,52 @@ actor StreamingDriver {
         }
 
         // 3. Dispatch loads for wanted-not-resident-not-in-flight, capped at
-        //    maxInFlightLoads. FileReader's fstream isn't thread-safe so
-        //    loads are serialized on this actor.
+        //    maxInFlightLoads per tick. Each batch of up to
+        //    decodeConcurrency chunks runs in parallel via a reader pool;
+        //    every child task targets a distinct slot in the pool, so
+        //    fstream-per-reader isolation is preserved.
         let needed = wanted.subtracting(resident.keys).subtracting(inFlight)
         let toLoad = Array(needed.prefix(options.maxInFlightLoads))
         for id in toLoad { inFlight.insert(id) }
 
-        for id in toLoad {
-            if closed || !inFlight.contains(id) { continue }
-            if let chunk = decodeAndPack(id: id) {
-                resident[id] = ResidentEntry(chunk: chunk, ticksSinceWanted: 0)
-                tickAdded.append(chunk)
+        let concurrency = max(1, options.decodeConcurrency)
+        let handleBox = SendableCopcHandle(raw: self.handle)
+        let originShift = self.originShift
+
+        var batchStart = 0
+        while batchStart < toLoad.count {
+            if closed { break }
+            let batchEnd = min(batchStart + concurrency, toLoad.count)
+            let batch = Array(toLoad[batchStart..<batchEnd])
+            batchStart = batchEnd
+
+            let results: [(ChunkID, ResidentChunk?)] = await withTaskGroup(
+                of: (ChunkID, ResidentChunk?).self,
+                returning: [(ChunkID, ResidentChunk?)].self
+            ) { group in
+                for (slotOffset, id) in batch.enumerated() {
+                    let slot = Int32(slotOffset)
+                    group.addTask {
+                        let chunk = StreamingDriver.decodeAndPack(
+                            handle: handleBox.raw, slot: slot, id: id, originShift: originShift
+                        )
+                        return (id, chunk)
+                    }
+                }
+                var out: [(ChunkID, ResidentChunk?)] = []
+                out.reserveCapacity(batch.count)
+                for await r in group { out.append(r) }
+                return out
             }
-            inFlight.remove(id)
+
+            for (id, chunk) in results {
+                if !inFlight.contains(id) { continue }  // cancelled mid-flight
+                if let chunk {
+                    resident[id] = ResidentEntry(chunk: chunk, ticksSinceWanted: 0)
+                    tickAdded.append(chunk)
+                }
+                inFlight.remove(id)
+            }
         }
 
         if !tickAdded.isEmpty || !tickRemoved.isEmpty {
@@ -751,11 +809,23 @@ actor StreamingDriver {
         return wanted
     }
 
-    private func decodeAndPack(id: ChunkID) -> ResidentChunk? {
+    /// Decode + pack a single COPC node into a render-ready chunk.
+    ///
+    /// `nonisolated` and `static` so it can run on a cooperative thread
+    /// outside the actor. Thread-safety is achieved by giving every
+    /// concurrent caller a distinct `slot` into the file reader pool
+    /// established in ``CopcStreamingPointCloudSource/open(_:options:)``.
+    nonisolated static func decodeAndPack(
+        handle: copc_handle,
+        slot: Int32,
+        id: ChunkID,
+        originShift: SIMD3<Double>
+    ) -> ResidentChunk? {
         var data = copc_chunk_data()
         let rc = swiftpdal_copc_read_node(
             handle,
             Int32(id.depth), Int32(id.x), Int32(id.y), Int32(id.z),
+            slot,
             &data
         )
         guard rc == 0, data.point_count > 0, let xyz = data.xyz, let rgb = data.rgb else {

@@ -18,17 +18,21 @@
 #include <cstring>
 
 struct copc_handle_s {
-    std::unique_ptr<copc::FileReader> reader;
+    std::vector<std::unique_ptr<copc::FileReader>> readers;
     std::vector<copc::Node> nodes;
     copc::las::LasHeader header;
 };
 
-extern "C" copc_handle swiftpdal_copc_open(const char* path) {
+extern "C" copc_handle swiftpdal_copc_open(const char* path, int32_t pool_size) {
+    if (!path || pool_size < 1) return nullptr;
     try {
         auto h = new copc_handle_s();
-        h->reader = std::make_unique<copc::FileReader>(std::string(path));
-        h->nodes  = h->reader->GetAllNodes();
-        h->header = h->reader->CopcConfig().LasHeader();
+        h->readers.reserve(static_cast<size_t>(pool_size));
+        for (int32_t i = 0; i < pool_size; ++i) {
+            h->readers.emplace_back(std::make_unique<copc::FileReader>(std::string(path)));
+        }
+        h->nodes  = h->readers[0]->GetAllNodes();
+        h->header = h->readers[0]->CopcConfig().LasHeader();
         return h;
     } catch (const std::exception&) {
         return nullptr;
@@ -39,8 +43,14 @@ extern "C" copc_handle swiftpdal_copc_open(const char* path) {
 
 extern "C" void swiftpdal_copc_close(copc_handle h) {
     if (!h) return;
-    h->reader.reset();
+    h->readers.clear();
     delete h;
+}
+
+extern "C" int32_t swiftpdal_copc_pool_size(copc_handle h, int32_t* out) {
+    if (!h || !out) return -1;
+    *out = static_cast<int32_t>(h->readers.size());
+    return 0;
 }
 
 extern "C" int32_t swiftpdal_copc_total_points(copc_handle h, int64_t* out) {
@@ -97,20 +107,24 @@ extern "C" int32_t swiftpdal_copc_node_at(copc_handle h, int32_t index, copc_nod
 extern "C" int32_t swiftpdal_copc_read_node(
     copc_handle h,
     int32_t depth, int32_t x, int32_t y, int32_t z,
+    int32_t slot,
     copc_chunk_data* out
 ) {
     if (!h || !out) return -1;
+    if (slot < 0 || static_cast<size_t>(slot) >= h->readers.size()) return -1;
     out->xyz = nullptr;
     out->rgb = nullptr;
     out->point_count = 0;
     out->has_rgb = 0;
 
+    copc::FileReader* reader = h->readers[static_cast<size_t>(slot)].get();
+
     try {
         copc::VoxelKey key(depth, x, y, z);
-        copc::Node node = h->reader->FindNode(key);
+        copc::Node node = reader->FindNode(key);
         if (!node.IsValid()) return -2;
 
-        copc::las::Points points = h->reader->GetPoints(node);
+        copc::las::Points points = reader->GetPoints(node);
         const int32_t n = static_cast<int32_t>(points.Size());
         if (n <= 0) return -3;
 

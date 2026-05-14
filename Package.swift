@@ -78,6 +78,17 @@ let package = Package(
             ]
         ),
 
+        // Dev-only benchmark for the COPC streaming path. Run with:
+        //   swift run -c release StreamingBench /path/to/file.copc.laz [concurrency] [seconds]
+        .executableTarget(
+            name: "StreamingBench",
+            dependencies: ["SwiftPDAL"],
+            path: "Sources/StreamingBench",
+            swiftSettings: [
+                .interoperabilityMode(.Cxx)
+            ]
+        ),
+
         .testTarget(
             name: "SwiftPDALTests",
             dependencies: ["SwiftPDAL"],
