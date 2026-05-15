@@ -49,13 +49,15 @@ let package = Package(
         // checksum below). For development against the locally-built cmake
         // prefix instead, see Frameworks/copc-build/README.md.
         //
-        // Switched from URL- to path-based while iterating on the lazperf
-        // pooled-decompressor patches (see Frameworks/lazperf-patches/).
-        // To return to URL-based for a release, see the checksum printed
-        // at the end of build-copc-xcframework.sh.
+        // copclib-1.2.0 adds the lazperf pooled-decompressor reset() API
+        // applied as Frameworks/lazperf-patches/0001-add-reset-api.patch on
+        // top of upstream laz-perf master. For local iteration, switch the
+        // binaryTarget below to `path: "Frameworks/copclib.xcframework"` and
+        // run the build script.
         .binaryTarget(
             name: "copclib",
-            path: "Frameworks/copclib.xcframework"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/copclib-1.2.0/copclib.xcframework.zip",
+            checksum: "cb45a86fb22da2f7f2e97a0ac2298bb18608a5abd42a4a2b7d2b3d938621ceb7"
         ),
 
         // C++ bridge to copc-lib for out-of-core streaming.
