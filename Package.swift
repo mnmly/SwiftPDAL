@@ -48,10 +48,14 @@ let package = Package(
         // Build with: scripts/build-copc-xcframework.sh (also computes the
         // checksum below). For development against the locally-built cmake
         // prefix instead, see Frameworks/copc-build/README.md.
+        //
+        // Switched from URL- to path-based while iterating on the lazperf
+        // pooled-decompressor patches (see Frameworks/lazperf-patches/).
+        // To return to URL-based for a release, see the checksum printed
+        // at the end of build-copc-xcframework.sh.
         .binaryTarget(
             name: "copclib",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/1.1.0/copclib.xcframework.zip",
-            checksum: "c4c1bf2c2eadf27d7e0194eab47beecc2e306661af3041dbbe0dc096514d8c7a"
+            path: "Frameworks/copclib.xcframework"
         ),
 
         // C++ bridge to copc-lib for out-of-core streaming.
