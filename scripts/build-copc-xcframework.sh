@@ -33,6 +33,28 @@ if [ ! -d "copc-lib/libs/laz-perf" ]; then
     git clone --depth 1 --branch "$LAZPERF_TAG" https://github.com/hobuinc/laz-perf.git copc-lib/libs/laz-perf
 fi
 
+# --- Apply local lazperf patches (in lexical order) ------------------------
+# See Frameworks/lazperf-patches/README.md.
+LAZPERF_PATCHES="$REPO_ROOT/Frameworks/lazperf-patches"
+if [ -d "$LAZPERF_PATCHES" ]; then
+    pushd copc-lib/libs/laz-perf >/dev/null
+    for p in "$LAZPERF_PATCHES"/*.patch; do
+        [ -f "$p" ] || continue
+        # Idempotent: skip if already applied (git apply --check fails on
+        # already-applied; we detect that and continue).
+        if git apply --reverse --check "$p" 2>/dev/null; then
+            echo "==> lazperf patch already applied: $(basename "$p")"
+        elif git apply --check "$p" 2>/dev/null; then
+            echo "==> Applying lazperf patch: $(basename "$p")"
+            git apply "$p"
+        else
+            echo "ERROR: lazperf patch $(basename "$p") does not cleanly apply or reverse-apply" >&2
+            exit 1
+        fi
+    done
+    popd >/dev/null
+fi
+
 # --- Helpers ---------------------------------------------------------------
 # build_slice <slice-name> <cmake-extra-flags...>
 # Produces: $WORK_DIR/install-<slice>/lib/{libcopc-lib.a,liblazperf.a}
