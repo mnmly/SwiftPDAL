@@ -10,7 +10,7 @@ import CxxCOPC
         return
     }
 
-    let handle = path.withCString { swiftpdal_copc_open($0) }
+    let handle = path.withCString { swiftpdal_copc_open($0, 1) }
     #expect(handle != nil, "FileReader failed to open")
     defer { swiftpdal_copc_close(handle) }
 

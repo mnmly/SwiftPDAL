@@ -786,6 +786,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
 
     /// Test-only diagnostic snapshot of the driver's last tick.
     public func _debugSnapshot() async -> (candidates: Int, wanted: Int, resident: Int, inFlight: Int,
+                                           frustumVisible: Int, totalNodes: Int,
                                            cacheHits: Int, cacheMisses: Int) {
         await driver.snapshot()
     }
@@ -892,13 +893,20 @@ actor StreamingDriver {
     private(set) var lastTickWanted: Int = 0
     private(set) var lastTickResident: Int = 0
     private(set) var lastTickInFlight: Int = 0
+    /// Nodes that passed the frustum test under
+    /// ``ResidencyPolicy/frustumFirstThenHalo``. 0 under
+    /// ``ResidencyPolicy/distanceOnly`` (no frustum computed) and 0
+    /// when the whole-file shortcut engaged.
+    private(set) var lastTickFrustumVisible: Int = 0
     /// Cumulative wanted-set cache hits / misses since driver start.
     private(set) var wantedCacheHits: Int = 0
     private(set) var wantedCacheMisses: Int = 0
 
     func snapshot() -> (candidates: Int, wanted: Int, resident: Int, inFlight: Int,
+                        frustumVisible: Int, totalNodes: Int,
                         cacheHits: Int, cacheMisses: Int) {
         (lastTickCandidates, lastTickWanted, lastTickResident, lastTickInFlight,
+         lastTickFrustumVisible, nodes.count,
          wantedCacheHits, wantedCacheMisses)
     }
 
@@ -965,6 +973,7 @@ actor StreamingDriver {
         // node is wanted. Skips the frustum scan and sort entirely.
         if totalNodeBytes <= budget {
             lastTickCandidates = nodes.count
+            lastTickFrustumVisible = 0
             return allNodeIDs
         }
 
@@ -993,6 +1002,10 @@ actor StreamingDriver {
             }
         }
         lastTickCandidates = visible.count + hidden.count
+        // `visible` carries everything under .distanceOnly (frustum not
+        // computed); only meaningful under .frustumFirstThenHalo.
+        lastTickFrustumVisible = (options.residencyPolicy == .frustumFirstThenHalo)
+            ? visible.count : 0
 
         // Pass 1: nearest visible chunks fill the budget.
         visible.sort { $0.score > $1.score }
