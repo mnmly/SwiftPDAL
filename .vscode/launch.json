@@ -59,6 +59,26 @@
             "target": "StreamingExample",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release StreamingExample"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftPDAL}",
+            "name": "Debug StreamingBench",
+            "target": "StreamingBench",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug StreamingBench"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SwiftPDAL}",
+            "name": "Release StreamingBench",
+            "target": "StreamingBench",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release StreamingBench"
         }
     ]
 }

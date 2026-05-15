@@ -317,6 +317,16 @@ public struct StreamingOptions: Sendable {
     /// engages automatically whenever the file fits in the current
     /// budget, regardless of this setting.
     public var residencyPolicy: ResidencyPolicy
+    /// Target on-screen size of a single COPC node's longest AABB
+    /// axis, in pixels. The residency scorer ranks each candidate node
+    /// by how close its projected screen size is to this value:
+    /// nodes that project to roughly this many pixels win, nodes that
+    /// would be much smaller (over-detailed) or much larger
+    /// (under-detailed) lose. Lower values pull finer-depth chunks
+    /// into residency sooner; higher values bias toward coarse
+    /// coverage. 256 px per chunk is a reasonable default for
+    /// per-point density on a typical desktop display.
+    public var targetChunkScreenSize: Float
 
     /// Create a configuration.
     ///
@@ -328,6 +338,8 @@ public struct StreamingOptions: Sendable {
     ///   - evictionDelayTicks: Hysteresis frames.
     ///   - driverTickInterval: Tick cadence.
     ///   - residencyPolicy: Wanted-set construction strategy.
+    ///   - targetChunkScreenSize: Pixels per chunk target for LOD
+    ///     selection. See ``targetChunkScreenSize``.
     public init(
         maxInFlightLoads: Int = 4,
         decodeConcurrency: Int = 4,
@@ -335,7 +347,8 @@ public struct StreamingOptions: Sendable {
         prefetchRoot: Bool = true,
         evictionDelayTicks: Int = 5,
         driverTickInterval: Duration = .milliseconds(100),
-        residencyPolicy: ResidencyPolicy = .frustumFirstThenHalo
+        residencyPolicy: ResidencyPolicy = .frustumFirstThenHalo,
+        targetChunkScreenSize: Float = 256
     ) {
         self.maxInFlightLoads = maxInFlightLoads
         self.decodeConcurrency = decodeConcurrency
@@ -344,6 +357,7 @@ public struct StreamingOptions: Sendable {
         self.evictionDelayTicks = evictionDelayTicks
         self.driverTickInterval = driverTickInterval
         self.residencyPolicy = residencyPolicy
+        self.targetChunkScreenSize = targetChunkScreenSize
     }
 }
 
@@ -784,12 +798,54 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         }
     }
 
-    /// Test-only diagnostic snapshot of the driver's last tick.
-    public func _debugSnapshot() async -> (candidates: Int, wanted: Int, resident: Int, inFlight: Int,
-                                           frustumVisible: Int, totalNodes: Int,
-                                           cacheHits: Int, cacheMisses: Int) {
+    /// Test-only diagnostic snapshot of the driver's last tick. Stable
+    /// shape across releases is not guaranteed — this is for benches,
+    /// tests, and ad-hoc consumer-side logging only.
+    public func _debugSnapshot() async -> StreamingDebugSnapshot {
         await driver.snapshot()
     }
+}
+
+// MARK: - Debug snapshot
+
+/// Diagnostic snapshot returned by
+/// ``CopcStreamingPointCloudSource/_debugSnapshot()``. Field shape is
+/// **not** part of the stable public API; it's for benches, tests, and
+/// ad-hoc consumer logging. Counts reflect the last completed driver
+/// tick, except for the depth buckets which are sampled live from the
+/// current `resident` and `cachedWanted` sets.
+public struct StreamingDebugSnapshot: Sendable {
+    /// Nodes scored on the most recent miss tick (post-frustum-cull
+    /// under ``ResidencyPolicy/frustumFirstThenHalo``; all nodes under
+    /// ``ResidencyPolicy/distanceOnly`` and the whole-file shortcut).
+    public let candidates: Int
+    /// Size of the wanted set computed on the most recent miss tick.
+    public let wanted: Int
+    /// Number of chunks currently resident on the driver.
+    public let resident: Int
+    /// Number of decode jobs that have been enqueued and not yet
+    /// completed.
+    public let inFlight: Int
+    /// Nodes that passed the frustum-intersection test on the most
+    /// recent miss tick. Only populated under
+    /// ``ResidencyPolicy/frustumFirstThenHalo``; `0` under
+    /// ``ResidencyPolicy/distanceOnly`` and the whole-file shortcut.
+    public let frustumVisible: Int
+    /// Total octree node count for the open file.
+    public let totalNodes: Int
+    /// Cumulative wanted-set cache hits since the source was opened.
+    public let cacheHits: Int
+    /// Cumulative wanted-set cache misses since the source was opened.
+    public let cacheMisses: Int
+    /// Resident chunk count bucketed by COPC depth, indexed by depth
+    /// (`residentByDepth[0]` = root level). Length = maxDepth + 1.
+    /// Useful for diagnosing LOD-selection bugs: a heavy leaf-depth
+    /// bucket with empty coarse buckets indicates the wanted-set
+    /// scorer is favouring close-camera detail and starving coverage.
+    public let residentByDepth: [Int]
+    /// Wanted chunk count bucketed by COPC depth. Same indexing as
+    /// ``residentByDepth``.
+    public let wantedByDepth: [Int]
 }
 
 // MARK: - Driver actor
@@ -811,6 +867,7 @@ actor StreamingDriver {
     private let nodeIndexByID: [ChunkID: Int]
     private let allNodeIDs: Set<ChunkID>
     private let totalNodeBytes: Int
+    private let maxNodeDepth: Int
     private let originShift: SIMD3<Double>
     private let options: StreamingOptions
     private let queue: UpdateQueue
@@ -851,6 +908,7 @@ actor StreamingDriver {
         self.nodeIndexByID = Dictionary(uniqueKeysWithValues: nodes.enumerated().map { ($1.id, $0) })
         self.allNodeIDs = Set(nodes.lazy.map(\.id))
         self.totalNodeBytes = nodes.reduce(0) { $0 + $1.pointCount * 17 }
+        self.maxNodeDepth = nodes.reduce(0) { max($0, $1.id.depth) }
         self.originShift = originShift
         self.options = options
         self.queue = queue
@@ -902,12 +960,30 @@ actor StreamingDriver {
     private(set) var wantedCacheHits: Int = 0
     private(set) var wantedCacheMisses: Int = 0
 
-    func snapshot() -> (candidates: Int, wanted: Int, resident: Int, inFlight: Int,
-                        frustumVisible: Int, totalNodes: Int,
-                        cacheHits: Int, cacheMisses: Int) {
-        (lastTickCandidates, lastTickWanted, lastTickResident, lastTickInFlight,
-         lastTickFrustumVisible, nodes.count,
-         wantedCacheHits, wantedCacheMisses)
+    func snapshot() -> StreamingDebugSnapshot {
+        let maxDepth = self.maxNodeDepth
+        var residentByDepth = [Int](repeating: 0, count: maxDepth + 1)
+        for id in resident.keys {
+            let d = id.depth
+            if d < residentByDepth.count { residentByDepth[d] &+= 1 }
+        }
+        var wantedByDepth = [Int](repeating: 0, count: maxDepth + 1)
+        for id in cachedWanted {
+            let d = id.depth
+            if d < wantedByDepth.count { wantedByDepth[d] &+= 1 }
+        }
+        return StreamingDebugSnapshot(
+            candidates: lastTickCandidates,
+            wanted: lastTickWanted,
+            resident: lastTickResident,
+            inFlight: lastTickInFlight,
+            frustumVisible: lastTickFrustumVisible,
+            totalNodes: nodes.count,
+            cacheHits: wantedCacheHits,
+            cacheMisses: wantedCacheMisses,
+            residentByDepth: residentByDepth,
+            wantedByDepth: wantedByDepth
+        )
     }
 
     func runOneTick() {
@@ -982,18 +1058,45 @@ actor StreamingDriver {
         var hidden: [Scored] = []
         visible.reserveCapacity(nodes.count)
 
+        // Screen-space-error scorer: each candidate is judged by how
+        // close its projected on-screen size matches
+        // ``StreamingOptions/targetChunkScreenSize``. The previous
+        // 1/distance heuristic biased the wanted set toward fine
+        // leaf-depth chunks near the camera and starved coarse
+        // ancestors that would have provided coverage of far regions —
+        // producing the "pockets of detail, vast black in between"
+        // failure mode the test fixtures and rendered consumers hit.
+        //
+        // For each node:
+        //   screenPx = extent * view.pixelScale / distance
+        //   ratio    = screenPx / target
+        //   err      = |log2(ratio)|        (0 = perfect match)
+        //   score    = 1 / (1 + err)        (peaks at err = 0)
+        //
+        // A coarse node far from the camera and a fine node close to
+        // it both hit `err ≈ 0` at their natural depth; the chunks
+        // that win the budget race are the ones at the *right* level
+        // for their distance, not just the closest ones.
+        let target = max(options.targetChunkScreenSize, 1)
+        let pixelScale = max(view.pixelScale, 1e-6)
+
+        func score(for node: NodeMeta) -> Float {
+            let distance = simd_length(node.center - view.position) + 1e-3
+            let screenPx = max(node.extent * pixelScale / distance, 1e-6)
+            let err = abs(log2(screenPx / target))
+            return 1 / (1 + err)
+        }
+
         switch options.residencyPolicy {
         case .distanceOnly:
             // No frustum gate — everything is a candidate.
             for node in nodes {
-                let d = simd_length(node.center - view.position) + 1e-3
-                visible.append(Scored(id: node.id, score: 1 / d, bytes: node.pointCount * 17))
+                visible.append(Scored(id: node.id, score: score(for: node), bytes: node.pointCount * 17))
             }
         case .frustumFirstThenHalo:
             let planes = FrustumPlanes(viewProjection: view.viewProjection)
             for node in nodes {
-                let d = simd_length(node.center - view.position) + 1e-3
-                let s = Scored(id: node.id, score: 1 / d, bytes: node.pointCount * 17)
+                let s = Scored(id: node.id, score: score(for: node), bytes: node.pointCount * 17)
                 if planes.intersects(min: node.minXYZ, max: node.maxXYZ) {
                     visible.append(s)
                 } else {

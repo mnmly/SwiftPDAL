@@ -92,9 +92,7 @@ private func narrowCornerView(for bounds: Bounds, originShift: SIMD3<Double>) ->
 private func waitForSnapshot(
     on source: CopcStreamingPointCloudSource,
     timeout: TimeInterval = 5,
-    predicate: ((candidates: Int, wanted: Int, resident: Int, inFlight: Int,
-                 frustumVisible: Int, totalNodes: Int,
-                 cacheHits: Int, cacheMisses: Int)) -> Bool
+    predicate: (StreamingDebugSnapshot) -> Bool
 ) async {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
@@ -221,6 +219,149 @@ private func waitForSnapshot(
             "no new misses expected while view+budget are unchanged (start=\(startMisses) now=\(snap.cacheMisses))")
     #expect(snap.wanted == firstWanted,
             "wanted-set count should be stable across cache hits (first=\(firstWanted) later=\(snap.wanted))")
+}
+
+// Eye placed near a corner of the scene (close enough that fine-depth
+// chunks project near the target screen size). Companion to
+// `narrowCornerView` which sits far away.
+private func nearCornerView(for bounds: Bounds, originShift: SIMD3<Double>) -> (SIMD3<Float>, simd_float4x4) {
+    let centerWorld = (bounds.min + bounds.max) * 0.5
+    let center = SIMD3<Float>(
+        centerWorld.x - Float(originShift.x),
+        centerWorld.y - Float(originShift.y),
+        centerWorld.z - Float(originShift.z)
+    )
+    let span = simd_length(bounds.max - bounds.min)
+    // Eye just outside one corner — fine-depth chunks here project to
+    // ~target screen size, coarse chunks are over-detailed.
+    let corner = SIMD3<Float>(
+        bounds.min.x - Float(originShift.x),
+        bounds.min.y - Float(originShift.y),
+        bounds.min.z - Float(originShift.z)
+    )
+    let eye = corner + SIMD3<Float>(-span * 0.02, -span * 0.02, span * 0.02)
+    let f = simd_normalize(center - eye)
+    let s = simd_normalize(simd_cross(f, SIMD3<Float>(0, 1, 0)))
+    let u = simd_cross(s, f)
+    let view = simd_float4x4(
+        SIMD4<Float>( s.x,  u.x, -f.x, 0),
+        SIMD4<Float>( s.y,  u.y, -f.y, 0),
+        SIMD4<Float>( s.z,  u.z, -f.z, 0),
+        SIMD4<Float>(-simd_dot(s, eye), -simd_dot(u, eye),  simd_dot(f, eye), 1)
+    )
+    let fov: Float = .pi / 3   // 60°
+    let aspect: Float = 1
+    let near: Float = max(span * 0.001, 0.01)
+    let far  = span * 4
+    let yScale = 1 / tan(fov * 0.5)
+    let zRange = far - near
+    let proj = simd_float4x4(
+        SIMD4<Float>(yScale / aspect, 0,      0,                  0),
+        SIMD4<Float>(0,               yScale, 0,                  0),
+        SIMD4<Float>(0,               0,     -(far + near)/zRange, -1),
+        SIMD4<Float>(0,               0,     -2*far*near/zRange,  0)
+    )
+    return (eye, proj * view)
+}
+
+@Test func streamingSource_lodScorer_admitsCoarseRootWhenCameraIsFar() async throws {
+    guard let url = loadFixture() else {
+        Issue.record("test.copc.laz fixture missing")
+        return
+    }
+    let source = try await CopcStreamingPointCloudSource.open(url, options: .init(
+        prefetchRoot: false,
+        evictionDelayTicks: 100,
+        driverTickInterval: .milliseconds(10),
+        residencyPolicy: .frustumFirstThenHalo,
+        targetChunkScreenSize: 256
+    ))
+    defer { source.close() }
+
+    let (eye, vp) = narrowCornerView(for: source.info.bounds, originShift: source.info.originShift)
+    source.setBudget(8 * 1_048_576)
+    source.submit(view: StreamingCameraView(position: eye, viewProjection: vp, pixelScale: 1000))
+
+    await waitForSnapshot(on: source) { $0.cacheMisses > 0 && $0.wanted > 0 }
+    let snap = await source._debugSnapshot()
+    #expect(snap.wantedByDepth[0] >= 1,
+            "with the camera far from the data, the depth-0 root should be wanted for coverage")
+    let coarseWanted = snap.wantedByDepth.prefix(3).reduce(0, +)
+    let deepWanted = snap.wantedByDepth.dropFirst(3).reduce(0, +)
+    #expect(coarseWanted > deepWanted,
+            "far camera should bias the wanted set toward coarse depths (coarse=\(coarseWanted) deep=\(deepWanted))")
+}
+
+@Test func streamingSource_lodScorer_admitsFineDetailWhenCameraIsNear() async throws {
+    guard let url = loadFixture() else {
+        Issue.record("test.copc.laz fixture missing")
+        return
+    }
+    let source = try await CopcStreamingPointCloudSource.open(url, options: .init(
+        prefetchRoot: false,
+        evictionDelayTicks: 100,
+        driverTickInterval: .milliseconds(10),
+        residencyPolicy: .frustumFirstThenHalo,
+        targetChunkScreenSize: 256
+    ))
+    defer { source.close() }
+
+    let (eye, vp) = nearCornerView(for: source.info.bounds, originShift: source.info.originShift)
+    source.setBudget(8 * 1_048_576)
+    source.submit(view: StreamingCameraView(position: eye, viewProjection: vp, pixelScale: 1000))
+
+    await waitForSnapshot(on: source) { $0.cacheMisses > 0 && $0.wanted > 0 }
+    let snap = await source._debugSnapshot()
+    let deepWanted = snap.wantedByDepth.dropFirst(snap.wantedByDepth.count / 2).reduce(0, +)
+    #expect(deepWanted >= 1,
+            "near camera should pull at least one deep-depth chunk into the wanted set (wantedByDepth=\(snap.wantedByDepth))")
+}
+
+// Diagnostic: dump the residency depth distribution under a narrow
+// camera + tight budget. Always passes; the print output is the value.
+// Run via:
+//   swift test --filter streamingSource_depthDistribution
+@Test func streamingSource_depthDistribution_diagnostic() async throws {
+    guard let url = loadFixture() else {
+        Issue.record("test.copc.laz fixture missing")
+        return
+    }
+    let source = try await CopcStreamingPointCloudSource.open(url, options: .init(
+        maxInFlightLoads: 16,
+        decodeConcurrency: 4,
+        prefetchRoot: false,
+        evictionDelayTicks: 100,
+        driverTickInterval: .milliseconds(10),
+        residencyPolicy: .frustumFirstThenHalo
+    ))
+    defer { source.close() }
+
+    let (eye, vp) = narrowCornerView(for: source.info.bounds, originShift: source.info.originShift)
+    source.setBudget(8 * 1_048_576)   // 8 MB — tight enough to force selection on a 36 MB fixture
+    source.submit(view: StreamingCameraView(position: eye, viewProjection: vp, pixelScale: 1000))
+
+    // Let residency converge on the wanted set.
+    let deadline = Date().addingTimeInterval(10)
+    while Date() < deadline {
+        try await Task.sleep(for: .milliseconds(50))
+        _ = source.pollLatest()
+        let snap = await source._debugSnapshot()
+        if snap.resident == snap.wanted && snap.inFlight == 0 && snap.wanted > 0 { break }
+    }
+
+    let snap = await source._debugSnapshot()
+    print("--- depth distribution diagnostic ---")
+    print("totalNodes:     \(snap.totalNodes) (maxDepth=\(snap.residentByDepth.count - 1))")
+    print("frustumVisible: \(snap.frustumVisible)")
+    print("wanted:         \(snap.wanted)")
+    print("resident:       \(snap.resident)")
+    for d in 0..<snap.residentByDepth.count {
+        let total = snap.totalNodes
+        let r = snap.residentByDepth[d]
+        let w = snap.wantedByDepth[d]
+        print(String(format: "  depth %d: resident=%-4d wanted=%-4d (of %d total)", d, r, w, total))
+    }
+    #expect(snap.resident > 0)
 }
 
 @Test func streamingSource_residencyFillsFile() async throws {
