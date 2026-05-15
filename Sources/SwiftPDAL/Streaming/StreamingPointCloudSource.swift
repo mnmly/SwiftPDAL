@@ -893,6 +893,13 @@ actor StreamingDriver {
     private var cachedView: StreamingCameraView?
     private var cachedBudget: Int = .min
     private var cachedWanted: Set<ChunkID> = []
+    /// Wanted IDs in *load-priority order* (best to load first). Under
+    /// the SSE scorer this is admission order from the budget-fill pass
+    /// (highest score first, then halo). Under whole-file mode it is
+    /// sorted by depth ASC so coarse coverage decodes before any leaf
+    /// detail — otherwise a renderer drawing during the streaming-in
+    /// phase sees patchy leaves before the root arrives.
+    private var cachedWantedSorted: [ChunkID] = []
     private var cachedCandidates: Int = 0
 
     init(
@@ -993,15 +1000,20 @@ actor StreamingDriver {
         // 1. Score nodes against the camera + budget — cached when the
         //    (view, budget) pair is unchanged from the previous tick.
         let wanted: Set<ChunkID>
+        let wantedOrdered: [ChunkID]
         if let cv = cachedView, cv == view, cachedBudget == budgetBytes {
             wanted = cachedWanted
+            wantedOrdered = cachedWantedSorted
             lastTickCandidates = cachedCandidates
             wantedCacheHits &+= 1
         } else {
-            wanted = computeWantedSet(view: view, budget: budgetBytes)
+            let computed = computeWantedSet(view: view, budget: budgetBytes)
+            wanted = computed.set
+            wantedOrdered = computed.ordered
             cachedView = view
             cachedBudget = budgetBytes
             cachedWanted = wanted
+            cachedWantedSorted = wantedOrdered
             cachedCandidates = lastTickCandidates
             wantedCacheMisses &+= 1
         }
@@ -1031,26 +1043,37 @@ actor StreamingDriver {
             queue.enqueue(added: [], removed: tickRemoved)
         }
 
-        // 3. Enqueue new decode jobs for wanted-not-resident-not-in-flight,
-        //    capped at maxInFlightLoads per tick. Persistent worker tasks
-        //    owned by ``CopcStreamingPointCloudSource`` consume the queue;
-        //    completed chunks publish to ``UpdateQueue`` from
-        //    ``completeLoad(id:chunk:)`` continuously, so a slow decode
-        //    does not stall subsequent ticks.
-        let needed = wanted.subtracting(resident.keys).subtracting(inFlight)
-        let toLoad = Array(needed.prefix(options.maxInFlightLoads))
+        // 3. Enqueue new decode jobs in load-priority order (best chunks
+        //    first per the wanted-set scorer; coarse-first under
+        //    whole-file mode). Cap at maxInFlightLoads per tick.
+        //    Persistent worker tasks consume the queue; completed
+        //    chunks publish to ``UpdateQueue`` from
+        //    ``completeLoad(id:chunk:)``, so a slow decode does not
+        //    stall subsequent ticks.
+        var toLoad: [ChunkID] = []
+        toLoad.reserveCapacity(options.maxInFlightLoads)
+        for id in wantedOrdered {
+            if toLoad.count == options.maxInFlightLoads { break }
+            if resident[id] != nil { continue }
+            if inFlight.contains(id) { continue }
+            toLoad.append(id)
+        }
         if toLoad.isEmpty { return }
         for id in toLoad { inFlight.insert(id) }
         jobs.enqueue(toLoad)
     }
 
-    private func computeWantedSet(view: StreamingCameraView, budget: Int) -> Set<ChunkID> {
+    private func computeWantedSet(view: StreamingCameraView, budget: Int)
+    -> (set: Set<ChunkID>, ordered: [ChunkID]) {
         // Whole-file shortcut: if every node fits in the budget, every
-        // node is wanted. Skips the frustum scan and sort entirely.
+        // node is wanted. Skip the frustum scan and sort entirely, but
+        // produce a depth-ASC load order so coarse coverage arrives
+        // before any leaf-depth detail during streaming-in.
         if totalNodeBytes <= budget {
             lastTickCandidates = nodes.count
             lastTickFrustumVisible = 0
-            return allNodeIDs
+            let ordered = nodes.sorted { $0.id.depth < $1.id.depth }.map(\.id)
+            return (allNodeIDs, ordered)
         }
 
         struct Scored { let id: ChunkID; let score: Float; let bytes: Int }
@@ -1110,13 +1133,17 @@ actor StreamingDriver {
         lastTickFrustumVisible = (options.residencyPolicy == .frustumFirstThenHalo)
             ? visible.count : 0
 
-        // Pass 1: nearest visible chunks fill the budget.
+        // Pass 1: nearest visible chunks fill the budget. Admission
+        // order doubles as load order (best chunks first).
         visible.sort { $0.score > $1.score }
         var wanted = Set<ChunkID>()
+        var ordered: [ChunkID] = []
+        ordered.reserveCapacity(visible.count + hidden.count)
         var used = 0
         for c in visible {
             if used + c.bytes > budget { continue }
             wanted.insert(c.id)
+            ordered.append(c.id)
             used += c.bytes
         }
 
@@ -1128,11 +1155,12 @@ actor StreamingDriver {
             for c in hidden {
                 if used + c.bytes > budget { continue }
                 wanted.insert(c.id)
+                ordered.append(c.id)
                 used += c.bytes
             }
         }
 
-        return wanted
+        return (wanted, ordered)
     }
 
     /// Decode + pack a single COPC node into a render-ready chunk.

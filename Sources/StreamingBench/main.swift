@@ -104,6 +104,16 @@ struct StreamingBench {
         print(String(format: "       %.0f chunks/s   %.2f Mpts/s",
                      Double(totalAdded) / elapsed, Double(totalPointsLoaded) / elapsed / 1_000_000))
 
+        let finalSnap = await source._debugSnapshot()
+        print("--- depth distribution (final tick) ---")
+        print(String(format: "totalNodes=%d  frustumVisible=%d  wanted=%d  resident=%d  inFlight=%d",
+                     finalSnap.totalNodes, finalSnap.frustumVisible,
+                     finalSnap.wanted, finalSnap.resident, finalSnap.inFlight))
+        for d in 0..<finalSnap.residentByDepth.count {
+            print(String(format: "  depth %d:  resident=%-6d  wanted=%-6d",
+                         d, finalSnap.residentByDepth[d], finalSnap.wantedByDepth[d]))
+        }
+
         source.close()
     }
 }
