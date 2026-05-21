@@ -679,7 +679,7 @@ extension PointCloud {
 // MARK: - PDAL Dimension Type Helpers
 
 /// Error codes for PDAL operations
-public enum PDALError: Int {
+public enum PDALError: Int, Sendable {
     case ok = 0
     case notImplemented = -1
     case pdalError = -2
