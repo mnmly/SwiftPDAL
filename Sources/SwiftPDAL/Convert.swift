@@ -17,7 +17,7 @@ import CxxStdlib
 /// Mirrors the subset of JSON that PDAL pipeline stages accept for
 /// their option values: scalars, arrays, and nested objects. Use
 /// ``PDALValue/string(_:)`` for SRS strings, filenames, and enumerated
-/// option values (e.g. ``"laszip"``).
+/// option values (e.g. `"laszip"`).
 ///
 /// Declared `indirect` because the Swift 6.2 compiler crashes when
 /// emitting the module under C++ interop for a recursive non-indirect
@@ -59,11 +59,11 @@ extension PDALValue: ExpressibleByBooleanLiteral {
 
 /// A single PDAL pipeline stage — a reader, filter, or writer.
 ///
-/// The ``type`` is a PDAL driver name such as ``"readers.ptx"``,
-/// ``"filters.reprojection"``, or ``"writers.copc"``. ``options`` are
+/// The ``type`` is a PDAL driver name such as `"readers.ptx"`,
+/// `"filters.reprojection"`, or `"writers.copc"`. ``options`` are
 /// stage-specific keys documented in the PDAL stage reference.
 public struct PDALStage: Sendable {
-    /// PDAL driver identifier, e.g. ``"writers.copc"``.
+    /// PDAL driver identifier, e.g. `"writers.copc"`.
     public var type: String
     /// Stage options, keyed by PDAL option name.
     public var options: [String: PDALValue]
@@ -88,7 +88,7 @@ public struct PDALStage: Sendable {
 public struct ConvertProgress: Sendable {
     /// Cumulative writer-side points processed so far.
     public let pointsSoFar: UInt64
-    /// Reader's preview count, when available. ``0`` when no reader in
+    /// Reader's preview count, when available. `0` when no reader in
     /// the pipeline exposes a usable point-count preview.
     public let estimatedTotal: UInt64
     /// `pointsSoFar / estimatedTotal`, clamped to `0...1`. `nil` when
@@ -159,7 +159,7 @@ public struct ConvertOptions: @unchecked Sendable {
 
 /// Outcome of a successful conversion.
 public struct ConvertResult: Sendable {
-    /// Number of points written. ``0`` when the pipeline ran in
+    /// Number of points written. `0` when the pipeline ran in
     /// streaming mode (PDAL doesn't surface a streamed point count).
     public let pointCount: UInt64
     /// Pipeline metadata as a JSON string, as emitted by PDAL.
@@ -170,8 +170,8 @@ public struct ConvertResult: Sendable {
 public enum ConvertError: Error, CustomStringConvertible {
     /// JSON serialisation of the synthesised pipeline failed.
     case pipelineEncodingFailed(underlying: Error)
-    /// PDAL rejected the pipeline or failed mid-execution. ``code``
-    /// mirrors ``PDALError``; ``detail`` is the PDAL exception text.
+    /// PDAL rejected the pipeline or failed mid-execution. `code`
+    /// mirrors ``PDALError``; `detail` is the PDAL exception text.
     case pipelineFailed(code: PDALError, detail: String)
     /// The progress callback returned `false`.
     case cancelled
@@ -213,7 +213,7 @@ public enum PDALConvert {
     /// - Parameters:
     ///   - input: Source file URL. Must be a file URL with a recognised
     ///     extension, or you must supply ``ConvertOptions/reader``.
-    ///   - output: Destination file URL. ``.copc.laz`` requires an
+    ///   - output: Destination file URL. `.copc.laz` requires an
     ///     explicit ``ConvertOptions/writer`` of `writers.copc`.
     ///   - options: Optional reader/writer overrides, filters, and
     ///     streaming configuration.
@@ -312,7 +312,7 @@ public enum PDALConvert {
     }
 
     /// True if the linked pdalcpp build registers the given driver
-    /// name (e.g. ``"writers.copc"``).
+    /// name (e.g. `"writers.copc"`).
     public static func isDriverRegistered(_ name: String) -> Bool {
         swiftpdal.convert.driver_is_registered(std.string(name))
     }
@@ -340,8 +340,8 @@ public enum PDALConvert {
     }
 
     /// Pick a writer driver from a file URL's extension. Note that
-    /// `.copc.laz` resolves to ``"writers.copc"`` here; plain `.laz`
-    /// resolves to ``"writers.las"`` with `compression: "laszip"`.
+    /// `.copc.laz` resolves to `"writers.copc"` here; plain `.laz`
+    /// resolves to `"writers.las"` with `compression: "laszip"`.
     public static func inferWriterDriver(for url: URL) throws -> String {
         switch normalizedExtension(url) {
         case "las", "laz":   return "writers.las"

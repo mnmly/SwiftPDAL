@@ -50,6 +50,21 @@ once with `pdal translate in.las out.copc.laz --writers.copc`.
 - ``PointCloudData``
 - ``PointCloudError``
 
+### Format conversion
+
+`pdal convert`-equivalent API for synthesising and executing a
+Reader → [Filters] → Writer pipeline (e.g. PLY → LAZ, PTX → COPC.LAZ).
+Streaming-mode execution surfaces per-chunk progress and supports
+cancellation.
+
+- ``PDALConvert``
+- ``ConvertOptions``
+- ``ConvertResult``
+- ``ConvertProgress``
+- ``ConvertError``
+- ``PDALStage``
+- ``PDALValue``
+
 ### Streaming (PDAL pipeline)
 
 Chunked progressive read for whole-file streaming. Distinct from the
