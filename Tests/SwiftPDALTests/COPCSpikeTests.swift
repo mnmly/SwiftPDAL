@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import CxxCOPC
+import CxxStdlib
 @testable import SwiftPDAL
 
 @Test func copcSpike_listsNodes() async throws {
@@ -10,20 +11,19 @@ import CxxCOPC
         return
     }
 
-    let handle = path.withCString { swiftpdal_copc_open($0, 1) }
-    #expect(handle != nil, "FileReader failed to open")
-    defer { swiftpdal_copc_close(handle) }
+    guard let reader = swiftpdal.copc.Reader.open(std.string(path), 1) else {
+        Issue.record("FileReader failed to open")
+        return
+    }
+    defer { reader.close() }
 
-    var totalPoints: Int64 = 0
-    #expect(swiftpdal_copc_total_points(handle, &totalPoints) == 0)
+    let totalPoints = reader.total_points()
     #expect(totalPoints > 0)
 
-    var minXYZ = [Double](repeating: 0, count: 3)
-    var maxXYZ = [Double](repeating: 0, count: 3)
-    #expect(swiftpdal_copc_bounds(handle, &minXYZ, &maxXYZ) == 0)
+    let minXYZ = reader.bounds_min()
+    let maxXYZ = reader.bounds_max()
 
-    var nodeCount: Int32 = 0
-    #expect(swiftpdal_copc_node_count(handle, &nodeCount) == 0)
+    let nodeCount = reader.node_count()
     #expect(nodeCount > 0)
 
     print("--- COPC spike ---")
@@ -36,8 +36,8 @@ import CxxCOPC
     var maxDepth: Int32 = 0
     let preview = min(nodeCount, 10)
     for i in 0 ..< nodeCount {
-        var info = copc_node_info()
-        #expect(swiftpdal_copc_node_at(handle, i, &info) == 0)
+        var info = swiftpdal.copc.NodeInfo()
+        #expect(reader.node_at(i, &info))
         nodePointSum += Int64(info.point_count)
         maxDepth = max(maxDepth, info.depth)
         if i < preview {

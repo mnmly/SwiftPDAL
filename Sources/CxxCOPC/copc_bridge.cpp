@@ -13,14 +13,15 @@
 
 #include <lazperf/lazperf.hpp>
 
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <memory>
 #include <string>
 #include <vector>
-#include <exception>
-#include <cstdlib>
-#include <cstring>
-#include <atomic>
-#include <cstdio>
 
 // --- Node-size histogram ---------------------------------------------------
 // Bins observed points-per-node in log2 buckets. Dumps to stderr on process
@@ -28,9 +29,9 @@
 //
 // Disabled by default. Enable by setting SWIFTPDAL_NODE_HISTOGRAM=1 in the
 // environment before launching the host process. The explicit
-// swiftpdal_copc_dump_node_size_histogram() entry point always works, even
-// without the env var, but will print only what was recorded since the
-// env was last observed.
+// dump_node_size_histogram() entry point always works, even without the env
+// var, but will print only what was recorded since the env was last
+// observed.
 namespace {
     constexpr int kHistBuckets = 22;        // covers 1 .. 2^22 (~4M points)
     std::atomic<uint64_t> g_hist[kHistBuckets] {};
@@ -43,7 +44,7 @@ namespace {
     // node read.
     std::atomic<int>      g_enabled_cached {0};
 
-    static bool histogram_enabled() {
+    bool histogram_enabled() {
         int s = g_enabled_cached.load(std::memory_order_acquire);
         if (s) return s == 1;
         const char* v = std::getenv("SWIFTPDAL_NODE_HISTOGRAM");
@@ -53,14 +54,14 @@ namespace {
         return on;
     }
 
-    static inline int log2_bucket(uint64_t n) {
+    inline int log2_bucket(uint64_t n) {
         if (n == 0) return 0;
         int b = 0;
         while ((n >>= 1) && b + 1 < kHistBuckets) ++b;
         return b;
     }
 
-    static void dump_histogram() {
+    void dump_histogram() {
         uint64_t total_nodes  = g_total_nodes.load();
         uint64_t total_points = g_total_points.load();
         if (total_nodes == 0) return;
@@ -98,7 +99,7 @@ namespace {
         std::fflush(stderr);
     }
 
-    static inline void record_node_size(uint64_t n) {
+    inline void record_node_size(uint64_t n) {
         if (n == 0) return;
         if (!histogram_enabled()) return;
         g_hist[log2_bucket(n)].fetch_add(1, std::memory_order_relaxed);
@@ -115,10 +116,6 @@ namespace {
         }
     }
 } // namespace
-
-extern "C" void swiftpdal_copc_dump_node_size_histogram(void) {
-    dump_histogram();
-}
 // --------------------------------------------------------------------------
 
 // --- PooledDecompressor (phase 2 perf optimization) -----------------------
@@ -185,27 +182,36 @@ private:
 } // namespace
 // --------------------------------------------------------------------------
 
-struct copc_handle_s {
-    std::vector<std::unique_ptr<copc::FileReader>> readers;
+namespace swiftpdal { namespace copc {
+
+struct Reader::Impl {
+    std::atomic<int> refcount {1};
+    std::vector<std::unique_ptr<::copc::FileReader>> readers;
     std::vector<PooledDecompressor> pool;   // parallel to `readers`
     std::vector<std::vector<char>> scratch; // reusable decompressed-bytes buffer per slot
-    std::vector<copc::Node> nodes;
-    copc::las::LasHeader header;
+    std::vector<::copc::Node> nodes;
+    ::copc::las::LasHeader header;
+    bool closed = false;
 };
 
-extern "C" copc_handle swiftpdal_copc_open(const char* path, int32_t pool_size) {
-    if (!path || pool_size < 1) return nullptr;
+Reader::~Reader() {
+    delete impl_;
+}
+
+Reader* Reader::open(const std::string& path, int32_t pool_size) noexcept {
+    if (path.empty() || pool_size < 1) return nullptr;
     try {
-        auto h = new copc_handle_s();
-        h->readers.reserve(static_cast<size_t>(pool_size));
-        h->pool.resize(static_cast<size_t>(pool_size));
-        h->scratch.resize(static_cast<size_t>(pool_size));
+        auto* r = new Reader();
+        r->impl_ = new Impl();
+        r->impl_->readers.reserve(static_cast<size_t>(pool_size));
+        r->impl_->pool.resize(static_cast<size_t>(pool_size));
+        r->impl_->scratch.resize(static_cast<size_t>(pool_size));
         for (int32_t i = 0; i < pool_size; ++i) {
-            h->readers.emplace_back(std::make_unique<copc::FileReader>(std::string(path)));
+            r->impl_->readers.emplace_back(std::make_unique<::copc::FileReader>(path));
         }
-        h->nodes  = h->readers[0]->GetAllNodes();
-        h->header = h->readers[0]->CopcConfig().LasHeader();
-        return h;
+        r->impl_->nodes  = r->impl_->readers[0]->GetAllNodes();
+        r->impl_->header = r->impl_->readers[0]->CopcConfig().LasHeader();
+        return r;
     } catch (const std::exception&) {
         return nullptr;
     } catch (...) {
@@ -213,157 +219,151 @@ extern "C" copc_handle swiftpdal_copc_open(const char* path, int32_t pool_size) 
     }
 }
 
-extern "C" void swiftpdal_copc_close(copc_handle h) {
-    if (!h) return;
-    h->readers.clear();
-    delete h;
+void Reader::__retain() noexcept {
+    impl_->refcount.fetch_add(1, std::memory_order_relaxed);
 }
 
-extern "C" int32_t swiftpdal_copc_pool_size(copc_handle h, int32_t* out) {
-    if (!h || !out) return -1;
-    *out = static_cast<int32_t>(h->readers.size());
-    return 0;
-}
-
-extern "C" int32_t swiftpdal_copc_total_points(copc_handle h, int64_t* out) {
-    if (!h || !out) return -1;
-    int64_t total = 0;
-    for (const auto& n : h->nodes) total += n.point_count;
-    *out = total;
-    return 0;
-}
-
-extern "C" int32_t swiftpdal_copc_bounds(copc_handle h, double* out_min, double* out_max) {
-    if (!h || !out_min || !out_max) return -1;
-    out_min[0] = h->header.min.x;
-    out_min[1] = h->header.min.y;
-    out_min[2] = h->header.min.z;
-    out_max[0] = h->header.max.x;
-    out_max[1] = h->header.max.y;
-    out_max[2] = h->header.max.z;
-    return 0;
-}
-
-extern "C" int32_t swiftpdal_copc_node_count(copc_handle h, int32_t* out) {
-    if (!h || !out) return -1;
-    *out = static_cast<int32_t>(h->nodes.size());
-    return 0;
-}
-
-extern "C" int32_t swiftpdal_copc_node_at(copc_handle h, int32_t index, copc_node_info* out) {
-    if (!h || !out) return -1;
-    if (index < 0 || static_cast<size_t>(index) >= h->nodes.size()) return -2;
-    const auto& n = h->nodes[index];
-    out->depth = n.key.d;
-    out->x = n.key.x;
-    out->y = n.key.y;
-    out->z = n.key.z;
-    out->point_count = n.point_count;
-    out->offset = n.offset;
-    out->byte_size = n.byte_size;
-
-    try {
-        copc::Box box(n.key, h->header);
-        out->min_x = box.x_min;
-        out->min_y = box.y_min;
-        out->min_z = box.z_min;
-        out->max_x = box.x_max;
-        out->max_y = box.y_max;
-        out->max_z = box.z_max;
-    } catch (...) {
-        return -3;
+void Reader::__release() noexcept {
+    if (impl_->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        delete this;
     }
-    return 0;
 }
 
-extern "C" int32_t swiftpdal_copc_read_node(
-    copc_handle h,
-    int32_t depth, int32_t x, int32_t y, int32_t z,
-    int32_t slot,
-    copc_chunk_data* out
-) {
-    if (!h || !out) return -1;
-    if (slot < 0 || static_cast<size_t>(slot) >= h->readers.size()) return -1;
-    out->xyz = nullptr;
-    out->rgb = nullptr;
-    out->point_count = 0;
-    out->has_rgb = 0;
+int32_t Reader::pool_size() const noexcept {
+    return static_cast<int32_t>(impl_->readers.size());
+}
 
-    copc::FileReader* reader = h->readers[static_cast<size_t>(slot)].get();
+int64_t Reader::total_points() const noexcept {
+    int64_t total = 0;
+    for (const auto& n : impl_->nodes) total += n.point_count;
+    return total;
+}
 
+std::array<double, 3> Reader::bounds_min() const noexcept {
+    return { impl_->header.min.x, impl_->header.min.y, impl_->header.min.z };
+}
+
+std::array<double, 3> Reader::bounds_max() const noexcept {
+    return { impl_->header.max.x, impl_->header.max.y, impl_->header.max.z };
+}
+
+int32_t Reader::node_count() const noexcept {
+    return static_cast<int32_t>(impl_->nodes.size());
+}
+
+bool Reader::node_at(int32_t index, NodeInfo& out) const noexcept {
+    if (index < 0 || static_cast<size_t>(index) >= impl_->nodes.size()) return false;
+    const auto& n = impl_->nodes[index];
+    out.depth       = n.key.d;
+    out.x           = n.key.x;
+    out.y           = n.key.y;
+    out.z           = n.key.z;
+    out.point_count = n.point_count;
+    out.offset      = n.offset;
+    out.byte_size   = n.byte_size;
     try {
-        copc::VoxelKey key(depth, x, y, z);
-        copc::Node node = reader->FindNode(key);
-        if (!node.IsValid()) return -2;
+        ::copc::Box box(n.key, impl_->header);
+        out.min_x = box.x_min;
+        out.min_y = box.y_min;
+        out.min_z = box.z_min;
+        out.max_x = box.x_max;
+        out.max_y = box.y_max;
+        out.max_z = box.z_max;
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+ChunkData Reader::read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
+                            int32_t slot) noexcept {
+    ChunkData out;
+    if (impl_->closed) return out;
+    if (slot < 0 || static_cast<size_t>(slot) >= impl_->readers.size()) return out;
+
+    ::copc::FileReader* reader = impl_->readers[static_cast<size_t>(slot)].get();
+    try {
+        ::copc::VoxelKey key(depth, x, y, z);
+        ::copc::Node node = reader->FindNode(key);
+        if (!node.IsValid()) return out;
 
         // Pooled decode path. Replaces reader->GetPoints(node), which would
         // build a fresh lazperf decompressor per call. See PooledDecompressor
         // above + Frameworks/lazperf-patches/.
-        const int8_t fmt = h->header.PointFormatId();
-        const uint16_t eb = h->header.EbByteSize();
-        const uint16_t point_size = copc::las::PointByteSize(fmt, eb);
+        const int8_t fmt = impl_->header.PointFormatId();
+        const uint16_t eb = impl_->header.EbByteSize();
+        const uint16_t point_size = ::copc::las::PointByteSize(fmt, eb);
 
         std::vector<char> compressed = reader->GetPointDataCompressed(node);
-        h->pool[static_cast<size_t>(slot)].decode(
+        impl_->pool[static_cast<size_t>(slot)].decode(
             compressed, node.point_count, fmt, eb, point_size,
-            h->scratch[static_cast<size_t>(slot)]);
-        copc::las::Points points = copc::las::Points::Unpack(
-            h->scratch[static_cast<size_t>(slot)], h->header);
+            impl_->scratch[static_cast<size_t>(slot)]);
+        ::copc::las::Points points = ::copc::las::Points::Unpack(
+            impl_->scratch[static_cast<size_t>(slot)], impl_->header);
 
         const int32_t n = static_cast<int32_t>(points.Size());
-        if (n <= 0) return -3;
+        if (n <= 0) return out;
         record_node_size(static_cast<uint64_t>(n));
 
-        double*   xyz = static_cast<double*>(std::malloc(sizeof(double) * 3 * n));
-        uint16_t* rgb = static_cast<uint16_t*>(std::malloc(sizeof(uint16_t) * 3 * n));
-        if (!xyz || !rgb) {
-            std::free(xyz);
-            std::free(rgb);
-            return -4;
-        }
+        out.xyz.resize(static_cast<size_t>(n) * 3);
+        out.rgb.resize(static_cast<size_t>(n) * 3);
 
         const std::vector<double> xs = points.X();
         const std::vector<double> ys = points.Y();
         const std::vector<double> zs = points.Z();
         for (int32_t i = 0; i < n; ++i) {
-            xyz[3*i+0] = xs[i];
-            xyz[3*i+1] = ys[i];
-            xyz[3*i+2] = zs[i];
+            out.xyz[3*i+0] = xs[i];
+            out.xyz[3*i+1] = ys[i];
+            out.xyz[3*i+2] = zs[i];
         }
 
-        const bool hasRgb = copc::las::FormatHasRgb(static_cast<uint8_t>(h->header.PointFormatId()));
+        const bool hasRgb = ::copc::las::FormatHasRgb(
+            static_cast<uint8_t>(impl_->header.PointFormatId()));
         if (hasRgb) {
             const std::vector<uint16_t> r = points.Red();
             const std::vector<uint16_t> g = points.Green();
             const std::vector<uint16_t> b = points.Blue();
             for (int32_t i = 0; i < n; ++i) {
-                rgb[3*i+0] = r[i];
-                rgb[3*i+1] = g[i];
-                rgb[3*i+2] = b[i];
+                out.rgb[3*i+0] = r[i];
+                out.rgb[3*i+1] = g[i];
+                out.rgb[3*i+2] = b[i];
             }
-            out->has_rgb = 1;
+            out.has_rgb_ = true;
         } else {
-            std::memset(rgb, 0, sizeof(uint16_t) * 3 * n);
-            out->has_rgb = 0;
+            // vector default-constructs to zero for trivial types — but
+            // resize() above only guarantees value-init when growing from
+            // empty, which we are. Be explicit anyway.
+            std::fill(out.rgb.begin(), out.rgb.end(), uint16_t{0});
+            out.has_rgb_ = false;
         }
-
-        out->xyz = xyz;
-        out->rgb = rgb;
-        out->point_count = n;
-        return 0;
+        out.point_count_ = n;
+        return out;
     } catch (const std::exception&) {
-        return -5;
+        return ChunkData{};
     } catch (...) {
-        return -5;
+        return ChunkData{};
     }
 }
 
-extern "C" void swiftpdal_copc_free_chunk(copc_chunk_data* chunk) {
-    if (!chunk) return;
-    std::free(chunk->xyz);
-    std::free(chunk->rgb);
-    chunk->xyz = nullptr;
-    chunk->rgb = nullptr;
-    chunk->point_count = 0;
-    chunk->has_rgb = 0;
+void Reader::close() noexcept {
+    if (!impl_ || impl_->closed) return;
+    impl_->closed = true;
+    impl_->readers.clear();
+    impl_->pool.clear();
+    impl_->scratch.clear();
+    impl_->nodes.clear();
+}
+
+void dump_node_size_histogram() noexcept {
+    dump_histogram();
+}
+
+}} // namespace swiftpdal::copc
+
+void swiftpdal_copc_reader_retain(swiftpdal::copc::Reader* r) noexcept {
+    if (r) r->__retain();
+}
+
+void swiftpdal_copc_reader_release(swiftpdal::copc::Reader* r) noexcept {
+    if (r) r->__release();
 }

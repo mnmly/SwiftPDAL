@@ -6,7 +6,9 @@ import PackageDescription
 let package = Package(
     name: "SwiftPDAL",
     platforms: [
-        .macOS(.v13)
+        // 13.3 is the minimum deployment for C++ reference types imported
+        // via SWIFT_SHARED_REFERENCE (used by CxxCOPC's Reader).
+        .macOS("13.3")
     ],
     products: [
         .library(

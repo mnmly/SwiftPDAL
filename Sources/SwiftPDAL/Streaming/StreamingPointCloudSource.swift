@@ -1,6 +1,10 @@
 import Foundation
 import simd
 import CxxCOPC
+import CxxStdlib
+
+typealias CopcReader = swiftpdal.copc.Reader
+typealias CopcNodeInfo = swiftpdal.copc.NodeInfo
 
 // MARK: - Identity
 
@@ -599,7 +603,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
     private let driver: StreamingDriver
     private let queue: UpdateQueue
     private let jobs: JobQueue
-    private let handleBox: SendableCopcHandle
+    private let handleBox: SendableCopcReader
     private let originShift: SIMD3<Double>
     private let workerCount: Int
     private var driverTask: Task<Void, Never>?
@@ -610,7 +614,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         driver: StreamingDriver,
         queue: UpdateQueue,
         jobs: JobQueue,
-        handle: SendableCopcHandle,
+        handle: SendableCopcReader,
         originShift: SIMD3<Double>,
         workerCount: Int
     ) {
@@ -641,34 +645,27 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         options: StreamingOptions = .init()
     ) async throws -> CopcStreamingPointCloudSource {
         let poolSize = Int32(max(1, options.decodeConcurrency))
-        guard let handle: copc_handle = url.path.withCString({ swiftpdal_copc_open($0, poolSize) }) else {
+        guard let reader = CopcReader.open(std.string(url.path), poolSize) else {
             throw StreamingSourceError.openFailed(url)
         }
 
-        var minXYZ = [Double](repeating: 0, count: 3)
-        var maxXYZ = [Double](repeating: 0, count: 3)
-        guard swiftpdal_copc_bounds(handle, &minXYZ, &maxXYZ) == 0 else {
-            swiftpdal_copc_close(handle)
-            throw StreamingSourceError.malformedHierarchy("bounds")
-        }
+        let bMin = reader.bounds_min()
+        let bMax = reader.bounds_max()
         let originShift = SIMD3<Double>(
-            (minXYZ[0] + maxXYZ[0]) * 0.5,
-            (minXYZ[1] + maxXYZ[1]) * 0.5,
-            (minXYZ[2] + maxXYZ[2]) * 0.5
+            (bMin[0] + bMax[0]) * 0.5,
+            (bMin[1] + bMax[1]) * 0.5,
+            (bMin[2] + bMax[2]) * 0.5
         )
 
-        var nodeCount: Int32 = 0
-        _ = swiftpdal_copc_node_count(handle, &nodeCount)
-
-        var totalPoints: Int64 = 0
-        _ = swiftpdal_copc_total_points(handle, &totalPoints)
+        let nodeCount = reader.node_count()
+        let totalPoints = reader.total_points()
 
         var nodes: [NodeMeta] = []
         nodes.reserveCapacity(Int(nodeCount))
         var maxDepth = 0
         for i in 0..<nodeCount {
-            var n = copc_node_info()
-            if swiftpdal_copc_node_at(handle, i, &n) != 0 { continue }
+            var n = CopcNodeInfo()
+            if !reader.node_at(i, &n) { continue }
             let mn = SIMD3<Float>(
                 Float(n.min_x - originShift.x),
                 Float(n.min_y - originShift.y),
@@ -691,8 +688,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         }
 
         let bounds = Bounds(
-            min: SIMD3<Float>(Float(minXYZ[0]), Float(minXYZ[1]), Float(minXYZ[2])),
-            max: SIMD3<Float>(Float(maxXYZ[0]), Float(maxXYZ[1]), Float(maxXYZ[2]))
+            min: SIMD3<Float>(Float(bMin[0]), Float(bMin[1]), Float(bMin[2])),
+            max: SIMD3<Float>(Float(bMax[0]), Float(bMax[1]), Float(bMax[2]))
         )
 
         let info = StreamingSourceInfo(
@@ -706,7 +703,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
 
         let queue = UpdateQueue()
         let jobs = JobQueue()
-        let handleBox = SendableCopcHandle(raw: handle)
+        let handleBox = SendableCopcReader(reader: reader)
         let driver = StreamingDriver(
             handle: handleBox,
             nodes: nodes,
@@ -749,7 +746,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                 while !Task.isCancelled {
                     guard let id = await jobs.pop() else { break }
                     let chunk = StreamingDriver.decodeAndPack(
-                        handle: handleBox.raw,
+                        reader: handleBox.reader,
                         slot: slotIndex,
                         id: id,
                         originShift: originShift
@@ -850,19 +847,19 @@ public struct StreamingDebugSnapshot: Sendable {
 
 // MARK: - Driver actor
 
-/// `@unchecked Sendable` wrapper for the opaque COPC handle so it can be
-/// captured by concurrent decode tasks. Safe because:
-///   1. The handle is read-only after open (hierarchy/header are
+/// `@unchecked Sendable` wrapper for the imported COPC `Reader` reference
+/// so it can be captured by concurrent decode tasks. Safe because:
+///   1. The reader is read-only after open (hierarchy/header are
 ///      immutable).
 ///   2. Each concurrent caller targets a distinct `slot` in the reader
 ///      pool, so per-reader `fstream` state is never shared.
-struct SendableCopcHandle: @unchecked Sendable {
-    let raw: copc_handle
+struct SendableCopcReader: @unchecked Sendable {
+    let reader: CopcReader
 }
 
 actor StreamingDriver {
-    private let handleBox: SendableCopcHandle
-    private var handle: copc_handle { handleBox.raw }
+    private let handleBox: SendableCopcReader
+    private var reader: CopcReader { handleBox.reader }
     private let nodes: [NodeMeta]
     private let nodeIndexByID: [ChunkID: Int]
     private let allNodeIDs: Set<ChunkID>
@@ -903,7 +900,7 @@ actor StreamingDriver {
     private var cachedCandidates: Int = 0
 
     init(
-        handle: SendableCopcHandle,
+        handle: SendableCopcReader,
         nodes: [NodeMeta],
         originShift: SIMD3<Double>,
         options: StreamingOptions,
@@ -935,7 +932,7 @@ actor StreamingDriver {
     func shutdown() {
         if closed { return }
         closed = true
-        swiftpdal_copc_close(handle)
+        reader.close()
         resident.removeAll()
         inFlight.removeAll()
     }
@@ -1170,29 +1167,26 @@ actor StreamingDriver {
     /// concurrent caller a distinct `slot` into the file reader pool
     /// established in ``CopcStreamingPointCloudSource/open(_:options:)``.
     nonisolated static func decodeAndPack(
-        handle: copc_handle,
+        reader: CopcReader,
         slot: Int32,
         id: ChunkID,
         originShift: SIMD3<Double>
     ) -> ResidentChunk? {
-        var data = copc_chunk_data()
-        let rc = swiftpdal_copc_read_node(
-            handle,
+        let chunk = reader.read_node(
             Int32(id.depth), Int32(id.x), Int32(id.y), Int32(id.z),
-            slot,
-            &data
+            slot
         )
-        guard rc == 0, data.point_count > 0, let xyz = data.xyz, let rgb = data.rgb else {
-            if data.xyz != nil || data.rgb != nil { swiftpdal_copc_free_chunk(&data) }
-            return nil
-        }
-        defer { swiftpdal_copc_free_chunk(&data) }
+        let count = Int(chunk.point_count())
+        guard count > 0 else { return nil }
 
+        // xyz_data() / rgb_data() return raw const pointers into the
+        // ChunkData's std::vector storage; the chunk stays alive on this
+        // frame so the pointers remain valid through ChunkPacker.pack.
         let packed = ChunkPacker.pack(
-            positionsXYZ: xyz,
-            rgb16: rgb,
-            count: Int(data.point_count),
-            hasRgb: data.has_rgb != 0,
+            positionsXYZ: chunk.__xyz_dataUnsafe()!,
+            rgb16: chunk.__rgb_dataUnsafe()!,
+            count: count,
+            hasRgb: chunk.has_rgb(),
             originShift: originShift
         )
 
