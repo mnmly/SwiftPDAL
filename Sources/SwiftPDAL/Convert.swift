@@ -40,6 +40,23 @@ public indirect enum PDALValue: Sendable {
         case .object(let o): return o.mapValues { $0.jsonObject }
         }
     }
+
+    /// Flat string form for protocols that take options as plain
+    /// strings (e.g. PDAL's command-line / Options.add(name, string)
+    /// path used by the E57→COPC bridge). PDAL coerces the string back
+    /// to the writer's expected type when the option is consumed.
+    /// Nested arrays / objects are serialised as JSON.
+    fileprivate var stringRepresentation: String {
+        switch self {
+        case .string(let s): return s
+        case .int(let i):    return String(i)
+        case .double(let d): return String(d)
+        case .bool(let b):   return b ? "true" : "false"
+        case .array, .object:
+            let data = (try? JSONSerialization.data(withJSONObject: jsonObject)) ?? Data()
+            return String(decoding: data, as: UTF8.self)
+        }
+    }
 }
 
 extension PDALValue: ExpressibleByStringLiteral {
@@ -238,6 +255,27 @@ public enum PDALConvert {
                                to output: URL,
                                options: ConvertOptions = .init()) throws -> ConvertResult
     {
+        // Point PDAL at the bundled plugin/PROJ data directories. The
+        // `PointCloud.read` path does the same — without it, plugin-based
+        // drivers (notably `readers.e57` / `writers.e57`, which live as a
+        // separate dylib under the framework's PlugIns/) fail with
+        // "Couldn't create reader stage of type 'readers.e57'".
+        let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
+        let paths = PointCloud.getPaths(isTesting: isTesting)
+        setenv("PROJ_DATA", paths.projDBURL, 1)
+        setenv("PDAL_DRIVER_PATH", paths.driversURL, 1)
+
+        // .e57 inputs route through the libE57Format → writers.copc
+        // bridge in CxxPDAL — PDAL 2.10's `readers.e57` throws partway
+        // through certain multi-scan files. The bypass uses
+        // libE57Format directly (which reads those files end-to-end),
+        // captures points into a long-lived PointView, then runs the
+        // user's writer over the captured data via BufferReader. Same
+        // API surface; same progress contract.
+        if normalizedExtension(input) == "e57" {
+            return try convertE57(input: input, output: output, options: options)
+        }
+
         let reader: PDALStage
         if let r = options.reader {
             reader = r
@@ -328,6 +366,94 @@ public enum PDALConvert {
             throw ConvertError.pipelineFailed(code: code, detail: errorString)
         }
 
+        return ConvertResult(pointCount: result.point_count,
+                             metadataJSON: metadataString)
+    }
+
+    /// Dispatch path for `.e57` inputs — funnels through the
+    /// libE57Format → writers.copc bridge in CxxPDAL instead of
+    /// PDAL's `readers.e57` pipeline. Same `ConvertOptions` semantics
+    /// as the main `convert(...)`; the only fields not honoured are
+    /// ``ConvertOptions/reader`` (always libE57Format) and
+    /// ``ConvertOptions/filters`` (no PDAL filter stages in this path,
+    /// since the points never become a PDAL view until after the read).
+    private static func convertE57(input: URL,
+                                   output: URL,
+                                   options: ConvertOptions) throws -> ConvertResult
+    {
+        // The C++ side builds the writer programmatically via
+        // PDAL's StageFactory rather than parsing pipeline JSON
+        // (PDAL doesn't ship `readers.null`, and the full nlohmann
+        // header isn't on its public include path). So we hand it
+        // the driver type + a flat `key=value\n`-separated bag of
+        // options. PDAL's Option coerces these strings to whatever
+        // each writer expects.
+        let writer: PDALStage
+        if let w = options.writer {
+            writer = w
+        } else {
+            writer = PDALStage(try inferWriterDriver(for: output),
+                               writerExtras(for: output))
+        }
+        let writerType = writer.type
+        let writerOptsKV: String = writer.options
+            .filter { $0.key != "filename" }
+            .map { "\($0.key)=\($0.value.stringRepresentation)" }
+            .joined(separator: "\n")
+
+        let resolvedTotalHint: UInt64 =
+            options.pointTotalHint
+            ?? Self.estimatePointTotal(for: input)
+            ?? 0
+
+        let trampoline: swiftpdal.convert.ProgressFn? = options.onProgress == nil ? nil : {
+            (pointsSoFar, estimatedTotal, ctx) -> Bool in
+            guard let ctx else { return true }
+            let box = Unmanaged<ProgressBox>.fromOpaque(ctx).takeUnretainedValue()
+            // The E57 path supplies its own running total from the
+            // pre-summed scan headers, so `estimatedTotal` is usually
+            // populated — but fall back to the hint when not.
+            let total = estimatedTotal > 0 ? estimatedTotal : box.totalHint
+            return box.handler(ConvertProgress(pointsSoFar: pointsSoFar,
+                                               estimatedTotal: total))
+        }
+
+        let result: swiftpdal.convert.E57Result
+        if let handler = options.onProgress {
+            let box = ProgressBox(handler: handler, totalHint: resolvedTotalHint)
+            let ctx = Unmanaged.passRetained(box).toOpaque()
+            defer { Unmanaged<ProgressBox>.fromOpaque(ctx).release() }
+            result = swiftpdal.convert.execute_e57_to_copc(
+                std.string(input.path),
+                std.string(output.path),
+                std.string(writerType),
+                std.string(writerOptsKV),
+                Int32(options.streamingChunkSize),
+                trampoline,
+                ctx
+            )
+        } else {
+            result = swiftpdal.convert.execute_e57_to_copc(
+                std.string(input.path),
+                std.string(output.path),
+                std.string(writerType),
+                std.string(writerOptsKV),
+                Int32(options.streamingChunkSize),
+                nil,
+                nil
+            )
+        }
+
+        let errorString = swiftStringFromCxx(result.error_message)
+        let metadataString = swiftStringFromCxx(result.metadata_json)
+
+        if result.status == -11 {
+            throw ConvertError.cancelled
+        }
+        if result.status != 0 {
+            let code = PDALError(rawValue: Int(result.status)) ?? .unknown
+            throw ConvertError.pipelineFailed(code: code, detail: errorString)
+        }
         return ConvertResult(pointCount: result.point_count,
                              metadataJSON: metadataString)
     }

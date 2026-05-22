@@ -120,6 +120,8 @@ Frameworks/gdal.xcframework
 Frameworks/gdal.xcframework.zip
 Frameworks/pdalcpp.xcframework
 Frameworks/pdalcpp.xcframework.zip
+Frameworks/E57Format.xcframework
+Frameworks/E57Format.xcframework.zip
 default.profraw
 References
 diff.txt

@@ -36,10 +36,28 @@ let package = Package(
             checksum: "2b495d8754c0f6009226a11b5829501414d9b9f6739ad2fb75b539af244c34d3"
         ),
 
-        // C++ wrapper target for PDAL
+        // libE57Format packaged as a self-contained xcframework (Xerces-C
+        // 3.3 statically bundled inside). Used by the libE57Format →
+        // writers.copc bridge in CxxPDAL, which works around PDAL's
+        // E57 reader bug on certain multi-scan files. Build with:
+        // pdal-xcframework-builder/build_e57.sh.
+        //
+        // For local iteration, swap the binaryTarget below to
+        // `path: "Frameworks/E57Format.xcframework"`.
+        .binaryTarget(
+            name: "E57Format",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/libE57Format-v3.3.0/E57Format.xcframework.zip",
+            checksum: "d3b35b2a323f0a7c2a4e1505bd6b29cbc7e24ff52234d65d207e67a53eb34bc4"
+        ),
+
+        // C++ wrapper target for PDAL. Two source files:
+        //   pdal_convert.cpp      — generic pdal-convert pipeline.
+        //   pdal_e57_convert.cpp  — libE57Format → writers.copc bypass.
+        // Both compile into the same CxxPDAL module and share the same
+        // C ABI shape (swiftpdal::convert namespace).
         .target(
             name: "CxxPDAL",
-            dependencies: ["pdalcpp", "gdal"],
+            dependencies: ["pdalcpp", "gdal", "E57Format"],
             cxxSettings: [
                 .headerSearchPath("include"),
                 .define("PDAL_DLL_EXPORT", to: "1"),

@@ -2,5 +2,6 @@ module CxxPDAL {
     requires cplusplus
     header "pdal_wrapper.h"
     header "pdal_convert.h"
+    header "pdal_e57_convert.h"
     export *
 }
