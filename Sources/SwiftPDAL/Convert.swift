@@ -139,12 +139,25 @@ public struct ConvertOptions: @unchecked Sendable {
     /// caller doesn't mutate it concurrently.
     public var onProgress: ((ConvertProgress) -> Bool)?
 
+    /// Optional override for ``ConvertProgress/estimatedTotal``. Set this
+    /// when PDAL's `preview()` can't surface a point count for the input
+    /// (notably `readers.text`/`readers.pts`/`readers.ptx` ASCII formats —
+    /// they don't pre-scan), and you want the progress callback to report
+    /// a usable fraction.
+    ///
+    /// When `nil`, ``PDALConvert/convert(from:to:options:)`` calls
+    /// ``PDALConvert/estimatePointTotal(for:)`` to derive a best-effort
+    /// estimate from the file — exact for LAS/LAZ/COPC/Cyclone-PTS,
+    /// heuristic (file-size ÷ average-line-bytes) for headerless ASCII.
+    public var pointTotalHint: UInt64?
+
     public init(reader: PDALStage? = nil,
                 filters: [PDALStage] = [],
                 writer: PDALStage? = nil,
                 streaming: Bool = true,
                 streamingChunkSize: Int = 10_000,
-                onProgress: ((ConvertProgress) -> Bool)? = nil)
+                onProgress: ((ConvertProgress) -> Bool)? = nil,
+                pointTotalHint: UInt64? = nil)
     {
         self.reader = reader
         self.filters = filters
@@ -152,6 +165,7 @@ public struct ConvertOptions: @unchecked Sendable {
         self.streaming = streaming
         self.streamingChunkSize = streamingChunkSize
         self.onProgress = onProgress
+        self.pointTotalHint = pointTotalHint
     }
 }
 
@@ -228,7 +242,7 @@ public enum PDALConvert {
         if let r = options.reader {
             reader = r
         } else {
-            reader = PDALStage(try inferReaderDriver(for: input))
+            reader = try inferReaderStage(for: input)
         }
         let writer: PDALStage
         if let w = options.writer {
@@ -252,6 +266,16 @@ public enum PDALConvert {
         }
         let jsonString = String(decoding: jsonData, as: UTF8.self)
 
+        // Resolve the point-total hint once, up front. Explicit
+        // `pointTotalHint` always wins; otherwise we ask the Swift-side
+        // estimator (cheap file-header peek for binary formats, a
+        // file-size / avg-line-bytes heuristic for ASCII formats where
+        // PDAL's preview() returns 0).
+        let resolvedTotalHint: UInt64 =
+            options.pointTotalHint
+            ?? Self.estimatePointTotal(for: input)
+            ?? 0
+
         // C trampoline: unbox the Swift closure from the void* context
         // and forward the progress sample. PDAL invokes this
         // synchronously from inside execute_pipeline_json on the
@@ -261,13 +285,16 @@ public enum PDALConvert {
             (pointsSoFar, estimatedTotal, ctx) -> Bool in
             guard let ctx else { return true }
             let box = Unmanaged<ProgressBox>.fromOpaque(ctx).takeUnretainedValue()
+            // Prefer PDAL's count when it exposes one, fall back to the
+            // Swift-side hint otherwise.
+            let total = estimatedTotal > 0 ? estimatedTotal : box.totalHint
             return box.handler(ConvertProgress(pointsSoFar: pointsSoFar,
-                                               estimatedTotal: estimatedTotal))
+                                               estimatedTotal: total))
         }
 
         let result: swiftpdal.convert.Result
         if let handler = options.onProgress {
-            let box = ProgressBox(handler: handler)
+            let box = ProgressBox(handler: handler, totalHint: resolvedTotalHint)
             let ctx = Unmanaged.passRetained(box).toOpaque()
             defer { Unmanaged<ProgressBox>.fromOpaque(ctx).release() }
             result = swiftpdal.convert.execute_pipeline_json(
@@ -305,10 +332,16 @@ public enum PDALConvert {
                              metadataJSON: metadataString)
     }
 
-    /// Holds the Swift progress closure across the C boundary.
+    /// Holds the Swift progress closure across the C boundary, plus the
+    /// resolved point-total hint we want to fall back on whenever PDAL's
+    /// native estimate is 0.
     private final class ProgressBox {
         let handler: (ConvertProgress) -> Bool
-        init(handler: @escaping (ConvertProgress) -> Bool) { self.handler = handler }
+        let totalHint: UInt64
+        init(handler: @escaping (ConvertProgress) -> Bool, totalHint: UInt64) {
+            self.handler = handler
+            self.totalHint = totalHint
+        }
     }
 
     /// True if the linked pdalcpp build registers the given driver
@@ -318,6 +351,195 @@ public enum PDALConvert {
     }
 
     // MARK: Extension inference
+
+    /// Pick a fully-configured reader stage for `url`.
+    ///
+    /// Extension-based inference (see ``inferReaderDriver(for:)``) is the
+    /// default. For ASCII formats — `.pts`, `.xyz`, `.txt` — this peeks at
+    /// the file's first non-blank, non-comment line to decide whether it
+    /// can route through PDAL's strict format-specific reader or whether
+    /// it has to fall back to the generic `readers.text` with an inferred
+    /// column map and separator.
+    ///
+    /// The most common case this covers is **headerless PTS**: PDAL's
+    /// `readers.pts` requires a Cyclone-style first-line point count, but
+    /// FARO and many other tools export raw `X Y Z [I] [R G B]` rows.
+    /// Those would otherwise fail mid-pipeline with
+    /// `"Unable to read expected point count at top of the file"`.
+    ///
+    /// Column heuristic for headerless ASCII:
+    ///
+    /// | columns | mapping                                        |
+    /// |--------:|------------------------------------------------|
+    /// | 3       | `X,Y,Z`                                        |
+    /// | 4       | `X,Y,Z,Intensity`                              |
+    /// | 6       | `X,Y,Z,Red,Green,Blue`                         |
+    /// | 7       | `X,Y,Z,Intensity,Red,Green,Blue`               |
+    /// | 9       | `X,Y,Z,Intensity,ReturnNumber,NumberOfReturns,Red,Green,Blue` |
+    /// | other   | `X,Y,Z`                                        |
+    ///
+    /// Separator is detected from the line (tab > comma > space).
+    /// Override via ``ConvertOptions/reader`` if the heuristic guesses
+    /// wrong.
+    public static func inferReaderStage(for url: URL) throws -> PDALStage {
+        let ext = normalizedExtension(url)
+        guard ext == "pts" || ext == "xyz" || ext == "txt" else {
+            return PDALStage(try inferReaderDriver(for: url))
+        }
+        guard let line = firstNonEmptyLine(of: url) else {
+            return PDALStage(try inferReaderDriver(for: url))
+        }
+        let cols = line.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "," })
+        // Cyclone-style PTS: first line is the point count.
+        if ext == "pts", cols.count == 1, Int(cols[0]) != nil {
+            return PDALStage("readers.pts")
+        }
+        let names: [String]
+        switch cols.count {
+        case 3:  names = ["X", "Y", "Z"]
+        case 4:  names = ["X", "Y", "Z", "Intensity"]
+        case 6:  names = ["X", "Y", "Z", "Red", "Green", "Blue"]
+        case 7:  names = ["X", "Y", "Z", "Intensity", "Red", "Green", "Blue"]
+        case 9:  names = ["X", "Y", "Z", "Intensity", "ReturnNumber",
+                          "NumberOfReturns", "Red", "Green", "Blue"]
+        default: names = ["X", "Y", "Z"]
+        }
+        let sep: String
+        if line.contains("\t") { sep = "\t" }
+        else if line.contains(",") { sep = "," }
+        else { sep = " " }
+        // PDAL `readers.text` splits the `header` string using the
+        // configured `separator`, so the two must match — joining names
+        // with `,` and setting separator to ` ` (or vice versa) blows up
+        // with "Invalid character ',' in dimension name."
+        let header = names.joined(separator: sep)
+        return PDALStage("readers.text", [
+            "header": .string(header),
+            "separator": .string(sep),
+            "skip": .int(0),
+        ])
+    }
+
+    /// Read the first non-blank, non-comment line of a text file. ~4 KiB
+    /// peek; returns `nil` if the file can't be opened or contains no
+    /// usable line in the prefix.
+    private static func firstNonEmptyLine(of url: URL) -> String? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? fh.close() }
+        let data = (try? fh.read(upToCount: 4096)) ?? Data()
+        guard let text = String(data: data, encoding: .utf8)
+                ?? String(data: data, encoding: .ascii)
+        else { return nil }
+        for raw in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            return line
+        }
+        return nil
+    }
+
+    /// Best-effort point-count estimate from the file alone, used by
+    /// ``convert(from:to:options:)`` to populate
+    /// ``ConvertProgress/estimatedTotal`` when PDAL's `preview()` returns
+    /// 0. Returns `nil` when no estimate is possible — callers that need
+    /// a number should fall back to `0` and surface the progress without
+    /// a fraction.
+    ///
+    /// Per-format strategy:
+    /// - **LAS / LAZ**: reads point count from the 32-bit `PointRecords`
+    ///   header field at offset 107 (LAS 1.0–1.4). Exact.
+    /// - **COPC LAZ**: same as LAS — the COPC writer sets the legacy
+    ///   point count field. Exact.
+    /// - **Cyclone PTS**: first line is the point count. Exact.
+    /// - **Headerless PTS / XYZ / TXT**: samples the first ~256 KiB,
+    ///   computes average bytes/line over non-blank lines, divides total
+    ///   file size by that average. Heuristic — within ~5% for
+    ///   uniformly-formatted files.
+    /// - Anything else: `nil` (PDAL's own `preview()` is the source of
+    ///   truth for those formats).
+    public static func estimatePointTotal(for url: URL) -> UInt64? {
+        let ext = normalizedExtension(url)
+        switch ext {
+        case "las", "laz", "copc.laz":
+            return estimateLASPointCount(url)
+        case "pts", "xyz", "txt":
+            return estimateAsciiPointCount(url, ext: ext)
+        default:
+            return nil
+        }
+    }
+
+    /// LAS header at offset 107 carries a 32-bit little-endian point
+    /// count (`Legacy Number of point records` in LAS ≥ 1.4). LAZ wraps
+    /// LAS, so the same offset is valid in the uncompressed header
+    /// region. COPC is LAS 1.4 underneath.
+    private static func estimateLASPointCount(_ url: URL) -> UInt64? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? fh.close() }
+        guard let header = try? fh.read(upToCount: 256), header.count >= 111
+        else { return nil }
+        // First sanity-check the LAS magic ("LASF" at offset 0).
+        guard header[0] == 0x4C, header[1] == 0x41,
+              header[2] == 0x53, header[3] == 0x46
+        else { return nil }
+        let count: UInt32 = header.withUnsafeBytes { raw in
+            raw.loadUnaligned(fromByteOffset: 107, as: UInt32.self).littleEndian
+        }
+        // LAS ≥ 1.4 also has a 64-bit point count at offset 247. Prefer
+        // it when present (file is large enough and version ≥ 1.4).
+        let versionMinor = header[25]
+        if versionMinor >= 4, header.count >= 255 {
+            let count64: UInt64 = header.withUnsafeBytes { raw in
+                raw.loadUnaligned(fromByteOffset: 247, as: UInt64.self).littleEndian
+            }
+            if count64 > 0 { return count64 }
+        }
+        return count > 0 ? UInt64(count) : nil
+    }
+
+    /// Cyclone PTS: header line is just the point count. Headerless
+    /// PTS/XYZ/TXT: sample the first 256 KiB, divide file size by the
+    /// average line length. Skips blanks and `#` comments.
+    private static func estimateAsciiPointCount(_ url: URL, ext: String) -> UInt64? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? fh.close() }
+        let sample = (try? fh.read(upToCount: 256 * 1024)) ?? Data()
+        guard !sample.isEmpty else { return nil }
+        guard let text = String(data: sample, encoding: .utf8)
+                ?? String(data: sample, encoding: .ascii)
+        else { return nil }
+        // Cyclone PTS: first non-blank line is the integer count.
+        if ext == "pts" {
+            for raw in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                if line.isEmpty || line.hasPrefix("#") { continue }
+                if let n = UInt64(line) { return n }
+                break
+            }
+        }
+        // Average bytes per data line over the sample.
+        var lines = 0
+        var bytes = 0
+        for raw in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            lines += 1
+            // +1 for the newline byte we split on.
+            bytes += raw.utf8.count + 1
+        }
+        // Drop the last sampled line — likely truncated mid-row.
+        if lines >= 2 {
+            lines -= 1
+            bytes = max(1, bytes - (text.utf8.count / max(1, lines + 1)))
+        }
+        guard lines >= 16 else { return nil }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let fileSize = (attrs[.size] as? NSNumber)?.int64Value
+        else { return nil }
+        let avg = Double(bytes) / Double(lines)
+        guard avg > 0 else { return nil }
+        return UInt64(Double(fileSize) / avg)
+    }
 
     /// Pick a reader driver from a file URL's extension.
     public static func inferReaderDriver(for url: URL) throws -> String {
