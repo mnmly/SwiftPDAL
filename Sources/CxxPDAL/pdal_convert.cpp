@@ -23,6 +23,12 @@
 #include <sstream>
 #include <exception>
 #include <memory>
+#include <atomic>
+#include <thread>
+#include <string>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #include "include/pdal_convert.h"
 
@@ -161,6 +167,134 @@ private:
     bool               ready_ = false;
 };
 
+// Pipes PDAL's native progress-fd output into our progress callback.
+//
+// `Stage::setProgressFd(fd)` tells PDAL to write progress messages to
+// `fd`. The format is text — `<percent> <message>\n` or similar — used
+// by the `pdal` CLI's progress bar. We give PDAL a pipe's write end,
+// spawn a reader thread that drains the read end line-by-line, parses
+// the leading number, and calls `progress(known_points, total, ctx)`
+// with a *synthesised* point count derived from the percentage and the
+// known total (from phase 1).
+//
+// Lifetime: construct after phase 1 + before writer.execute, destruct
+// after writer.execute returns. The destructor closes the write end,
+// the reader thread sees EOF, exits, and gets joined. SIGPIPE is
+// suppressed via F_SETNOSIGPIPE so PDAL writes don't kill the process
+// if the reader thread is somehow slow to drain.
+class WriterProgressPump {
+public:
+    WriterProgressPump(ProgressFn cb, void* ctx, uint64_t known_points)
+        : cb_(cb), ctx_(ctx), known_points_(known_points)
+    {
+        if (!cb_) return;
+        int fds[2] = { -1, -1 };
+        if (::pipe(fds) != 0) return;
+        readFd_ = fds[0];
+        writeFd_ = fds[1];
+        // Suppress SIGPIPE on the write end — PDAL uses fprintf-style
+        // writes which would otherwise raise SIGPIPE if our reader
+        // closes first.
+        ::fcntl(writeFd_, F_SETNOSIGPIPE, 1);
+        // Non-blocking reads, polled in the drain loop.
+        int flags = ::fcntl(readFd_, F_GETFL, 0);
+        ::fcntl(readFd_, F_SETFL, flags | O_NONBLOCK);
+        running_.store(true, std::memory_order_release);
+        reader_ = std::thread([this]() { drainLoop(); });
+    }
+
+    int writeFd() const noexcept { return writeFd_; }
+    bool active() const noexcept { return writeFd_ >= 0; }
+
+    ~WriterProgressPump() {
+        if (writeFd_ >= 0) { ::close(writeFd_); writeFd_ = -1; }
+        running_.store(false, std::memory_order_release);
+        if (reader_.joinable()) reader_.join();
+        if (readFd_ >= 0) { ::close(readFd_); readFd_ = -1; }
+    }
+
+private:
+    void drainLoop() noexcept {
+        std::string carry;
+        char buf[1024];
+        while (running_.load(std::memory_order_acquire)) {
+            ssize_t n = ::read(readFd_, buf, sizeof(buf));
+            if (n > 0) {
+                carry.append(buf, static_cast<std::size_t>(n));
+                parseLines(carry);
+            } else if (n == 0) {
+                // EOF — write end closed.
+                break;
+            } else {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // No data right now; sleep briefly to avoid spin.
+                    ::usleep(50 * 1000);
+                    continue;
+                }
+                if (errno == EINTR) continue;
+                break;
+            }
+        }
+        // Drain any remaining bytes after EOF.
+        if (!carry.empty()) parseLines(carry, /*flush=*/true);
+    }
+
+    void parseLines(std::string& buf, bool flush = false) noexcept {
+        std::size_t pos = 0;
+        while (true) {
+            std::size_t nl = buf.find('\n', pos);
+            if (nl == std::string::npos) break;
+            handleLine(buf.substr(pos, nl - pos));
+            pos = nl + 1;
+        }
+        if (pos > 0) buf.erase(0, pos);
+        if (flush && !buf.empty()) {
+            handleLine(buf);
+            buf.clear();
+        }
+    }
+
+    void handleLine(const std::string& line) noexcept {
+        // PDAL emits lines beginning with a number (percent or fraction).
+        // Parse leniently — leading whitespace, any non-numeric prefix is
+        // ignored, the first numeric token wins.
+        std::size_t i = 0;
+        while (i < line.size() &&
+               !(line[i] == '-' || line[i] == '.' || (line[i] >= '0' && line[i] <= '9'))) {
+            ++i;
+        }
+        if (i >= line.size()) return;
+        try {
+            std::size_t consumed = 0;
+            double v = std::stod(line.c_str() + i, &consumed);
+            if (consumed == 0) return;
+            // PDAL emits percents in [0,100] historically; if we see a
+            // value > 1 treat it as percent.
+            double frac = (v > 1.0) ? (v / 100.0) : v;
+            if (frac < 0) frac = 0;
+            if (frac > 1) frac = 1;
+            // Synthesise a point count so the existing
+            // (pointsSoFar / estimatedTotal) UI still works during the
+            // writer phase.
+            uint64_t pts = known_points_ > 0
+                ? static_cast<uint64_t>(frac * static_cast<double>(known_points_))
+                : 0;
+            uint64_t total = known_points_;
+            if (cb_) (void)cb_(pts, total, ctx_);
+        } catch (...) {
+            // Non-numeric line — ignore.
+        }
+    }
+
+    ProgressFn cb_;
+    void*      ctx_;
+    uint64_t   known_points_;
+    int        readFd_  = -1;
+    int        writeFd_ = -1;
+    std::atomic<bool> running_{false};
+    std::thread reader_;
+};
+
 // Best-effort total-point estimate from the pipeline's root stage's
 // preview(). Stage::preview() is recursive — readers fill in their
 // point count and intermediate stages forward it — so this gives us
@@ -230,6 +364,16 @@ Result execute_pipeline_json(const std::string& json,
                 bufReader.addView(sink);
                 writer->getInputs().clear();
                 writer->setInput(bufReader);
+
+                // Hook PDAL's native progress fd on the writer so we can
+                // forward its internal phase percentages (e.g. COPC
+                // pyramid build) into the user's callback while
+                // writer->execute is blocking. The pump owns the pipe
+                // and a reader thread; its destructor joins on scope
+                // exit, *after* execute() returns.
+                WriterProgressPump pump(progress, progress_ctx,
+                                        streamTbl.total());
+                if (pump.active()) writer->setProgressFd(pump.writeFd());
 
                 writer->prepare(phase2Table);
                 pdal::PointViewSet outs = writer->execute(phase2Table);
