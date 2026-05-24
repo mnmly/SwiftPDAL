@@ -1,3 +1,8 @@
+// StreamingBench is a dev-only CLI for the COPC streaming path. It's
+// macOS-only by design (CommandLine-driven, runs on the host). On iOS
+// the file degenerates into an empty module so the package still builds.
+#if os(macOS)
+
 import Foundation
 import SwiftPDAL
 import simd
@@ -117,3 +122,5 @@ struct StreamingBench {
         source.close()
     }
 }
+
+#endif

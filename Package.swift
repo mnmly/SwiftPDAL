@@ -8,7 +8,11 @@ let package = Package(
     platforms: [
         // 13.3 is the minimum deployment for C++ reference types imported
         // via SWIFT_SHARED_REFERENCE (used by CxxCOPC's Reader).
-        .macOS("13.3")
+        .macOS("13.3"),
+        // iOS slices of gdal/proj/pdalcpp/E57Format are static MH_OBJECT
+        // built by gdal-xcframework-builder + pdal-xcframework-builder.
+        // 17.0 matches the deployment target used to build those slices.
+        .iOS("17.0"),
     ],
     products: [
         .library(
@@ -25,16 +29,18 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.4.3"),
     ],
     targets: [
-        .binaryTarget(
-            name: "gdal",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1/gdal.xcframework.zip",
-            checksum: "6beb1207e1cad7849191a5423e1f097bb9631747b30b96df3ff971de7ba2d187"
-        ),
-        .binaryTarget(
-            name: "pdalcpp",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1/pdalcpp.xcframework.zip",
-            checksum: "2b495d8754c0f6009226a11b5829501414d9b9f6739ad2fb75b539af244c34d3"
-        ),
+        // Local-iteration path: switch back to URL+checksum after
+        // publishing the iOS-enabled releases. The mirror under
+        // Frameworks/ is populated by the builders' SWIFT_PACKAGE_FRAMEWORKS_DIR
+        // option (config.sh in each builder).
+        .binaryTarget(name: "gdal", path: "Frameworks/gdal.xcframework"),
+        .binaryTarget(name: "pdalcpp", path: "Frameworks/pdalcpp.xcframework"),
+
+        // PROJ ships as a separate xcframework (iOS-only) from
+        // gdal-xcframework-builder. macOS PDAL build links Homebrew
+        // proj at builder-time and bundles its dylib inside gdal.framework's
+        // Libraries/, so this binaryTarget is only meaningful on iOS.
+        .binaryTarget(name: "proj", path: "Frameworks/proj.xcframework"),
 
         // libE57Format packaged as a self-contained xcframework (Xerces-C
         // 3.3 statically bundled inside). Used by the libE57Format →
@@ -44,11 +50,7 @@ let package = Package(
         //
         // For local iteration, swap the binaryTarget below to
         // `path: "Frameworks/E57Format.xcframework"`.
-        .binaryTarget(
-            name: "E57Format",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/libE57Format-v3.3.0/E57Format.xcframework.zip",
-            checksum: "d3b35b2a323f0a7c2a4e1505bd6b29cbc7e24ff52234d65d207e67a53eb34bc4"
-        ),
+        .binaryTarget(name: "E57Format", path: "Frameworks/E57Format.xcframework"),
 
         // C++ wrapper target for PDAL. Two source files:
         //   pdal_convert.cpp      — generic pdal-convert pipeline.
@@ -57,10 +59,43 @@ let package = Package(
         // C ABI shape (swiftpdal::convert namespace).
         .target(
             name: "CxxPDAL",
-            dependencies: ["pdalcpp", "gdal", "E57Format"],
+            dependencies: [
+                "pdalcpp", "gdal", "E57Format",
+                .target(name: "proj", condition: .when(platforms: [.iOS])),
+            ],
             cxxSettings: [
                 .headerSearchPath("include"),
                 .define("PDAL_DLL_EXPORT", to: "1"),
+                // pdalcpp.framework's headers live at Headers/pdal/*.
+                // xcodebuild only exposes <pdalcpp/...>-style includes
+                // via -F; <pdal/...>-style needs an explicit -I to the
+                // framework's Headers/ dir. On iOS the framework is at
+                // a per-slice path; we point at the device slice
+                // (headers are identical across slices).
+                .unsafeFlags(
+                    [
+                        "-I",
+                        "Frameworks/pdalcpp.xcframework/ios-arm64/pdalcpp.framework/Headers",
+                    ],
+                    .when(platforms: [.iOS])
+                ),
+            ],
+            linkerSettings: [
+                // System libs PDAL + bundled gdal/proj transitively need.
+                // libcurl is cross-built and statically merged into
+                // pdalcpp.framework's binary on iOS (PDAL's arbiter
+                // eagerly constructs an HTTP Pool on startup — runtime
+                // resolution via -undefined dynamic_lookup crashes).
+                // SecureTransport.framework + CoreFoundation satisfy
+                // libcurl's TLS path on iOS.
+                .linkedLibrary("z", .when(platforms: [.iOS])),
+                .linkedLibrary("iconv", .when(platforms: [.iOS])),
+                .linkedLibrary("xml2", .when(platforms: [.iOS])),
+                .linkedLibrary("sqlite3", .when(platforms: [.iOS])),
+                .linkedLibrary("c++", .when(platforms: [.iOS])),
+                .linkedFramework("Security", .when(platforms: [.iOS])),
+                .linkedFramework("CoreFoundation", .when(platforms: [.iOS])),
+                .linkedFramework("SystemConfiguration", .when(platforms: [.iOS])),
             ]
         ),
 
