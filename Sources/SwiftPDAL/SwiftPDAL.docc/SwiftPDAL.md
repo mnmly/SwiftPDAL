@@ -1,7 +1,8 @@
 # ``SwiftPDAL``
 
-A Swift wrapper around PDAL for reading LAS/LAZ/COPC point clouds, plus
-an out-of-core streaming source for large COPC files.
+A Swift wrapper around PDAL for reading LAS/LAZ/COPC/E57 point clouds,
+plus an out-of-core streaming source for large COPC files. Runs on
+**macOS, iOS device, and iOS Simulator** — Apple Silicon.
 
 ## Overview
 
@@ -20,6 +21,42 @@ SwiftPDAL wraps the PDAL C++ library with two distinct codepaths:
 The out-of-core path is the recent addition and the focus of this
 documentation. For the design rationale and tradeoffs, see
 `docs/streaming.md` in the repo root.
+
+## Apple-platform support
+
+SwiftPDAL ships binary xcframeworks for both macOS and iOS, sourced from
+the sibling `pdal-xcframework-builder` and `gdal-xcframework-builder`
+projects:
+
+| Platform | Shape | Notes |
+| --- | --- | --- |
+| macOS arm64 | Dynamic `.framework` with bundled Homebrew dylibs | Drop-in `import SwiftPDAL`. |
+| iOS arm64 device | Static library xcframework | Needs consumer-side `OTHER_LDFLAGS` — see below. |
+| iOS arm64 Simulator | Static library xcframework | Same as device. |
+
+### iOS consumer requirements
+
+iOS app targets that depend on SwiftPDAL must add to their Xcode
+project's build settings:
+
+```
+OTHER_LDFLAGS[sdk=iphoneos*]        = -Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
+OTHER_LDFLAGS[sdk=iphonesimulator*] = -Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
+```
+
+This is necessary because PDAL registers its readers/writers via
+file-scope static initializers (`static bool LasReader_b =
+registerPlugin(...)`). Without `-force_load`, the linker drops those
+`.o` files as unreferenced, and `StageFactory::createStage("readers.las")`
+returns null at runtime.
+
+`Examples/PDALApp/PDALApp.xcodeproj` is a working iOS sample app that
+demonstrates the full setup — bundled `.laz` and `.e57` resources,
+SwiftPDAL package dependency, the `OTHER_LDFLAGS` rule above, and a
+`PDALApp.entitlements` for the "Designed for iPad" macOS run path.
+
+macOS consumers get a standard dynamic framework — no extra build
+settings needed.
 
 ## Topics
 
