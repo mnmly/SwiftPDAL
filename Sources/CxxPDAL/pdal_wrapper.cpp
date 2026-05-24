@@ -182,6 +182,33 @@ static Stage* createConfiguredStage(
     bool needsTransformOnly = applyTransformation &&
                              (filename.ends_with(".xyz") || reader_name == "readers.ply" || reader_name == "readers.las" || reader_name == "readers.text");
 
+    // Probe the source for a spatial reference before adding
+    // filters.reprojection. The filter errors out at prepare() with
+    // "source data has no spatial reference and none is specified with
+    // the 'in_srs' option" if the source lacks SRS — common for E57
+    // and PLY files with local coordinates. PDAL readers populate
+    // getSpatialReference() during initialize()/prepare(); we probe in
+    // a throwaway PointTable and silently swallow probe failures
+    // (treat as "no SRS").
+    if (!needsTransformOnly) {
+        Stage* probe = factory.createStage(reader_name);
+        if (probe) {
+            Options probeOpts;
+            probeOpts.add("filename", filename);
+            probe->setOptions(probeOpts);
+            try {
+                PointTable probeTable;
+                probe->prepare(probeTable);
+                if (probe->getSpatialReference().empty()) {
+                    needsTransformOnly = true;
+                }
+            } catch (...) {
+                // Probe failed — assume no SRS, skip reprojection.
+                needsTransformOnly = true;
+            }
+        }
+    }
+
     if (!needsTransformOnly) {
         *outFilter = factory.createStage("filters.reprojection");
         if (*outFilter) {

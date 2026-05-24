@@ -112,10 +112,21 @@ public final class PointCloud: PointCloudData {
                 .appendingPathComponent("pdalcpp.framework/Versions/A/PlugIns").path()
             return (projDBURL, driversURL)
         } else {
+            #if os(iOS)
+            // iOS bundles are flat — resources sit directly under the
+            // .bundle root, not under Contents/Resources/. And there's
+            // no PlugIns dir because pdalcpp is statically linked on
+            // iOS (no loadable dylib plugins to discover); pass empty
+            // driversURL to disable PDAL's plugin search.
+            let projDBURL = Bundle.module.bundleURL.path()
+            let driversURL = ""
+            #else
+            // macOS dynamic-framework layout (Versions/A/Resources/ etc.).
             let projDBURL = Bundle.module.bundleURL.appendingPathComponent("Contents/Resources").path()
             let driversURL = Bundle.module.bundleURL.deletingLastPathComponent()
                 .deletingLastPathComponent()
                 .appendingPathComponent("Frameworks/pdalcpp.framework/Versions/A/PlugIns").path()
+            #endif
             return (projDBURL, driversURL)
         }
     }

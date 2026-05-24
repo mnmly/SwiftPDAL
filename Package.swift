@@ -108,6 +108,18 @@ let package = Package(
                 .linkedFramework("Security", .when(platforms: [.iOS])),
                 .linkedFramework("CoreFoundation", .when(platforms: [.iOS])),
                 .linkedFramework("SystemConfiguration", .when(platforms: [.iOS])),
+                // IMPORTANT for iOS consumers: PDAL's plugin registrars
+                // are file-scope statics; without `-force_load` on
+                // libpdalcpp.a, ld drops them and
+                // `StageFactory::createStage("readers.las")` returns
+                // null at runtime. SwiftPM's .unsafeFlags rejects
+                // Xcode build variables like $(BUILT_PRODUCTS_DIR),
+                // so we can't express the slice-aware path here.
+                // App targets must add to their OTHER_LDFLAGS build
+                // setting:
+                //     -Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
+                // (only for iOS configurations). Examples/PDALApp's
+                // project.pbxproj demonstrates this.
             ]
         ),
 

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- When the iOS app runs as "Designed for iPad" on Apple Silicon
+         Mac, macOS library validation rejects E57Format.framework's
+         bundled libxerces-c-3.3.dylib because its ad-hoc team ID
+         doesn't match the Xcode-signed parent app. Disabling library
+         validation lets dyld load the nested dylib.
+
+         Real iOS device and iOS Simulator targets don't hit this
+         (iOS doesn't enforce library validation on app-internal
+         frameworks), and the iOS xcframeworks link statically so
+         there's no nested dylib at all. This entitlement is purely
+         for the Mac/Designed-for-iPad smoke test. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

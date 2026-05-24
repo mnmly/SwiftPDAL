@@ -92,22 +92,48 @@ struct ContentView: View {
             return
         }
         let start = Date()
-        do {
-            let pc = try PointCloud.read(from: url.path, readerName: file.readerName)
-            let elapsed = Date().timeIntervalSince(start)
-            results.insert(
-                ReadResult(
-                    label: file.label,
-                    pointCount: pc.pointCount,
-                    minXYZ: pc.bounds.min,
-                    maxXYZ: pc.bounds.max,
-                    duration: elapsed
-                ),
-                at: 0
-            )
-        } catch {
-            self.error = "\(file.label): \(error)"
+        // PDAL emits its real error to std::cerr; the Swift wrapper
+        // surfaces only a generic "readFailed". Capture stderr around
+        // the read call so we can see what actually went wrong.
+        let captured = captureStderr {
+            do {
+                let pc = try PointCloud.read(from: url.path, readerName: file.readerName)
+                let elapsed = Date().timeIntervalSince(start)
+                results.insert(
+                    ReadResult(
+                        label: file.label,
+                        pointCount: pc.pointCount,
+                        minXYZ: pc.bounds.min,
+                        maxXYZ: pc.bounds.max,
+                        duration: elapsed
+                    ),
+                    at: 0
+                )
+            } catch {
+                self.error = "\(file.label): \(error)"
+                print(self.error!)
+            }
         }
+        if !captured.isEmpty {
+            let prefix = self.error ?? ""
+            self.error = (prefix.isEmpty ? "" : prefix + "\n") + "stderr: " + captured
+            print(self.error!)
+        }
+    }
+
+    /// Redirect stderr (fd 2) through a pipe for the duration of
+    /// `block` and return whatever was written.
+    private func captureStderr(_ block: () -> Void) -> String {
+        let pipe = Pipe()
+        let oldFD = dup(2)
+        dup2(pipe.fileHandleForWriting.fileDescriptor, 2)
+        block()
+        fflush(stderr)
+        dup2(oldFD, 2)
+        close(oldFD)
+        pipe.fileHandleForWriting.closeFile()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
     }
 
     private func fmt(_ v: SIMD3<Float>) -> String {
