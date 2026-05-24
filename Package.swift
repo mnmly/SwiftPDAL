@@ -29,35 +29,59 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.4.3"),
     ],
     targets: [
-        // xcodebuild rejects mixing framework + library slices in a
-        // single xcframework, and static iOS libraries must ship as
-        // library xcframeworks (`<slice>/lib<name>.a + Headers/`)
-        // because Xcode's framework-embed pipeline corrupts MH_OBJECT
-        // framework binaries on iOS apps. So the macOS dynamic
-        // framework and the iOS static library ship in separate
-        // xcframeworks, gated by platform conditions on dependent
-        // targets below.
-        .binaryTarget(name: "gdal", path: "Frameworks/gdal.xcframework"),
-        .binaryTarget(name: "pdalcpp", path: "Frameworks/pdalcpp.xcframework"),
-        .binaryTarget(name: "pdalcpp-ios", path: "Frameworks/pdalcpp-ios.xcframework"),
+        // xcodebuild rejects mixing framework + library slices in one
+        // xcframework, and static iOS libraries must ship as library
+        // xcframeworks (`<slice>/lib<name>.a + Headers/`) because
+        // Xcode's framework-embed pipeline corrupts MH_OBJECT framework
+        // binaries on iOS apps. So the macOS dynamic framework and the
+        // iOS static library ship in separate xcframeworks, gated by
+        // platform conditions on the dependent targets below.
+        //
+        // For local iteration, swap each `.binaryTarget` below to
+        // `path: "Frameworks/<name>.xcframework"` and rebuild via
+        // gdal-xcframework-builder / pdal-xcframework-builder.
+        .binaryTarget(
+            name: "gdal",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r3/gdal.xcframework.zip",
+            checksum: "1187949a2fe8bb46a0de0110efae858cf86343541a38b9d36b8c43fe2fe4778c"
+        ),
+        .binaryTarget(
+            name: "pdalcpp",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r3/pdalcpp.xcframework.zip",
+            checksum: "44a8f51dcba3614f4e2af78aeb62a5c400e7db8af3a99ba546d37f7c4b0e3300"
+        ),
+        .binaryTarget(
+            name: "pdalcpp-ios",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r3/pdalcpp-ios.xcframework.zip",
+            checksum: "da1df7c13014cebc4709dff3a0af4d6b8b3f0dd896145404bebe3a0aa57421bc"
+        ),
 
         // PROJ ships as a separate xcframework (iOS-only) from
         // gdal-xcframework-builder. macOS PDAL build links Homebrew
         // proj at builder-time and bundles its dylib inside
         // gdal.framework's Libraries/, so this binaryTarget is only
         // meaningful on iOS.
-        .binaryTarget(name: "proj", path: "Frameworks/proj.xcframework"),
+        .binaryTarget(
+            name: "proj",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r3/proj.xcframework.zip",
+            checksum: "6737228edcb2bc33e1a4d36377fd523626f519878d821343a548042a3b0da6a6"
+        ),
 
-        // libE57Format packaged as a self-contained xcframework (Xerces-C
-        // 3.3 statically bundled inside). Used by the libE57Format →
-        // writers.copc bridge in CxxPDAL, which works around PDAL's
-        // E57 reader bug on certain multi-scan files. Build with:
-        // pdal-xcframework-builder/build_e57.sh.
-        //
-        // For local iteration, swap the binaryTarget below to
-        // `path: "Frameworks/E57Format.xcframework"`.
-        .binaryTarget(name: "E57Format", path: "Frameworks/E57Format.xcframework"),
-        .binaryTarget(name: "E57Format-ios", path: "Frameworks/E57Format-ios.xcframework"),
+        // libE57Format packaged as a self-contained xcframework
+        // (Xerces-C 3.3 statically bundled inside). Used by the
+        // libE57Format → writers.copc bridge in CxxPDAL, which works
+        // around PDAL's E57 reader bug on certain multi-scan files.
+        // Built by pdal-xcframework-builder/build_e57.sh.
+        .binaryTarget(
+            name: "E57Format",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r3/E57Format.xcframework.zip",
+            checksum: "38bc39642bfcab988a13bbfe7c136913ed3eb5daea2263ed34599fe9527bd652"
+        ),
+        .binaryTarget(
+            name: "E57Format-ios",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r3/E57Format-ios.xcframework.zip",
+            checksum: "11676f48db16a9f022e158d3560fadcbd17bf886bfbd57e973b920c5baf6b402"
+        ),
 
         // C++ wrapper target for PDAL. Two source files:
         //   pdal_convert.cpp      — generic pdal-convert pipeline.
