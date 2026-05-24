@@ -122,6 +122,10 @@ Frameworks/pdalcpp.xcframework
 Frameworks/pdalcpp.xcframework.zip
 Frameworks/E57Format.xcframework
 Frameworks/E57Format.xcframework.zip
+Frameworks/E57Format-ios.xcframework
+Frameworks/E57Format-ios.xcframework.zip
+Frameworks/pdalcpp-ios.xcframework
+Frameworks/pdalcpp-ios.xcframework.zip
 Frameworks/proj.xcframework
 Frameworks/proj.xcframework.zip
 default.profraw
