@@ -9,10 +9,13 @@
 
 import SwiftUI
 import SwiftPDAL
+import simd
 
 struct ContentView: View {
     @State private var results: [ReadResult] = []
     @State private var error: String?
+    @State private var streamStatus: String = "idle"
+    @State private var streamingTask: Task<Void, Never>?
 
     private let probedDrivers: [String] = [
         "readers.las", "readers.ply", "readers.text", "readers.copc",
@@ -51,6 +54,24 @@ struct ContentView: View {
                             }
                         }
                     }
+                }
+
+                Section("COPC streaming (CopcStreamingPointCloudSource)") {
+                    Button {
+                        runStreamingSmokeTest()
+                    } label: {
+                        HStack {
+                            Image(systemName: "waveform.path")
+                            VStack(alignment: .leading) {
+                                Text("Stream test.copc.laz").font(.headline)
+                                Text("Reproduces the iOS lazperf vtable crash")
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    Text("status: \(streamStatus)")
+                        .font(.caption.monospaced())
                 }
 
                 if let error {
@@ -136,6 +157,92 @@ struct ContentView: View {
             let prefix = self.error ?? ""
             self.error = (prefix.isEmpty ? "" : prefix + "\n") + "stderr: " + captured
             print(self.error!)
+        }
+    }
+
+    /// Exercise CopcStreamingPointCloudSource on a bundled COPC file —
+    /// this is the path that crashes on iOS device with
+    /// `__cxa_pure_virtual` when the two lazperf vtables (PDAL's
+    /// vendored copy vs copclib's patched copy) disagree.
+    private func runStreamingSmokeTest() {
+        streamingTask?.cancel()
+        streamStatus = "opening…"
+        guard let url = Bundle.main.url(forResource: "test.copc", withExtension: "laz") else {
+            streamStatus = "missing test.copc.laz"
+            return
+        }
+        streamingTask = Task { @MainActor in
+            do {
+                let source = try await CopcStreamingPointCloudSource.open(url, options: .init(
+                    decodeConcurrency: 2, prefetchRoot: true,
+                    driverTickInterval: .milliseconds(10)
+                ))
+                defer { source.close() }
+                streamStatus = "opened — \(source.info.totalPoints) pts, \(source.info.maxDepth) depth"
+
+                // Wide top-down view of the whole bounds.
+                let b = source.info.bounds
+                let originShift = source.info.originShift
+                let centerWorld = (b.min + b.max) * 0.5
+                let center = SIMD3<Float>(
+                    centerWorld.x - Float(originShift.x),
+                    centerWorld.y - Float(originShift.y),
+                    centerWorld.z - Float(originShift.z)
+                )
+                let span = simd_length(b.max - b.min)
+                let eye = center + SIMD3<Float>(0, 0, span)
+                let f = simd_normalize(center - eye)
+                let s = simd_normalize(simd_cross(f, SIMD3<Float>(0, 1, 0)))
+                let u = simd_cross(s, f)
+                let view = simd_float4x4(
+                    SIMD4<Float>( s.x,  u.x, -f.x, 0),
+                    SIMD4<Float>( s.y,  u.y, -f.y, 0),
+                    SIMD4<Float>( s.z,  u.z, -f.z, 0),
+                    SIMD4<Float>(-simd_dot(s, eye), -simd_dot(u, eye),  simd_dot(f, eye), 1)
+                )
+                let fov: Float = .pi / 2
+                let near: Float = 1
+                let far = span * 4
+                let yScale = 1 / tan(fov * 0.5)
+                let zRange = far - near
+                let proj = simd_float4x4(
+                    SIMD4<Float>(yScale, 0,      0,                   0),
+                    SIMD4<Float>(0,      yScale, 0,                   0),
+                    SIMD4<Float>(0,      0,     -(far + near)/zRange, -1),
+                    SIMD4<Float>(0,      0,     -2*far*near/zRange,   0)
+                )
+                source.setBudget(Int.max)
+                source.submit(view: StreamingCameraView(
+                    position: eye,
+                    viewProjection: proj * view,
+                    pixelScale: 1000
+                ))
+
+                // Drain decoded batches until every node has been served
+                // or we time out. The crash (if present) fires inside the
+                // decode worker on the first decompress() call.
+                let deadline = Date().addingTimeInterval(15)
+                var decoded = 0
+                var batches = 0
+                while Date() < deadline {
+                    if let delta = source.pollLatest() {
+                        batches += delta.added.reduce(0) { $0 + $1.batches.count }
+                        decoded += delta.added.reduce(0) { $0 + $1.totalPointCount }
+                        streamStatus = "decoded \(decoded) pts / \(batches) batches"
+                    }
+                    let snap = await source._debugSnapshot()
+                    if snap.totalNodes > 0, snap.wanted > 0,
+                       snap.resident >= snap.wanted, snap.inFlight == 0 {
+                        streamStatus = "done — \(snap.resident)/\(snap.totalNodes) nodes resident, \(decoded) pts"
+                        return
+                    }
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                streamStatus = "timeout — \(decoded) pts decoded"
+            } catch {
+                streamStatus = "open failed: \(error)"
+                self.error = "streaming: \(error)"
+            }
         }
     }
 

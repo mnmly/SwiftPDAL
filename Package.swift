@@ -42,18 +42,23 @@ let package = Package(
         // gdal-xcframework-builder / pdal-xcframework-builder.
         .binaryTarget(
             name: "gdal",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r4/gdal.xcframework.zip",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r5/gdal.xcframework.zip",
             checksum: "1187949a2fe8bb46a0de0110efae858cf86343541a38b9d36b8c43fe2fe4778c"
         ),
+        // r5 rebuilds pdalcpp + pdalcpp-ios against PDAL's vendored
+        // lazperf patched to match copclib's lazperf vtable layout
+        // (las_decompressor::reset(InputCb) added). Without that, iOS
+        // consumers crashed with __cxa_pure_virtual during COPC
+        // decompression. See pdal-xcframework-builder phase 1.5.
         .binaryTarget(
             name: "pdalcpp",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r4/pdalcpp.xcframework.zip",
-            checksum: "96e0a49b86abaf433ba636072fa2890a97acb2f041e35a8b7fe1de2da2b826c6"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r5/pdalcpp.xcframework.zip",
+            checksum: "730291c9a93ec92df1d26e127259cf24926306edc74713be30d6d83586c5b653"
         ),
         .binaryTarget(
             name: "pdalcpp-ios",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r4/pdalcpp-ios.xcframework.zip",
-            checksum: "330b82e5f638819643738d1d89df43d225fcc1b6d81d210a53d0ec6e1bc3aacc"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r5/pdalcpp-ios.xcframework.zip",
+            checksum: "1fe36b4705aa299c28e20e63ee17d28746f7a6ee1510e0ebcae9014fac8ac297"
         ),
 
         // PROJ ships as a separate xcframework (iOS-only) from
@@ -63,7 +68,7 @@ let package = Package(
         // meaningful on iOS.
         .binaryTarget(
             name: "proj",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r4/proj.xcframework.zip",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r5/proj.xcframework.zip",
             checksum: "6737228edcb2bc33e1a4d36377fd523626f519878d821343a548042a3b0da6a6"
         ),
 
@@ -74,13 +79,13 @@ let package = Package(
         // Built by pdal-xcframework-builder/build_e57.sh.
         .binaryTarget(
             name: "E57Format",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r4/E57Format.xcframework.zip",
-            checksum: "38bc39642bfcab988a13bbfe7c136913ed3eb5daea2263ed34599fe9527bd652"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r5/E57Format.xcframework.zip",
+            checksum: "80235bbb898a462591193c8cd799cdb54ee7b5172f5bbb9bfae3f543589aec37"
         ),
         .binaryTarget(
             name: "E57Format-ios",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r4/E57Format-ios.xcframework.zip",
-            checksum: "11676f48db16a9f022e158d3560fadcbd17bf886bfbd57e973b920c5baf6b402"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r5/E57Format-ios.xcframework.zip",
+            checksum: "f2b9746f7851cec2123e0cdd935b7c25d45c9515a2b1fb4639a085efb1bbcca2"
         ),
 
         // C++ wrapper target for PDAL. Two source files:
