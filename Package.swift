@@ -42,18 +42,18 @@ let package = Package(
         // gdal-xcframework-builder / pdal-xcframework-builder.
         .binaryTarget(
             name: "gdal",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r3/gdal.xcframework.zip",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r4/gdal.xcframework.zip",
             checksum: "1187949a2fe8bb46a0de0110efae858cf86343541a38b9d36b8c43fe2fe4778c"
         ),
         .binaryTarget(
             name: "pdalcpp",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r3/pdalcpp.xcframework.zip",
-            checksum: "44a8f51dcba3614f4e2af78aeb62a5c400e7db8af3a99ba546d37f7c4b0e3300"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r4/pdalcpp.xcframework.zip",
+            checksum: "96e0a49b86abaf433ba636072fa2890a97acb2f041e35a8b7fe1de2da2b826c6"
         ),
         .binaryTarget(
             name: "pdalcpp-ios",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r3/pdalcpp-ios.xcframework.zip",
-            checksum: "da1df7c13014cebc4709dff3a0af4d6b8b3f0dd896145404bebe3a0aa57421bc"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r4/pdalcpp-ios.xcframework.zip",
+            checksum: "330b82e5f638819643738d1d89df43d225fcc1b6d81d210a53d0ec6e1bc3aacc"
         ),
 
         // PROJ ships as a separate xcframework (iOS-only) from
@@ -63,7 +63,7 @@ let package = Package(
         // meaningful on iOS.
         .binaryTarget(
             name: "proj",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r3/proj.xcframework.zip",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r4/proj.xcframework.zip",
             checksum: "6737228edcb2bc33e1a4d36377fd523626f519878d821343a548042a3b0da6a6"
         ),
 
@@ -74,12 +74,12 @@ let package = Package(
         // Built by pdal-xcframework-builder/build_e57.sh.
         .binaryTarget(
             name: "E57Format",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r3/E57Format.xcframework.zip",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r4/E57Format.xcframework.zip",
             checksum: "38bc39642bfcab988a13bbfe7c136913ed3eb5daea2263ed34599fe9527bd652"
         ),
         .binaryTarget(
             name: "E57Format-ios",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r3/E57Format-ios.xcframework.zip",
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r4/E57Format-ios.xcframework.zip",
             checksum: "11676f48db16a9f022e158d3560fadcbd17bf886bfbd57e973b920c5baf6b402"
         ),
 
@@ -132,18 +132,14 @@ let package = Package(
                 .linkedFramework("Security", .when(platforms: [.iOS])),
                 .linkedFramework("CoreFoundation", .when(platforms: [.iOS])),
                 .linkedFramework("SystemConfiguration", .when(platforms: [.iOS])),
-                // IMPORTANT for iOS consumers: PDAL's plugin registrars
-                // are file-scope statics; without `-force_load` on
-                // libpdalcpp.a, ld drops them and
-                // `StageFactory::createStage("readers.las")` returns
-                // null at runtime. SwiftPM's .unsafeFlags rejects
-                // Xcode build variables like $(BUILT_PRODUCTS_DIR),
-                // so we can't express the slice-aware path here.
-                // App targets must add to their OTHER_LDFLAGS build
-                // setting:
-                //     -Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
-                // (only for iOS configurations). Examples/PDALApp's
-                // project.pbxproj demonstrates this.
+                // PDAL's plugin registrars are file-scope statics, so
+                // ld would drop them from the static iOS slices of
+                // libpdalcpp.a as unreferenced. CxxPDAL handles this
+                // in-package via `pdal_static_plugins.cpp`, which
+                // constructs one instance of each anchored stage to
+                // keep its `.o` linked. No consumer-side OTHER_LDFLAGS
+                // needed. See SwiftPDAL.docc/SwiftPDAL.md for the list
+                // of anchored stages.
             ]
         ),
 

@@ -31,32 +31,37 @@ projects:
 | Platform | Shape | Notes |
 | --- | --- | --- |
 | macOS arm64 | Dynamic `.framework` with bundled Homebrew dylibs | Drop-in `import SwiftPDAL`. |
-| iOS arm64 device | Static library xcframework | Needs consumer-side `OTHER_LDFLAGS` — see below. |
+| iOS arm64 device | Static library xcframework | Drop-in — no extra build settings. |
 | iOS arm64 Simulator | Static library xcframework | Same as device. |
 
-### iOS consumer requirements
+### iOS plugin registration
 
-iOS app targets that depend on SwiftPDAL must add to their Xcode
-project's build settings:
+PDAL registers its readers/writers/filters via file-scope static
+initializers (`static bool LasReader_b = registerPlugin(...)`). When
+`pdalcpp` is linked statically (the iOS slices), `ld64` would normally
+drop those `.o` files as unreferenced, and
+`StageFactory::createStage("readers.las")` would return null at runtime.
 
-```
-OTHER_LDFLAGS[sdk=iphoneos*]        = -Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
-OTHER_LDFLAGS[sdk=iphonesimulator*] = -Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
-```
+SwiftPDAL handles this internally: `CxxPDAL/pdal_static_plugins.cpp`
+anchors the stages it depends on so they survive dead-stripping. The
+anchored set covers everything the Swift API invokes by name —
+`readers.las`, `readers.ply`, `readers.text`, `readers.copc`,
+`readers.e57`, the matching writers, and `filters.range / assign /
+reprojection / transformation`.
 
-This is necessary because PDAL registers its readers/writers via
-file-scope static initializers (`static bool LasReader_b =
-registerPlugin(...)`). Without `-force_load`, the linker drops those
-`.o` files as unreferenced, and `StageFactory::createStage("readers.las")`
-returns null at runtime.
+If you run a custom PDAL JSON pipeline on iOS that references a stage
+outside that set (e.g. `filters.crop`, `readers.ept`), the linker will
+strip it and `StageFactory::createStage(...)` will return null. The
+workaround is to anchor it yourself in your app target — instantiate
+the type once in any TU your app reaches.
 
-`Examples/PDALApp/PDALApp.xcodeproj` is a working iOS sample app that
-demonstrates the full setup — bundled `.laz` and `.e57` resources,
-SwiftPDAL package dependency, the `OTHER_LDFLAGS` rule above, and a
-`PDALApp.entitlements` for the "Designed for iPad" macOS run path.
+`Examples/PDALApp/PDALApp.xcodeproj` is a working iOS sample app:
+bundled `.laz` and `.e57` resources, a Swift-side probe that lists
+every anchored driver, and a `PDALApp.entitlements` for the "Designed
+for iPad" macOS run path.
 
-macOS consumers get a standard dynamic framework — no extra build
-settings needed.
+macOS consumers get a standard dynamic framework — no anchor needed,
+all PDAL symbols stay live in the dylib.
 
 ## Topics
 

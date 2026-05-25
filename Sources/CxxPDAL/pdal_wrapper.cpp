@@ -38,6 +38,19 @@
 using namespace pdal;
 #endif
 
+// Defined in pdal_static_plugins.cpp. Referencing it here (a TU that
+// the Swift side reaches via every public entry point) keeps the
+// anchor TU linked into CxxPDAL.a, which in turn forces ld to pull
+// each anchored stage's `.o` out of libpdalcpp.a on iOS. See
+// pdal_static_plugins.cpp for the full rationale.
+namespace swiftpdal { void ensureStaticPluginsLinked(); }
+namespace {
+struct StaticPluginAnchor {
+    StaticPluginAnchor() { swiftpdal::ensureStaticPluginsLinked(); }
+};
+static StaticPluginAnchor g_staticPluginAnchor;
+} // namespace
+
 PDALPipeline pdal_pipeline_create() {
     return static_cast<PDALPipeline>(new pdal::PipelineManager());
 }

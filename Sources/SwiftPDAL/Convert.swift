@@ -472,8 +472,19 @@ public enum PDALConvert {
 
     /// True if the linked pdalcpp build registers the given driver
     /// name (e.g. `"writers.copc"`).
+    ///
+    /// PDAL's plugin directory is a process-wide singleton seeded
+    /// from `PDAL_DRIVER_PATH` on first touch, so we set the env
+    /// vars here before probing — otherwise the first probe locks
+    /// the search path to PDAL's defaults (which don't include the
+    /// framework's `PlugIns/` dir on macOS), and subsequent reads
+    /// can't find e.g. `readers.e57`.
     public static func isDriverRegistered(_ name: String) -> Bool {
-        swiftpdal.convert.driver_is_registered(std.string(name))
+        let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
+        let paths = PointCloud.getPaths(isTesting: isTesting)
+        setenv("PROJ_DATA", paths.projDBURL, 1)
+        setenv("PDAL_DRIVER_PATH", paths.driversURL, 1)
+        return swiftpdal.convert.driver_is_registered(std.string(name))
     }
 
     // MARK: Extension inference

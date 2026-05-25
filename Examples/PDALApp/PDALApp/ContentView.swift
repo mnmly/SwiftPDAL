@@ -14,9 +14,27 @@ struct ContentView: View {
     @State private var results: [ReadResult] = []
     @State private var error: String?
 
+    private let probedDrivers: [String] = [
+        "readers.las", "readers.ply", "readers.text", "readers.copc",
+        "writers.las", "writers.ply", "writers.copc", "writers.text",
+        "filters.range", "filters.assign", "filters.reprojection", "filters.transformation",
+        "readers.e57",
+    ]
+
     var body: some View {
         NavigationStack {
             List {
+                Section("Static plugin registration (iOS)") {
+                    ForEach(probedDrivers, id: \.self) { name in
+                        let ok = PDALConvert.isDriverRegistered(name)
+                        HStack {
+                            Image(systemName: ok ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                                .foregroundStyle(ok ? .green : .red)
+                            Text(name).font(.caption.monospaced())
+                        }
+                    }
+                }
+
                 Section("Bundled files") {
                     ForEach(bundledFiles, id: \.path) { file in
                         Button {
