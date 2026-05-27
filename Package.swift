@@ -42,8 +42,8 @@ let package = Package(
         // gdal-xcframework-builder / pdal-xcframework-builder.
         .binaryTarget(
             name: "gdal",
-            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r5/gdal.xcframework.zip",
-            checksum: "1187949a2fe8bb46a0de0110efae858cf86343541a38b9d36b8c43fe2fe4778c"
+            url: "https://github.com/mnmly/SwiftPDAL/releases/download/gdal-3.12.4_pdal-2.10.1-r6/gdal.xcframework.zip",
+            checksum: "4748c10b71863dfa76da6a7c003c16191bc60060993b7b7fcf9e36f562d45f68"
         ),
         // r5 rebuilds pdalcpp + pdalcpp-ios against PDAL's vendored
         // lazperf patched to match copclib's lazperf vtable layout
