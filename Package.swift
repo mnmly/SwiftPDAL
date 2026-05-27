@@ -42,8 +42,8 @@ let package = Package(
         // gdal-xcframework-builder / pdal-xcframework-builder.
         .binaryTarget(
             name: "gdal",
-            url: "https://github.com/mnmly/gdal-xcframework-builder/releases/download/gdal-3.12.4-r1/gdal.xcframework.zip",
-            checksum: "29db8b666c2a366c148d0178041ad9ad3c985d7652247d54b4c752379e37f04f"
+            url: "https://github.com/mnmly/gdal-xcframework-builder/releases/download/gdal-3.12.4-r2/gdal.xcframework.zip",
+            checksum: "2d935c5a83f39e7cdde40116bf3fb1531b672911b3d60c785465a84723b9381c"
         ),
         // r5 rebuilds pdalcpp + pdalcpp-ios against PDAL's vendored
         // lazperf patched to match copclib's lazperf vtable layout
@@ -68,8 +68,8 @@ let package = Package(
         // meaningful on iOS.
         .binaryTarget(
             name: "proj",
-            url: "https://github.com/mnmly/gdal-xcframework-builder/releases/download/gdal-3.12.4-r1/proj.xcframework.zip",
-            checksum: "6d306ae764ac3bab92ad75b30aaccf41181fafd108af538cd4f7d9dfaa2fc6ea"
+            url: "https://github.com/mnmly/gdal-xcframework-builder/releases/download/gdal-3.12.4-r2/proj.xcframework.zip",
+            checksum: "13cf2c5ecfad1aee5e7dd333752c44ba13b160ae8e29a08869c3ffbc3bbdda73"
         ),
 
         // libE57Format packaged as a self-contained xcframework
