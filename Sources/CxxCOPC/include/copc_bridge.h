@@ -72,6 +72,14 @@ public:
     // Returns nullptr on failure. pool_size must be >= 1.
     static Reader* open(const std::string& path, int32_t pool_size) noexcept;
 
+    // Open a COPC file streamed over HTTP range requests, instead of from a
+    // local path. `url` must be an http:// or https:// URL. Builds pool_size
+    // independent HTTP-range-backed streams (one per slot, each with its own
+    // read position) so read_node() keeps its lock-free per-slot contract.
+    // Returns nullptr on failure (bad URL, network error, non-COPC, or a
+    // server that doesn't support range requests). pool_size must be >= 1.
+    static Reader* open_http(const std::string& url, int32_t pool_size) noexcept;
+
     int32_t pool_size() const noexcept;
     int64_t total_points() const noexcept;
 

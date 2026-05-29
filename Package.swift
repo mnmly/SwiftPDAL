@@ -169,10 +169,16 @@ let package = Package(
             name: "CxxCOPC",
             dependencies: ["copclib"],
             path: "Sources/CxxCOPC",
-            sources: ["copc_bridge.cpp"],
+            // http_stream.mm is Objective-C++ (URLSession-backed istream for
+            // the COPC-over-HTTP streaming path). It compiles in this C++ SPM
+            // target and exposes only a plain C++ interface (http_stream.h).
+            sources: ["copc_bridge.cpp", "http_stream.mm"],
             publicHeadersPath: "include",
             cxxSettings: [
                 .headerSearchPath("include"),
+            ],
+            linkerSettings: [
+                .linkedFramework("Foundation"), // URLSession for http_stream.mm
             ]
         ),
 

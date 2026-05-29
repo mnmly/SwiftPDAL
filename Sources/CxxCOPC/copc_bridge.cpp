@@ -1,4 +1,5 @@
 #include "copc_bridge.h"
+#include "http_stream.h"
 
 #include <copc-lib/io/copc_reader.hpp>
 #include <copc-lib/hierarchy/node.hpp>
@@ -186,7 +187,15 @@ namespace swiftpdal { namespace copc {
 
 struct Reader::Impl {
     std::atomic<int> refcount {1};
-    std::vector<std::unique_ptr<::copc::FileReader>> readers;
+    // Backing streams for the HTTP path. Declared BEFORE `readers` so they are
+    // destroyed AFTER the readers: an istream-backed ::copc::Reader holds a raw
+    // std::istream* it does not own, so the stream must outlive it. Empty for
+    // the local-file path (FileReader owns its own fstream).
+    std::vector<std::unique_ptr<std::istream>> streams;
+    // ::copc::Reader (base), not FileReader: holds either a FileReader (local)
+    // or an istream-backed Reader (HTTP). FindNode / GetPointDataCompressed /
+    // CopcConfig / GetAllNodes are all on the base, so read_node() is agnostic.
+    std::vector<std::unique_ptr<::copc::Reader>> readers;
     std::vector<PooledDecompressor> pool;   // parallel to `readers`
     std::vector<std::vector<char>> scratch; // reusable decompressed-bytes buffer per slot
     std::vector<::copc::Node> nodes;
@@ -208,6 +217,34 @@ Reader* Reader::open(const std::string& path, int32_t pool_size) noexcept {
         r->impl_->scratch.resize(static_cast<size_t>(pool_size));
         for (int32_t i = 0; i < pool_size; ++i) {
             r->impl_->readers.emplace_back(std::make_unique<::copc::FileReader>(path));
+        }
+        r->impl_->nodes  = r->impl_->readers[0]->GetAllNodes();
+        r->impl_->header = r->impl_->readers[0]->CopcConfig().LasHeader();
+        return r;
+    } catch (const std::exception&) {
+        return nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+Reader* Reader::open_http(const std::string& url, int32_t pool_size) noexcept {
+    if (url.empty() || pool_size < 1) return nullptr;
+    try {
+        auto* r = new Reader();
+        r->impl_ = new Impl();
+        r->impl_->streams.reserve(static_cast<size_t>(pool_size));
+        r->impl_->readers.reserve(static_cast<size_t>(pool_size));
+        r->impl_->pool.resize(static_cast<size_t>(pool_size));
+        r->impl_->scratch.resize(static_cast<size_t>(pool_size));
+        for (int32_t i = 0; i < pool_size; ++i) {
+            // Each slot gets an independent HTTP stream with its own read
+            // position — required by read_node's lock-free per-slot contract.
+            std::unique_ptr<std::istream> stream = OpenHttpRangeStream(url);
+            if (!stream) { delete r; return nullptr; }
+            r->impl_->readers.emplace_back(
+                std::make_unique<::copc::Reader>(stream.get()));
+            r->impl_->streams.emplace_back(std::move(stream));
         }
         r->impl_->nodes  = r->impl_->readers[0]->GetAllNodes();
         r->impl_->header = r->impl_->readers[0]->CopcConfig().LasHeader();
@@ -281,7 +318,7 @@ ChunkData Reader::read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
     if (impl_->closed) return out;
     if (slot < 0 || static_cast<size_t>(slot) >= impl_->readers.size()) return out;
 
-    ::copc::FileReader* reader = impl_->readers[static_cast<size_t>(slot)].get();
+    ::copc::Reader* reader = impl_->readers[static_cast<size_t>(slot)].get();
     try {
         ::copc::VoxelKey key(depth, x, y, z);
         ::copc::Node node = reader->FindNode(key);
@@ -349,6 +386,9 @@ void Reader::close() noexcept {
     if (!impl_ || impl_->closed) return;
     impl_->closed = true;
     impl_->readers.clear();
+    // Streams cleared after readers: an istream-backed Reader references its
+    // stream by raw pointer, so the reader must go first.
+    impl_->streams.clear();
     impl_->pool.clear();
     impl_->scratch.clear();
     impl_->nodes.clear();

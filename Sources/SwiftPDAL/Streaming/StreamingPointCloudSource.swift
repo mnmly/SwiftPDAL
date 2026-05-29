@@ -648,7 +648,48 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         guard let reader = CopcReader.open(std.string(url.path), poolSize) else {
             throw StreamingSourceError.openFailed(url)
         }
+        return makeSource(reader: reader, options: options)
+    }
 
+    /// Open a COPC file streamed over HTTP and parse its octree hierarchy.
+    ///
+    /// Identical to ``open(_:options:)`` except the point data is pulled from a
+    /// remote `http(s)://` URL via HTTP range requests — only the octree nodes
+    /// the renderer asks for are fetched, with no full download. Works on macOS
+    /// and iOS (the path talks to copc-lib directly, bypassing GDAL/curl).
+    ///
+    /// Opening issues a few synchronous network requests (to read the LAS
+    /// header + COPC hierarchy), so this runs off the calling actor.
+    ///
+    /// - Parameters:
+    ///   - url: An `http://` or `https://` URL to a COPC LAZ file. Plain
+    ///     `http://` requires an App Transport Security exception in the host
+    ///     app's Info.plist.
+    ///   - options: Streaming configuration.
+    /// - Returns: A live source with its driver Task already started.
+    /// - Throws: ``StreamingSourceError/openFailed(_:)`` if the URL can't be
+    ///   opened as a COPC LAZ (bad URL, network error, non-COPC payload, or a
+    ///   server that doesn't support range requests).
+    public static func open(
+        remoteURL url: URL,
+        options: StreamingOptions = .init()
+    ) async throws -> CopcStreamingPointCloudSource {
+        let poolSize = Int32(max(1, options.decodeConcurrency))
+        // open_http issues blocking HEAD/GETs while reading the header +
+        // hierarchy (same as the local path's synchronous file open).
+        guard let reader = CopcReader.open_http(std.string(url.absoluteString), poolSize) else {
+            throw StreamingSourceError.openFailed(url)
+        }
+        return makeSource(reader: reader, options: options)
+    }
+
+    /// Build a live streaming source from an already-opened COPC reader.
+    /// Shared by ``open(_:options:)`` and ``open(remoteURL:options:)`` — the
+    /// only difference between them is how the reader is constructed.
+    private static func makeSource(
+        reader: CopcReader,
+        options: StreamingOptions
+    ) -> CopcStreamingPointCloudSource {
         let bMin = reader.bounds_min()
         let bMax = reader.bounds_max()
         let originShift = SIMD3<Double>(

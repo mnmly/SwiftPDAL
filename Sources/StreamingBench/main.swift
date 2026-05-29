@@ -12,10 +12,23 @@ struct StreamingBench {
     static func main() async {
         let args = CommandLine.arguments
         guard args.count >= 2 else {
-            print("usage: StreamingBench <file.copc.laz> [decodeConcurrency=4] [seconds=20] [maxInFlightLoadsPerTick=16] [budgetMB=8192]")
+            print("usage: StreamingBench <file.copc.laz | http(s)://host/file.copc.laz> [decodeConcurrency=4] [seconds=20] [maxInFlightLoadsPerTick=16] [budgetMB=8192]")
             exit(2)
         }
-        let url = URL(fileURLWithPath: args[1])
+        // An http(s):// argument streams over range requests; anything else is
+        // treated as a local file path.
+        let arg = args[1]
+        let isRemote = arg.hasPrefix("http://") || arg.hasPrefix("https://")
+        let url: URL
+        if isRemote {
+            guard let u = URL(string: arg) else {
+                print("invalid URL: \(arg)")
+                exit(2)
+            }
+            url = u
+        } else {
+            url = URL(fileURLWithPath: arg)
+        }
         let concurrency = args.count > 2 ? Int(args[2]) ?? 4 : 4
         let seconds = args.count > 3 ? Double(args[3]) ?? 20 : 20
         let perTick = args.count > 4 ? Int(args[4]) ?? 16 : 16
@@ -27,7 +40,7 @@ struct StreamingBench {
             driverTickInterval: .milliseconds(16)
         )
 
-        print("file:         \(url.path)")
+        print("file:         \(isRemote ? url.absoluteString : url.path)")
         print("concurrency:  \(concurrency)")
         print("perTick cap:  \(perTick)")
         print("tick:         16 ms")
@@ -36,7 +49,9 @@ struct StreamingBench {
         let openStart = Date()
         let source: CopcStreamingPointCloudSource
         do {
-            source = try await CopcStreamingPointCloudSource.open(url, options: opts)
+            source = isRemote
+                ? try await CopcStreamingPointCloudSource.open(remoteURL: url, options: opts)
+                : try await CopcStreamingPointCloudSource.open(url, options: opts)
         } catch {
             print("open failed: \(error)")
             exit(1)
