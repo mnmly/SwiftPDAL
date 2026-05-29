@@ -131,13 +131,13 @@ public final class PointCloud: PointCloudData {
         }
     }
 
-    public static func read(from path: String, readerName: String = "readers.text") throws -> PointCloud {
-        
+    public static func read(from path: String, readerName: String = "readers.text", outSrs: String = "") throws -> PointCloud {
+
         let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
         let paths = Self.getPaths(isTesting: isTesting)
         setenv("PROJ_DATA", paths.projDBURL, 1)
         setenv("PDAL_DRIVER_PATH", paths.driversURL, 1)
-        
+
         var outData: UnsafePointer<CChar>?
         var outSize: Int = 0
         var outCount: Int = 0
@@ -145,21 +145,24 @@ public final class PointCloud: PointCloudData {
         var dimList: UnsafeMutablePointer<PDALDimensionInfo>?
         var dimCount: Int = 0
         var bbox = PDALBounds()
-        
+
         var result: Int32 = 0
         readerName.withCString { readerPtr in
             path.withCString { pathPtr in
-                result = pdal_read_binary(
-                    readerPtr,
-                    pathPtr,
-                    &outData,
-                    &outSize,
-                    &outCount,
-                    &outStride,
-                    &dimList,
-                    &dimCount,
-                    &bbox
-                )
+                outSrs.withCString { srsPtr in
+                    result = pdal_read_binary(
+                        readerPtr,
+                        pathPtr,
+                        &outData,
+                        &outSize,
+                        &outCount,
+                        &outStride,
+                        &dimList,
+                        &dimCount,
+                        &bbox,
+                        srsPtr
+                    )
+                }
             }
         }
 
@@ -318,6 +321,9 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
     public let readerName: String
     public let chunkSize: Int
     public let dimensionMap: [String: String]  // Stored as Swift dict, converted to DimensionMap for C++
+    /// Target SRS to reproject into (e.g. `"EPSG:3857"`). Empty leaves points in
+    /// the source's native CRS — true-scale, with no Web Mercator distortion.
+    public let outSrs: String
 
     private let boundsLock = NSLock()
 
@@ -347,12 +353,14 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
         filePath: String,
         readerName: String = "readers.text",
         chunkSize: Int = 100000,
-        dimensionMap: [String: String] = [:]
+        dimensionMap: [String: String] = [:],
+        outSrs: String = ""
     ) {
         self.filePath = filePath
         self.readerName = readerName
         self.chunkSize = chunkSize
         self.dimensionMap = dimensionMap
+        self.outSrs = outSrs
     }
 
     // No deinit needed - std::shared_ptr is managed by Swift ARC automatically
@@ -374,16 +382,19 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
         var loadResult: Int32 = 0
         readerName.withCString { readerPtr in
             filePath.withCString { pathPtr in
-                loadResult = pdal_load_info(
-                    readerPtr,
-                    pathPtr,
-                    &outCount,
-                    &outStride,
-                    &dimList,
-                    &dimCount,
-                    &bbox,
-                    &outView
-                )
+                outSrs.withCString { srsPtr in
+                    loadResult = pdal_load_info(
+                        readerPtr,
+                        pathPtr,
+                        &outCount,
+                        &outStride,
+                        &dimList,
+                        &dimCount,
+                        &bbox,
+                        &outView,
+                        srsPtr
+                    )
+                }
             }
         }
 
@@ -435,7 +446,8 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
                 insert_dimension(&dimMap, std.string(key), std.string(value))
             }
 
-            Task.detached { [weak self, filePath, readerName, chunkSize] in
+            let outSrs = self.outSrs
+            Task.detached { [weak self, filePath, readerName, chunkSize, outSrs] in
                 do {
                     if let viewCtx = capturedViewContext {
                         try Self.readStreamingFromView(
@@ -452,7 +464,8 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
                             from: filePath,
                             readerName: readerName,
                             chunkSize: chunkSize,
-                            dimensionMap: dimMap
+                            dimensionMap: dimMap,
+                            outSrs: outSrs
                         ) { progress in
                             self?.bounds = progress.chunk.currentBounds
                             continuation.yield(progress)
@@ -481,6 +494,7 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
         readerName: String,
         chunkSize: Int,
         dimensionMap: DimensionMap,
+        outSrs: String = "",
         onProgress: @escaping (StreamingProgress) -> Bool
     ) throws -> Bounds {
         let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
@@ -546,15 +560,18 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
         var streamResult: Int32 = 0
         readerName.withCString { readerPtr in
             path.withCString { pathPtr in
-                streamResult = pdal_read_binary_stream_progressive(
-                    readerPtr,
-                    pathPtr,
-                    chunkSize,
-                    callback,
-                    contextPtr,
-                    &bbox,
-                    dimensionMap
-                )
+                outSrs.withCString { srsPtr in
+                    streamResult = pdal_read_binary_stream_progressive(
+                        readerPtr,
+                        pathPtr,
+                        chunkSize,
+                        callback,
+                        contextPtr,
+                        &bbox,
+                        dimensionMap,
+                        srsPtr
+                    )
+                }
             }
         }
 

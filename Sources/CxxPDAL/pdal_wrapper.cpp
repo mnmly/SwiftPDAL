@@ -136,9 +136,8 @@ static Stage* createConfiguredStage(
     const std::string& filename,
     StageFactory& factory,
     Stage** outFilter,
-    Stage** outFlipFilter,
     const DimensionMap& dimensionMap = {},
-    bool applyTransformation = true)
+    const std::string& outSrs = "")
 {
     // 1. Resolve Reader
     std::string inferredReaderName = factory.inferReaderDriver(filename);
@@ -192,8 +191,12 @@ static Stage* createConfiguredStage(
     
 
     // 3. Logic: Reprojection
-    bool needsTransformOnly = applyTransformation &&
-                             (filename.ends_with(".xyz") || reader_name == "readers.ply" || reader_name == "readers.las" || reader_name == "readers.text");
+    //
+    // Reprojection is opt-in: only requested when the caller passes a non-empty
+    // outSrs (e.g. "EPSG:3857"). With the default empty outSrs the source is
+    // rendered in its native CRS — true-scale, no Web Mercator anisotropy.
+    bool needsTransformOnly = outSrs.empty() ||
+                             filename.ends_with(".xyz") || reader_name == "readers.ply" || reader_name == "readers.las" || reader_name == "readers.text";
 
     // Probe the source for a spatial reference before adding
     // filters.reprojection. The filter errors out at prepare() with
@@ -226,33 +229,16 @@ static Stage* createConfiguredStage(
         *outFilter = factory.createStage("filters.reprojection");
         if (*outFilter) {
             Options filterOptions;
-            filterOptions.add("out_srs", "EPSG:3857");
+            filterOptions.add("out_srs", outSrs);
             (*outFilter)->setOptions(filterOptions);
             (*outFilter)->setInput(*finalStage);
             finalStage = *outFilter;
         }
     }
 
-    // 4. Transformation (The Matrix Flip)
-    *outFlipFilter = factory.createStage("filters.transformation");
-    if (!*outFlipFilter) return nullptr;
-
-    Options flipOptions;
-    if (*outFilter) {
-        flipOptions.add("matrix", "1  0  0  0  "
-                                 "0  1  0  0  "
-                                 "0  0  -1  0  "
-                                 "0  0  0  1");
-    } else {
-        flipOptions.add("matrix", "1  0  0  0  "
-                                 "0  0  1  0  "
-                                 "0 -1  0  0  "
-                                 "0  0  0  1");
-    }
-    (*outFlipFilter)->setOptions(flipOptions);
-    (*outFlipFilter)->setInput(*finalStage);
-    finalStage = *outFlipFilter;
-
+    // No axis-convention transform: the library delivers points in the source's
+    // native (Z-up) orientation, keeping this layer renderer-agnostic. Consumers
+    // that need Y-up apply the Z-up->Y-up rotation in their own model/view matrix.
     return finalStage;
 }
 
@@ -337,16 +323,15 @@ static void extractBounds(pdal::PointViewPtr view, PDALBounds& bbox) {
     bbox.max_z = _bbox.maxz;
 }
 
-int pdal_read_binary(const char* reader_name_backup, const char* filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox){
+int pdal_read_binary(const char* reader_name_backup, const char* filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, const char* out_srs){
 
     try {
         StageFactory factory;
         Stage* filter = nullptr;
-        Stage* flipFilter = nullptr;
 
-        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter);
+        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, {}, out_srs ? out_srs : "");
         if (!finalStage) return PDAL_ERR_CREATE_STAGE;
-        
+
         PointTable table;
         finalStage->prepare(table);
         PointViewSet viewSet = finalStage->execute(table);
@@ -408,13 +393,12 @@ int pdal_read_binary(const char* reader_name_backup, const char* filename, const
 #include <pdal/Streamable.hpp>
 #include <pdal/filters/StreamCallbackFilter.hpp>
 
-int pdal_load_info(const char* reader_name_backup, const char* filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PointViewContextPtr& outView){
+int pdal_load_info(const char* reader_name_backup, const char* filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PointViewContextPtr& outView, const char* out_srs){
     try {
         StageFactory factory;
         Stage* filter = nullptr;
-        Stage* flipFilter = nullptr;
 
-        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter);
+        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, {}, out_srs ? out_srs : "");
         if (!finalStage) return PDAL_ERR_CREATE_STAGE;
 
         auto table = std::make_shared<PointTable>();
@@ -698,7 +682,8 @@ int pdal_read_binary_stream_progressive(
     ProgressCallback onChunk,
     void* context,
     PDALBounds& bbox,
-    const DimensionMap& dimensionMap)
+    const DimensionMap& dimensionMap,
+    const char* out_srs)
 {
     try {
         using namespace pdal;
@@ -708,9 +693,8 @@ int pdal_read_binary_stream_progressive(
 
         StageFactory factory;
         Stage* filter = nullptr;
-        Stage* flipFilter = nullptr;
 
-        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, &flipFilter, dimensionMap);
+        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, dimensionMap, out_srs ? out_srs : "");
         if (!finalStage) return PDAL_ERR_CREATE_STAGE;
 
         bool isStreamable = finalStage->pipelineStreamable();

@@ -82,8 +82,10 @@ int pdal_pipeline_execute(PDALPipeline pipeline);
 // Function to get metadata as a JSON string (needs buffer management)
 int pdal_pipeline_get_metadata_json(PDALPipeline pipeline, char* buffer, size_t buffer_size);
 
-// New function to read LAS file and extract points as separate arrays
-int pdal_read_binary(const char* reader_name_backup, const char* filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox);
+// New function to read LAS file and extract points as separate arrays.
+// out_srs: optional target SRS (e.g. "EPSG:3857") to reproject into. Empty or
+// NULL leaves points in the source's native CRS (no reprojection).
+int pdal_read_binary(const char* reader_name_backup, const char* filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, const char* out_srs = "");
 
 void pdal_free_data(const char* data, PDALDimensionInfo* dimList, size_t dimCount);
 
@@ -111,7 +113,9 @@ typedef struct {
 // Load file info and retain the PointViewContext for later streaming
 // Returns 0 on success, negative error code on failure
 // outView receives a shared_ptr that manages the PointViewContext lifetime automatically
-int pdal_load_info(const char* reader_name_backup, const char* filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PointViewContextPtr& outView);
+// out_srs: optional target SRS (e.g. "EPSG:3857") to reproject into. Empty or
+// NULL leaves points in the source's native CRS (no reprojection).
+int pdal_load_info(const char* reader_name_backup, const char* filename, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, PointViewContextPtr& outView, const char* out_srs = "");
 
 
 // C-compatible callback function type for streaming chunks with context pointer
@@ -128,6 +132,8 @@ typedef bool (*ProgressCallback)(const ChunkData* chunk, void* context);
 //   context: User context pointer passed to callback
 //   bbox: Output parameter for bounds
 //   dimensionMap: Optional map mapping dimension names (e.g., {"band_1": "Z"})
+//   out_srs: Optional target SRS (e.g. "EPSG:3857") to reproject into. Empty
+//            or NULL leaves points in the source's native CRS (no reprojection).
 // Returns: 0 on success, negative error code on failure
 int pdal_read_binary_stream_progressive(
     const char* reader_name_backup,
@@ -136,7 +142,8 @@ int pdal_read_binary_stream_progressive(
     ProgressCallback onChunk,
     void* context,
     PDALBounds& bbox,
-    const DimensionMap& dimensionMap = {});
+    const DimensionMap& dimensionMap = {},
+    const char* out_srs = "");
 
 // Streaming reader that reuses a pre-loaded PointViewContext from pdal_load_info
 // This avoids re-reading the file - use this after calling pdal_load_info
