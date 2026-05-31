@@ -442,6 +442,92 @@ private func nearCornerView(for bounds: Bounds, originShift: SIMD3<Double>) -> (
     #expect(totalResidentPoints == Int(source.info.totalPoints))
 }
 
+@Test func streamingSource_extraDimensions_streamWidenedFloatScalars() async throws {
+    guard let url = loadFixture() else {
+        Issue.record("test.copc.laz fixture missing")
+        return
+    }
+    // Classification is present in every LAS point format, so it is always
+    // an available standard dimension.
+    let source = try await CopcStreamingPointCloudSource.open(url, options: .init(
+        prefetchRoot: false,
+        evictionDelayTicks: 100,
+        driverTickInterval: .milliseconds(10),
+        extraDimensions: ["Classification"]
+    ))
+    defer { source.close() }
+
+    #expect(source.info.availableDimensions.contains("Classification"),
+            "Classification should be advertised as available")
+    #expect(source.info.extraBytesPerPoint == 4,
+            "one requested Float32 dim → 4 extra bytes/point (got \(source.info.extraBytesPerPoint))")
+
+    let (eye, vp) = wideViewMatrix(for: source.info.bounds, originShift: source.info.originShift)
+    source.setBudget(Int.max)
+    source.submit(view: StreamingCameraView(position: eye, viewProjection: vp, pixelScale: 1000))
+
+    var sawChunk = false
+    let deadline = Date().addingTimeInterval(20)
+    while Date() < deadline {
+        try await Task.sleep(for: .milliseconds(50))
+        if let update = source.pollLatest() {
+            for chunk in update.added {
+                sawChunk = true
+                let cls = chunk.extraScalars["Classification"]
+                #expect(cls != nil, "requested Classification should ride on the chunk")
+                #expect(cls?.count == chunk.totalPointCount * 4,
+                        "Classification blob is one Float32 per point")
+                // Classification is a non-negative byte value (0..255) widened to float.
+                cls?.withUnsafeBytes { raw in
+                    let floats = raw.bindMemory(to: Float.self)
+                    for v in floats {
+                        #expect(v >= 0 && v <= 255 && v == v.rounded(),
+                                "classification widened cleanly to an integral float in [0,255] (got \(v))")
+                    }
+                }
+            }
+        }
+        let snap = await source._debugSnapshot()
+        if snap.resident == snap.wanted && snap.inFlight == 0 && snap.wanted > 0 { break }
+    }
+    #expect(sawChunk, "at least one chunk should have become resident")
+}
+
+@Test func streamingSource_default_carriesNoExtraScalars() async throws {
+    guard let url = loadFixture() else {
+        Issue.record("test.copc.laz fixture missing")
+        return
+    }
+    // Back-compat: the default (no extraDimensions) preserves the exact
+    // position+color-only path — chunks carry no extra scalars.
+    let source = try await CopcStreamingPointCloudSource.open(url, options: .init(
+        prefetchRoot: false,
+        evictionDelayTicks: 100,
+        driverTickInterval: .milliseconds(10)
+    ))
+    defer { source.close() }
+
+    #expect(source.info.extraBytesPerPoint == 0,
+            "no requested dims → 0 extra bytes/point")
+
+    let (eye, vp) = wideViewMatrix(for: source.info.bounds, originShift: source.info.originShift)
+    source.setBudget(Int.max)
+    source.submit(view: StreamingCameraView(position: eye, viewProjection: vp, pixelScale: 1000))
+
+    let deadline = Date().addingTimeInterval(20)
+    while Date() < deadline {
+        try await Task.sleep(for: .milliseconds(50))
+        if let update = source.pollLatest() {
+            for chunk in update.added {
+                #expect(chunk.extraScalars.isEmpty,
+                        "default path must not populate extraScalars")
+            }
+        }
+        let snap = await source._debugSnapshot()
+        if snap.resident == snap.wanted && snap.inFlight == 0 && snap.wanted > 0 { break }
+    }
+}
+
 @Test func streamingSource_evictsWhenCameraLeaves() async throws {
     guard let url = loadFixture() else {
         Issue.record("test.copc.laz fixture missing")

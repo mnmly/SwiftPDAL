@@ -719,7 +719,14 @@ public enum PDALConvert {
     private static func writerExtras(for url: URL) -> [String: PDALValue] {
         switch normalizedExtension(url) {
         case "laz":
-            return ["compression": .string("laszip")]
+            // `extra_dims: "all"` carries any non-standard per-point dimensions
+            // (e.g. `semantic`, `instance`, `score`) through as LAS Extra Bytes.
+            // Without it the LAS-family writer silently drops them on convert.
+            return ["compression": .string("laszip"), "extra_dims": .string("all")]
+        case "copc.laz":
+            // writers.copc is always laszip; it inherits the LAS-family default
+            // of dropping custom dims, so opt them in here too.
+            return ["extra_dims": .string("all")]
         default:
             return [:]
         }

@@ -28,6 +28,10 @@ enum ChunkPacker {
         var xyzHigh: Data
         var colors: Data
         var levels: Data
+        /// Optional per-point scalar dimensions (Float32), Morton-reordered to
+        /// match the packed positions/colors. Keyed by dimension name. Empty
+        /// unless extra dims were requested.
+        var extraScalars: [String: Data] = [:]
     }
 
     /// Pack a single COPC node's worth of points.
@@ -45,6 +49,9 @@ enum ChunkPacker {
         count: Int,
         hasRgb: Bool,
         originShift: SIMD3<Double>,
+        extra: UnsafePointer<Float>? = nil,
+        extraCount: Int = 0,
+        extraNames: [String] = [],
         pointsPerBatch: Int = defaultPointsPerBatch,
         lodLevels: Int = defaultLODLevels,
         coarseVoxelDivisions: Int = defaultCoarseVoxelDivisions
@@ -153,13 +160,29 @@ enum ChunkPacker {
             for i in 0..<count { colors[i] = 0xFFFFFFFF }
         }
 
+        // Permute requested extra scalars into Morton order (dim-major input:
+        // extra[d*count + srcIndex]) so each dim lines up with the packed
+        // positions/colors. Each output blob is `count` Float32.
+        var extraScalars: [String: Data] = [:]
+        if let extra, extraCount > 0, extraCount == extraNames.count {
+            for (d, name) in extraNames.enumerated() {
+                let base = d * count
+                var col = [Float](repeating: 0, count: count)
+                for (dstIndex, srcIndex) in order.enumerated() {
+                    col[dstIndex] = extra[base + srcIndex]
+                }
+                extraScalars[name] = Data(buffer: UnsafeBufferPointer(start: col, count: count))
+            }
+        }
+
         return Output(
             batches: batches,
             xyzLow:  Data(buffer: UnsafeBufferPointer(start: xyzLow,  count: count)),
             xyzMed:  Data(buffer: UnsafeBufferPointer(start: xyzMed,  count: count)),
             xyzHigh: Data(buffer: UnsafeBufferPointer(start: xyzHigh, count: count)),
             colors:  Data(buffer: UnsafeBufferPointer(start: colors,  count: count)),
-            levels:  Data(levels)
+            levels:  Data(levels),
+            extraScalars: extraScalars
         )
     }
 }

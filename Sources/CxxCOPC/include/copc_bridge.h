@@ -28,6 +28,35 @@ struct NodeInfo {
     int32_t byte_size = 0;
 };
 
+// One custom "Extra Bytes" dimension declared in the file's Extra Bytes VLR.
+// Filled by Reader::eb_field_at. `offset` is the byte offset of this field
+// within a point's ExtraBytes() blob; `data_type` is the LAS Extra Bytes type
+// code; `size` is the element byte size; `scale`/`offset_value` are applied
+// (value = raw*scale + offset_value) when the VLR's option bits request it,
+// else default to 1/0.
+struct EbFieldInfo {
+    char    name[32] = {0};   // null-padded UTF-8 (LAS EB names are <= 32 bytes)
+    int32_t byte_offset = 0;
+    int32_t data_type = 0;
+    int32_t size = 0;
+    double  scale = 1.0;
+    double  offset_value = 0.0;
+};
+
+// A resolved request for one extra per-point scalar, built by the Swift layer
+// from the file schema and passed to read_node. kind 0 = standard LAS accessor
+// (use `code`); kind 1 = extra-bytes field (slice `size` bytes at `byte_offset`,
+// interpret per `data_type`, then value = raw*scale + offset_value).
+struct ExtractDesc {
+    int32_t kind = 0;
+    int32_t code = 0;
+    int32_t byte_offset = 0;
+    int32_t data_type = 0;
+    int32_t size = 0;
+    double  scale = 1.0;
+    double  offset_value = 0.0;
+};
+
 // Decoded chunk: world-space doubles + 16-bit RGB (LAS convention).
 //
 // Owned by value; returned by-value from Reader::read_node. Marked
@@ -47,16 +76,23 @@ public:
     // Pointer is valid for the lifetime of this ChunkData.
     const double*   xyz_data() const { return xyz.data(); }
     const uint16_t* rgb_data() const { return rgb.data(); }
+    // Optional per-point scalar dimensions, widened to float, laid out
+    // dim-major: extra[d * point_count + i]. Empty unless read_node was
+    // asked for extra dims (opt-in; never populated for the default path).
+    const float*    extra_data() const { return extra.data(); }
 
     int32_t point_count() const { return point_count_; }
     bool    has_rgb() const     { return has_rgb_; }
+    int32_t extra_dim_count() const { return extra_dim_count_; }
 
     // Public so the bridge impl can fill these directly; not intended for
     // Swift mutation (Swift only sees const accessors above).
     std::vector<double>   xyz;
     std::vector<uint16_t> rgb;
+    std::vector<float>    extra;            // count * extra_dim_count_, dim-major
     int32_t point_count_ = 0;
     bool    has_rgb_     = false;
+    int32_t extra_dim_count_ = 0;
 } SWIFT_NONCOPYABLE;
 
 class Reader;
@@ -93,11 +129,27 @@ public:
     // otherwise.
     bool node_at(int32_t index, NodeInfo& out) const noexcept;
 
+    // LAS point format id of the open file (0..10), or -1 if closed. Drives
+    // which standard per-point dimensions are present (Swift maps this to the
+    // standard-dimension name set).
+    int8_t point_format_id() const noexcept;
+
+    // Count of custom Extra Bytes dimensions declared in the file's EB VLR.
+    int32_t eb_field_count() const noexcept;
+
+    // Fills `out` with the `index`-th Extra Bytes field's schema. Returns
+    // false if index is out of range.
+    bool eb_field_at(int32_t index, EbFieldInfo& out) const noexcept;
+
     // Decode the node at (depth, x, y, z) using FileReader slot `slot`.
     // Returns an empty ChunkData (point_count() == 0) on failure or if
-    // the node is not present in the hierarchy.
+    // the node is not present in the hierarchy. When `desc_count > 0`,
+    // additionally extracts the requested per-point scalars (widened to
+    // float, dim-major) into ChunkData::extra. `descs == nullptr` /
+    // `desc_count == 0` ⇒ the original position+color-only path, verbatim.
     ChunkData read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
-                        int32_t slot) noexcept;
+                        int32_t slot,
+                        const ExtractDesc* descs, int32_t desc_count) noexcept;
 
     // Drop the underlying file readers + caches. Subsequent calls become
     // no-ops returning failure / zero. Idempotent. The Reader itself

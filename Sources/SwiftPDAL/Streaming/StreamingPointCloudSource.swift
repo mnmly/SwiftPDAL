@@ -5,6 +5,45 @@ import CxxStdlib
 
 typealias CopcReader = swiftpdal.copc.Reader
 typealias CopcNodeInfo = swiftpdal.copc.NodeInfo
+typealias CopcEbFieldInfo = swiftpdal.copc.EbFieldInfo
+typealias CopcExtractDesc = swiftpdal.copc.ExtractDesc
+
+// MARK: - Standard LAS dimension table
+
+/// Standard per-point LAS dimensions that can be streamed by name. The raw
+/// `code` is shared verbatim with the C++ `read_node` accessor switch. Names
+/// match the resident-path / PDAL dimension names so the same graph applies to
+/// both sources.
+enum StandardLasDim: Int32, CaseIterable {
+    case classification = 0
+    case intensity = 1
+    case returnNumber = 2
+    case numberOfReturns = 3
+    case scanAngle = 4
+    case userData = 5
+    case pointSourceId = 6
+    case gpsTime = 7
+
+    var name: String {
+        switch self {
+        case .classification: return "Classification"
+        case .intensity: return "Intensity"
+        case .returnNumber: return "ReturnNumber"
+        case .numberOfReturns: return "NumberOfReturns"
+        case .scanAngle: return "ScanAngleRank"
+        case .userData: return "UserData"
+        case .pointSourceId: return "PointSourceId"
+        case .gpsTime: return "GpsTime"
+        }
+    }
+
+    /// Standard dims present for a given LAS point format id. GPS time is
+    /// absent from formats 0 and 2; everything else is in every format.
+    static func present(forPointFormat fmt: Int8) -> [StandardLasDim] {
+        let hasGps = !(fmt == 0 || fmt == 2)
+        return StandardLasDim.allCases.filter { $0 != .gpsTime || hasGps }
+    }
+}
 
 // MARK: - Identity
 
@@ -79,8 +118,17 @@ public struct StreamingSourceInfo: Sendable {
     public let pointsPerBatch: Int
     /// On-GPU byte cost per point: `xyzLow(4) + xyzMed(4) + xyzHigh(4)
     /// + colors(4) + levels(1) = 17`. Multiply by point count to predict
-    /// VRAM footprint.
+    /// VRAM footprint. Unaffected by extra dimensions (those ride host-side).
     public let bytesPerPoint: Int
+    /// Per-point dimension names available to stream alongside position+color:
+    /// the standard LAS dims present for this file's point format plus every
+    /// custom Extra Bytes dimension declared in the file. Use to populate an
+    /// attribute picker or validate a requested set.
+    public let availableDimensions: [String]
+    /// Host-side byte cost per point of the *requested* extra dimensions
+    /// (`4 * requestedDimensionCount`), accounted separately from
+    /// ``bytesPerPoint``. `0` when no extra dimensions were requested.
+    public let extraBytesPerPoint: Int
 }
 
 // MARK: - Camera
@@ -219,6 +267,11 @@ public struct ResidentChunk: Sendable {
     /// Per-point LOD level, one `UInt8` per point. `0` = coarsest
     /// (visible at distance), `levelsCount - 1` = finest.
     public let levels: Data
+    /// Optional per-point scalar dimensions (Float32, one per point), keyed by
+    /// dimension name and Morton-reordered to match ``xyzLow``/``colors``.
+    /// Empty unless extra dimensions were requested via
+    /// ``StreamingOptions/extraDimensions``.
+    public let extraScalars: [String: Data]
 
     /// Total points in this chunk (sum of `batches[i].numPoints`).
     public var totalPointCount: Int { batches.reduce(0) { $0 + Int($1.numPoints) } }
@@ -331,6 +384,17 @@ public struct StreamingOptions: Sendable {
     /// coverage. 256 px per chunk is a reasonable default for
     /// per-point density on a typical desktop display.
     public var targetChunkScreenSize: Float
+    /// Per-point dimension names to stream alongside position+color, by name
+    /// (standard LAS dims like `"Classification"`/`"Intensity"`, or custom
+    /// Extra Bytes dimension names). **Opt-in:** empty (the default) preserves
+    /// the exact position+color-only path. Names not present in the file are
+    /// dropped (see ``StreamingSourceInfo/availableDimensions``).
+    public var extraDimensions: [String]
+    /// If `true`, stream **every** dimension in
+    /// ``StreamingSourceInfo/availableDimensions`` (ignoring
+    /// ``extraDimensions``). For inspector/spreadsheet use that wants all
+    /// attributes without scanning a graph. Default `false`.
+    public var requestAllAvailableDimensions: Bool
 
     /// Create a configuration.
     ///
@@ -344,6 +408,9 @@ public struct StreamingOptions: Sendable {
     ///   - residencyPolicy: Wanted-set construction strategy.
     ///   - targetChunkScreenSize: Pixels per chunk target for LOD
     ///     selection. See ``targetChunkScreenSize``.
+    ///   - extraDimensions: Per-point dimension names to stream (opt-in;
+    ///     empty preserves the position+color-only path).
+    ///   - requestAllAvailableDimensions: Stream every available dimension.
     public init(
         maxInFlightLoads: Int = 4,
         decodeConcurrency: Int = 4,
@@ -352,7 +419,9 @@ public struct StreamingOptions: Sendable {
         evictionDelayTicks: Int = 5,
         driverTickInterval: Duration = .milliseconds(100),
         residencyPolicy: ResidencyPolicy = .frustumFirstThenHalo,
-        targetChunkScreenSize: Float = 256
+        targetChunkScreenSize: Float = 256,
+        extraDimensions: [String] = [],
+        requestAllAvailableDimensions: Bool = false
     ) {
         self.maxInFlightLoads = maxInFlightLoads
         self.decodeConcurrency = decodeConcurrency
@@ -362,6 +431,8 @@ public struct StreamingOptions: Sendable {
         self.driverTickInterval = driverTickInterval
         self.residencyPolicy = residencyPolicy
         self.targetChunkScreenSize = targetChunkScreenSize
+        self.extraDimensions = extraDimensions
+        self.requestAllAvailableDimensions = requestAllAvailableDimensions
     }
 }
 
@@ -606,6 +677,13 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
     private let handleBox: SendableCopcReader
     private let originShift: SIMD3<Double>
     private let workerCount: Int
+    /// Resolved extra-dimension extraction descriptors (parallel to
+    /// ``extraNames``), passed to `read_node` on every decode. Empty for the
+    /// default position+color-only path.
+    private let extraDescs: [CopcExtractDesc]
+    /// Names of the requested extra dimensions, in the same order as
+    /// ``extraDescs`` — used to key each chunk's `extraScalars`.
+    private let extraNames: [String]
     private var driverTask: Task<Void, Never>?
     private var workerTasks: [Task<Void, Never>] = []
 
@@ -616,7 +694,9 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         jobs: JobQueue,
         handle: SendableCopcReader,
         originShift: SIMD3<Double>,
-        workerCount: Int
+        workerCount: Int,
+        extraDescs: [CopcExtractDesc],
+        extraNames: [String]
     ) {
         self.info = info
         self.driver = driver
@@ -625,6 +705,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         self.handleBox = handle
         self.originShift = originShift
         self.workerCount = workerCount
+        self.extraDescs = extraDescs
+        self.extraNames = extraNames
     }
 
     /// Open a COPC file and parse its octree hierarchy.
@@ -733,13 +815,63 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             max: SIMD3<Float>(Float(bMax[0]), Float(bMax[1]), Float(bMax[2]))
         )
 
+        // Resolve the streamable dimension schema: standard LAS dims present
+        // for this point format + custom Extra Bytes fields. Then build the
+        // requested extraction descriptors (opt-in — empty unless requested).
+        let standard = StandardLasDim.present(forPointFormat: reader.point_format_id())
+        var ebNames: [String] = []
+        var ebDescByName: [String: CopcExtractDesc] = [:]
+        for i in 0..<reader.eb_field_count() {
+            var f = CopcEbFieldInfo()
+            guard reader.eb_field_at(i, &f) else { continue }
+            let name = withUnsafeBytes(of: f.name) { raw -> String in
+                String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+            }
+            guard f.size > 0, !name.isEmpty else { continue }  // skip undocumented/array EB
+            var d = CopcExtractDesc()
+            d.kind = 1
+            d.byte_offset = f.byte_offset
+            d.data_type = f.data_type
+            d.size = f.size
+            d.scale = f.scale
+            d.offset_value = f.offset_value
+            ebNames.append(name)
+            ebDescByName[name] = d
+        }
+        let availableDimensions = standard.map(\.name) + ebNames
+
+        let requestedNames: [String]
+        if options.requestAllAvailableDimensions {
+            requestedNames = availableDimensions
+        } else {
+            let avail = Set(availableDimensions)
+            requestedNames = options.extraDimensions.filter { avail.contains($0) }
+        }
+        let standardByName = Dictionary(uniqueKeysWithValues: standard.map { ($0.name, $0) })
+        var extraDescs: [CopcExtractDesc] = []
+        var extraNames: [String] = []
+        for name in requestedNames {
+            if let std = standardByName[name] {
+                var d = CopcExtractDesc()
+                d.kind = 0
+                d.code = std.rawValue
+                extraDescs.append(d)
+                extraNames.append(name)
+            } else if let d = ebDescByName[name] {
+                extraDescs.append(d)
+                extraNames.append(name)
+            }
+        }
+
         let info = StreamingSourceInfo(
             bounds: bounds,
             originShift: originShift,
             totalPoints: UInt64(totalPoints),
             maxDepth: maxDepth,
             pointsPerBatch: ChunkPacker.defaultPointsPerBatch,
-            bytesPerPoint: 17
+            bytesPerPoint: 17,
+            availableDimensions: availableDimensions,
+            extraBytesPerPoint: 4 * extraNames.count
         )
 
         let queue = UpdateQueue()
@@ -762,7 +894,9 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             jobs: jobs,
             handle: handleBox,
             originShift: originShift,
-            workerCount: workerCount
+            workerCount: workerCount,
+            extraDescs: extraDescs,
+            extraNames: extraNames
         )
         source.startDriver()
         return source
@@ -781,6 +915,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         let jobs = self.jobs
         let handleBox = self.handleBox
         let originShift = self.originShift
+        let extraDescs = self.extraDescs
+        let extraNames = self.extraNames
         let workers = (0..<workerCount).map { slot in
             Task.detached(priority: .utility) {
                 let slotIndex = Int32(slot)
@@ -790,7 +926,9 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                         reader: handleBox.reader,
                         slot: slotIndex,
                         id: id,
-                        originShift: originShift
+                        originShift: originShift,
+                        extraDescs: extraDescs,
+                        extraNames: extraNames
                     )
                     await driver.completeLoad(id: id, chunk: chunk)
                 }
@@ -1211,35 +1349,47 @@ actor StreamingDriver {
         reader: CopcReader,
         slot: Int32,
         id: ChunkID,
-        originShift: SIMD3<Double>
+        originShift: SIMD3<Double>,
+        extraDescs: [CopcExtractDesc],
+        extraNames: [String]
     ) -> ResidentChunk? {
-        let chunk = reader.read_node(
-            Int32(id.depth), Int32(id.x), Int32(id.y), Int32(id.z),
-            slot
-        )
-        let count = Int(chunk.point_count())
-        guard count > 0 else { return nil }
+        // The decoded chunk is ~Copyable; do everything that touches it inside
+        // the descriptor buffer's scope so the C++ ChunkData stays alive while
+        // ChunkPacker reads its raw pointers.
+        extraDescs.withUnsafeBufferPointer { descBuf -> ResidentChunk? in
+            let chunk = reader.read_node(
+                Int32(id.depth), Int32(id.x), Int32(id.y), Int32(id.z),
+                slot, descBuf.baseAddress, Int32(descBuf.count)
+            )
+            let count = Int(chunk.point_count())
+            guard count > 0 else { return nil }
 
-        // xyz_data() / rgb_data() return raw const pointers into the
-        // ChunkData's std::vector storage; the chunk stays alive on this
-        // frame so the pointers remain valid through ChunkPacker.pack.
-        let packed = ChunkPacker.pack(
-            positionsXYZ: chunk.__xyz_dataUnsafe()!,
-            rgb16: chunk.__rgb_dataUnsafe()!,
-            count: count,
-            hasRgb: chunk.has_rgb(),
-            originShift: originShift
-        )
+            // xyz_data() / rgb_data() / extra_data() return raw const pointers
+            // into the ChunkData's std::vector storage; the chunk stays alive
+            // on this frame so the pointers remain valid through ChunkPacker.
+            let extraDimCount = Int(chunk.extra_dim_count())
+            let packed = ChunkPacker.pack(
+                positionsXYZ: chunk.__xyz_dataUnsafe()!,
+                rgb16: chunk.__rgb_dataUnsafe()!,
+                count: count,
+                hasRgb: chunk.has_rgb(),
+                originShift: originShift,
+                extra: extraDimCount > 0 ? chunk.__extra_dataUnsafe() : nil,
+                extraCount: extraDimCount,
+                extraNames: extraNames
+            )
 
-        return ResidentChunk(
-            id: id,
-            batches: packed.batches,
-            xyzLow: packed.xyzLow,
-            xyzMed: packed.xyzMed,
-            xyzHigh: packed.xyzHigh,
-            colors: packed.colors,
-            levels: packed.levels
-        )
+            return ResidentChunk(
+                id: id,
+                batches: packed.batches,
+                xyzLow: packed.xyzLow,
+                xyzMed: packed.xyzMed,
+                xyzHigh: packed.xyzHigh,
+                colors: packed.colors,
+                levels: packed.levels,
+                extraScalars: packed.extraScalars
+            )
+        }
     }
 }
 

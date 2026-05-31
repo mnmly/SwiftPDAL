@@ -11,6 +11,7 @@
 #include <copc-lib/las/point.hpp>
 #include <copc-lib/las/points.hpp>
 #include <copc-lib/las/utils.hpp>
+#include <copc-lib/las/vlr.hpp>
 
 #include <lazperf/lazperf.hpp>
 
@@ -200,8 +201,62 @@ struct Reader::Impl {
     std::vector<std::vector<char>> scratch; // reusable decompressed-bytes buffer per slot
     std::vector<::copc::Node> nodes;
     ::copc::las::LasHeader header;
+    std::vector<EbFieldInfo> eb_fields;  // resolved Extra Bytes schema
     bool closed = false;
 };
+
+// Byte size of a LAS Extra Bytes data_type code (0 / array types → 0 = skip).
+static int32_t eb_type_size(uint8_t dt) noexcept {
+    switch (dt) {
+        case 1: case 2: return 1;            // uint8 / int8
+        case 3: case 4: return 2;            // uint16 / int16
+        case 5: case 6: case 9: return 4;    // uint32 / int32 / float
+        case 7: case 8: case 10: return 8;   // uint64 / int64 / double
+        default: return 0;                   // undocumented / 2D-3D arrays — unsupported
+    }
+}
+
+// Reinterpret `size` bytes at `p` as data_type `dt`, widened to float.
+static float eb_read_float(const uint8_t* p, uint8_t dt) noexcept {
+    switch (dt) {
+        case 1:  { uint8_t  v; std::memcpy(&v, p, 1); return float(v); }
+        case 2:  { int8_t   v; std::memcpy(&v, p, 1); return float(v); }
+        case 3:  { uint16_t v; std::memcpy(&v, p, 2); return float(v); }
+        case 4:  { int16_t  v; std::memcpy(&v, p, 2); return float(v); }
+        case 5:  { uint32_t v; std::memcpy(&v, p, 4); return float(v); }
+        case 6:  { int32_t  v; std::memcpy(&v, p, 4); return float(v); }
+        case 7:  { uint64_t v; std::memcpy(&v, p, 8); return float(v); }
+        case 8:  { int64_t  v; std::memcpy(&v, p, 8); return float(v); }
+        case 9:  { float    v; std::memcpy(&v, p, 4); return v; }
+        case 10: { double   v; std::memcpy(&v, p, 8); return float(v); }
+        default: return 0.0f;
+    }
+}
+
+// Build the Extra Bytes schema (name/offset/type/size/scale/offset) from the
+// file's EB VLR, computing each field's byte offset within a point's
+// ExtraBytes() blob as the running sum of preceding field sizes.
+static std::vector<EbFieldInfo> build_eb_fields(const ::copc::las::EbVlr& vlr) {
+    std::vector<EbFieldInfo> out;
+    int32_t offset = 0;
+    for (const auto& f : vlr.items) {
+        EbFieldInfo e;
+        const std::string& nm = f.name;
+        const size_t n = std::min(nm.size(), size_t{31});
+        std::memcpy(e.name, nm.data(), n);
+        e.name[n] = '\0';
+        e.data_type   = f.data_type;
+        e.size        = eb_type_size(f.data_type);
+        e.byte_offset = offset;
+        // LAS Extra Bytes option bits: 0x08 = scale present, 0x10 = offset present.
+        e.scale        = (f.options & 0x08) ? f.scale[0]  : 1.0;
+        e.offset_value = (f.options & 0x10) ? f.offset[0] : 0.0;
+        out.push_back(e);
+        // Advance by the on-disk size (undocumented/type 0 uses `options` bytes).
+        offset += e.size > 0 ? e.size : int32_t(f.options);
+    }
+    return out;
+}
 
 Reader::~Reader() {
     delete impl_;
@@ -220,6 +275,7 @@ Reader* Reader::open(const std::string& path, int32_t pool_size) noexcept {
         }
         r->impl_->nodes  = r->impl_->readers[0]->GetAllNodes();
         r->impl_->header = r->impl_->readers[0]->CopcConfig().LasHeader();
+        r->impl_->eb_fields = build_eb_fields(r->impl_->readers[0]->CopcConfig().ExtraBytesVlr());
         return r;
     } catch (const std::exception&) {
         return nullptr;
@@ -248,6 +304,7 @@ Reader* Reader::open_http(const std::string& url, int32_t pool_size) noexcept {
         }
         r->impl_->nodes  = r->impl_->readers[0]->GetAllNodes();
         r->impl_->header = r->impl_->readers[0]->CopcConfig().LasHeader();
+        r->impl_->eb_fields = build_eb_fields(r->impl_->readers[0]->CopcConfig().ExtraBytesVlr());
         return r;
     } catch (const std::exception&) {
         return nullptr;
@@ -312,8 +369,24 @@ bool Reader::node_at(int32_t index, NodeInfo& out) const noexcept {
     return true;
 }
 
+int8_t Reader::point_format_id() const noexcept {
+    if (impl_->closed) return -1;
+    return impl_->header.PointFormatId();
+}
+
+int32_t Reader::eb_field_count() const noexcept {
+    return static_cast<int32_t>(impl_->eb_fields.size());
+}
+
+bool Reader::eb_field_at(int32_t index, EbFieldInfo& out) const noexcept {
+    if (index < 0 || static_cast<size_t>(index) >= impl_->eb_fields.size()) return false;
+    out = impl_->eb_fields[static_cast<size_t>(index)];
+    return true;
+}
+
 ChunkData Reader::read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
-                            int32_t slot) noexcept {
+                            int32_t slot,
+                            const ExtractDesc* descs, int32_t desc_count) noexcept {
     ChunkData out;
     if (impl_->closed) return out;
     if (slot < 0 || static_cast<size_t>(slot) >= impl_->readers.size()) return out;
@@ -373,6 +446,45 @@ ChunkData Reader::read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
             std::fill(out.rgb.begin(), out.rgb.end(), uint16_t{0});
             out.has_rgb_ = false;
         }
+
+        // Optional per-point scalar dimensions (opt-in). dim-major float layout:
+        // extra[d*n + i]. desc_count == 0 ⇒ no work (original path).
+        if (descs != nullptr && desc_count > 0) {
+            out.extra.assign(static_cast<size_t>(n) * static_cast<size_t>(desc_count), 0.0f);
+            for (int32_t i = 0; i < n; ++i) {
+                const auto& p = points[static_cast<size_t>(i)];
+                std::vector<uint8_t> ebBytes;
+                bool fetchedEb = false;
+                for (int32_t d = 0; d < desc_count; ++d) {
+                    const ExtractDesc& dd = descs[d];
+                    double v = 0.0;
+                    if (dd.kind == 0) {
+                        switch (dd.code) {
+                            case 0: v = double(p->Classification());   break;
+                            case 1: v = double(p->Intensity());        break;
+                            case 2: v = double(p->ReturnNumber());     break;
+                            case 3: v = double(p->NumberOfReturns());  break;
+                            case 4: v = double(p->ScanAngle());        break;
+                            case 5: v = double(p->UserData());         break;
+                            case 6: v = double(p->PointSourceId());    break;
+                            case 7: v = p->GPSTime();                  break;
+                            default: v = 0.0;                          break;
+                        }
+                    } else if (dd.kind == 1 && dd.size > 0) {
+                        if (!fetchedEb) { ebBytes = p->ExtraBytes(); fetchedEb = true; }
+                        const int32_t end = dd.byte_offset + dd.size;
+                        if (dd.byte_offset >= 0 && end <= static_cast<int32_t>(ebBytes.size())) {
+                            const float raw = eb_read_float(ebBytes.data() + dd.byte_offset,
+                                                            static_cast<uint8_t>(dd.data_type));
+                            v = double(raw) * dd.scale + dd.offset_value;
+                        }
+                    }
+                    out.extra[static_cast<size_t>(d) * static_cast<size_t>(n) + static_cast<size_t>(i)] = float(v);
+                }
+            }
+            out.extra_dim_count_ = desc_count;
+        }
+
         out.point_count_ = n;
         return out;
     } catch (const std::exception&) {

@@ -41,6 +41,31 @@ import Foundation
     print("Converted ply→laz, points=\(result.pointCount)")
 }
 
+@Test func convertPreservesExtraDimensionsAsExtraBytes() async throws {
+    setenv("SWIFTPDAL_TESTING", "1", 1)
+    guard let input = Bundle.module.path(forResource: "test", ofType: "laz") else {
+        Issue.record("test.laz missing from bundle"); return
+    }
+    let inputURL = URL(fileURLWithPath: input)
+    let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("extradims-\(UUID().uuidString).copc.laz")
+    defer { try? FileManager.default.removeItem(at: outputURL) }
+
+    // Ferry X into a non-standard dimension. The inferred COPC writer must
+    // carry it through as Extra Bytes — regression for `writerExtras` setting
+    // `extra_dims: "all"`. Without that flag the LAS-family writer silently
+    // drops `my_score`, so a graph that filters on it would see nothing.
+    let options = ConvertOptions(
+        filters: [PDALStage("filters.ferry", ["dimensions": .string("X=>my_score")])],
+        streaming: false
+    )
+    _ = try PDALConvert.convert(from: inputURL, to: outputURL, options: options)
+
+    let pc = try PointCloud.read(from: outputURL.path, readerName: "readers.copc")
+    #expect(pc.dimensions.contains { $0.name == "my_score" },
+            "ferried custom dim should survive conversion as Extra Bytes (got \(pc.dimensions.map(\.name)))")
+}
+
 @Test func convertReportsProgress() async throws {
     setenv("SWIFTPDAL_TESTING", "1", 1)
     guard let input = Bundle.module.path(forResource: "test", ofType: "laz") else {
