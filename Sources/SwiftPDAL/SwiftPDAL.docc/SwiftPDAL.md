@@ -92,6 +92,22 @@ once with `pdal translate in.las out.copc.laz --writers.copc`.
 - ``PointCloudData``
 - ``PointCloudError``
 
+### GPU-ready de-interleaved buffers (Struct-of-Arrays)
+
+An additive, non-destructive export of a bulk-read ``PointCloud`` into
+de-interleaved `Float32` buffers — one per dimension, plus packed,
+centered `position` and normalized `color` — ready for a Metal compute
+consumer with no CPU de-interleave pass. A GPU (Metal scatter) and a
+vectorized CPU backend produce identical output; ``DeinterleaveBackend/auto``
+picks the faster for the point count.
+
+- ``PointCloud/deinterleavedGeometry(device:backend:wideningIntegersToFloat:options:)``
+- ``PointCloud/deinterleavedGeometryCPU(wideningIntegersToFloat:)``
+- ``DeinterleavedGeometry``
+- ``DeinterleavedRawGeometry``
+- ``DeinterleaveBackend``
+- ``PointCloud/deinterleaveAutoGPUThreshold``
+
 ### Format conversion
 
 `pdal convert`-equivalent API for synthesising and executing a

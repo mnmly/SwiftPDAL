@@ -72,6 +72,32 @@ public struct DimensionInfo: Sendable {
         self.outputSize = cInfo.outputSize
         self.offset = cInfo.offset
     }
+
+    /// Creates a dimension descriptor directly from its fields.
+    ///
+    /// This mirrors the layout PDAL produces (see ``PointCloud/read(from:readerName:outSrs:)``)
+    /// and is primarily useful for constructing synthetic point clouds in tests
+    /// or for callers that already know a buffer's interleaved layout.
+    ///
+    /// - Parameters:
+    ///   - name: The dimension's name (e.g. `"X"`, `"Red"`, `"semantic"`).
+    ///   - sourceType: The element type the reader produced the value in.
+    ///   - outputType: The element type stored in the interleaved buffer. PDAL
+    ///     narrows `Double` source values to `Float` here, so this is never
+    ///     `Double` for buffers produced by ``PointCloud/read(from:readerName:outSrs:)``.
+    ///   - outputSize: The byte width of `outputType`.
+    ///   - offset: The byte offset of this dimension within one point's stride.
+    public init(name: String,
+                sourceType: pdal.Dimension.`Type`,
+                outputType: pdal.Dimension.`Type`,
+                outputSize: Int,
+                offset: Int) {
+        self.name = name
+        self.sourceType = sourceType
+        self.outputType = outputType
+        self.outputSize = outputSize
+        self.offset = offset
+    }
 }
 
 public final class PointCloud: PointCloudData {
