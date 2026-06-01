@@ -130,31 +130,49 @@ public final class PointCloud: PointCloudData {
     }
 
     public static func getPaths(isTesting: Bool) -> (projDBURL: String, driversURL: String) {
+        // PROJ_DATA must point at the directory holding the bundled
+        // `proj.db`. Locate the file directly via `Bundle.module` rather
+        // than assuming a bundle layout — the on-disk shape differs across
+        // consumers: a flat SPM resource bundle (`swift run`, tests, plain
+        // executables) keeps resources at the bundle root, while the
+        // shipped macOS `.framework` nests them under `Contents/Resources/`.
+        // `url(forResource:withExtension:)` resolves both, so no
+        // `SWIFTPDAL_TESTING` workaround is needed off the test path.
+        let projDBURL: String
+        if let dbURL = Bundle.module.url(forResource: "proj", withExtension: "db") {
+            projDBURL = dbURL.deletingLastPathComponent().path()
+        } else {
+            // Defensive fallback to the historical layout assumptions if
+            // the resource lookup ever fails.
+            #if os(iOS)
+            projDBURL = Bundle.module.bundleURL.path()
+            #else
+            projDBURL = isTesting
+                ? (Bundle.module.bundlePath as NSString).deletingLastPathComponent
+                    .appending("/SwiftPDAL_SwiftPDAL.bundle")
+                : Bundle.module.bundleURL.appendingPathComponent("Contents/Resources").path()
+            #endif
+        }
+
+        // PDAL_DRIVER_PATH governs only optional loadable plugins; the core
+        // LAS/COPC/stats drivers are statically linked. Its location tracks
+        // the bundle layout, so it stays branch-specific.
+        let driversURL: String
         if isTesting {
-            let bundlePath = Bundle.module.bundlePath as NSString
-            let projDBURL = bundlePath.deletingLastPathComponent
-                .appending("/SwiftPDAL_SwiftPDAL.bundle")
-            let driversURL = Bundle.module.bundleURL.deletingLastPathComponent()
+            driversURL = Bundle.module.bundleURL.deletingLastPathComponent()
                 .appendingPathComponent("pdalcpp.framework/Versions/A/PlugIns").path()
-            return (projDBURL, driversURL)
         } else {
             #if os(iOS)
-            // iOS bundles are flat — resources sit directly under the
-            // .bundle root, not under Contents/Resources/. And there's
-            // no PlugIns dir because pdalcpp is statically linked on
-            // iOS (no loadable dylib plugins to discover); pass empty
-            // driversURL to disable PDAL's plugin search.
-            let projDBURL = Bundle.module.bundleURL.path()
-            let driversURL = ""
+            // iOS statically links pdalcpp — no dylib plugins to discover;
+            // an empty path disables PDAL's plugin search.
+            driversURL = ""
             #else
-            // macOS dynamic-framework layout (Versions/A/Resources/ etc.).
-            let projDBURL = Bundle.module.bundleURL.appendingPathComponent("Contents/Resources").path()
-            let driversURL = Bundle.module.bundleURL.deletingLastPathComponent()
+            driversURL = Bundle.module.bundleURL.deletingLastPathComponent()
                 .deletingLastPathComponent()
                 .appendingPathComponent("Frameworks/pdalcpp.framework/Versions/A/PlugIns").path()
             #endif
-            return (projDBURL, driversURL)
         }
+        return (projDBURL, driversURL)
     }
 
     public static func read(from path: String, readerName: String = "readers.text", outSrs: String = "") throws -> PointCloud {

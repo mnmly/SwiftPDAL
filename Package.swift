@@ -205,6 +205,17 @@ let package = Package(
             ]
         ),
 
+        // Dev-only one-off: write a STAC sidecar JSON for a point-cloud file.
+        //   swift run -c release SidecarTool /path/to/file.copc.laz
+        .executableTarget(
+            name: "SidecarTool",
+            dependencies: ["SwiftPDAL"],
+            path: "Sources/SidecarTool",
+            swiftSettings: [
+                .interoperabilityMode(.Cxx)
+            ]
+        ),
+
         .testTarget(
             name: "SwiftPDALTests",
             dependencies: ["SwiftPDAL"],
