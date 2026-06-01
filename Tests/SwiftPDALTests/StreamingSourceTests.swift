@@ -211,8 +211,11 @@ private func waitForSnapshot(
 
     // Wait for additional ticks. The view hasn't changed, so every
     // subsequent tick should be a cache hit and `wanted` shouldn't drift.
+    // Poll for the first cache hit rather than sleeping a fixed interval —
+    // under parallel-test CPU contention the 10 ms driver loop can be
+    // starved long enough that a fixed sleep elapses before any tick fires.
     let startMisses = (await source._debugSnapshot()).cacheMisses
-    try await Task.sleep(for: .milliseconds(500))
+    await waitForSnapshot(on: source) { $0.cacheHits > 0 }
     let snap = await source._debugSnapshot()
     #expect(snap.cacheHits > 0, "static view should produce cache hits")
     #expect(snap.cacheMisses == startMisses,
