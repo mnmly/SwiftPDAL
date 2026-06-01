@@ -45,9 +45,11 @@
 #include <E57Format/E57Exception.h>
 
 #include "include/pdal_e57_convert.h"
+#include "include/e57_init_guard.h"
 
 #include <atomic>
 #include <thread>
+#include <memory>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -208,7 +210,16 @@ E57Result execute_e57_to_copc(const std::string& input_path,
 
     uint64_t total_points_estimate = 0;
     try {
-        e57::Reader reader(input_path, e57::ReaderOptions{});
+        // Serialize libE57Format's Xerces bring-up — the ImageFile ctor
+        // runs the non-thread-safe XMLPlatformUtils Initialize/Terminate
+        // cycle. See e57_init_guard.h. The lock covers only construction;
+        // the read loop below runs unlocked.
+        std::unique_ptr<e57::Reader> readerPtr;
+        {
+            swiftpdal::E57InitGuard g(input_path);
+            readerPtr = std::make_unique<e57::Reader>(input_path, e57::ReaderOptions{});
+        }
+        e57::Reader& reader = *readerPtr;
         int64_t nScans = reader.GetData3DCount();
 
         // Sum point counts up-front so we have a real `estimatedTotal`

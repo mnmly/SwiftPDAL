@@ -7,6 +7,7 @@
 
 // pdal_wrapper.cpp
 #include "include/pdal_wrapper.h"
+#include "include/e57_init_guard.h"
 
 #include <cstdlib>
 #include <unistd.h>
@@ -214,7 +215,7 @@ static Stage* createConfiguredStage(
             probe->setOptions(probeOpts);
             try {
                 PointTable probeTable;
-                probe->prepare(probeTable);
+                { swiftpdal::E57InitGuard g(filename); probe->prepare(probeTable); }
                 if (probe->getSpatialReference().empty()) {
                     needsTransformOnly = true;
                 }
@@ -333,9 +334,9 @@ int pdal_read_binary(const char* reader_name_backup, const char* filename, const
         if (!finalStage) return PDAL_ERR_CREATE_STAGE;
 
         PointTable table;
-        finalStage->prepare(table);
+        { swiftpdal::E57InitGuard g(filename); finalStage->prepare(table); }
         PointViewSet viewSet = finalStage->execute(table);
-        
+
         if (viewSet.empty()) return PDAL_ERR_NO_POINTS;
         PointViewPtr view = *viewSet.begin();
         pdal::PointLayoutPtr layout = view->layout();
@@ -402,7 +403,7 @@ int pdal_load_info(const char* reader_name_backup, const char* filename, size_t*
         if (!finalStage) return PDAL_ERR_CREATE_STAGE;
 
         auto table = std::make_shared<PointTable>();
-        finalStage->prepare(*table);
+        { swiftpdal::E57InitGuard g(filename); finalStage->prepare(*table); }
         PointViewSet viewSet = finalStage->execute(*table);
 
         if (viewSet.empty()) return PDAL_ERR_NO_POINTS;
@@ -717,7 +718,7 @@ int pdal_read_binary_stream_progressive(
         // For streaming mode, we use a regular PointTable and rely on the
         // StreamCallbackFilter's processOne() method to be called for each point
         PointTable table;
-        streamFilter.prepare(table);
+        { swiftpdal::E57InitGuard g(filename); streamFilter.prepare(table); }
         loader.initialize(table.layout());
 
         // Execute the streaming pipeline
