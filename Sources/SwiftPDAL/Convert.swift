@@ -268,15 +268,12 @@ public enum PDALConvert {
                                to output: URL,
                                options: ConvertOptions = .init()) throws -> ConvertResult
     {
-        // Point PDAL at the bundled plugin/PROJ data directories. The
-        // `PointCloud.read` path does the same — without it, plugin-based
-        // drivers (notably `readers.e57` / `writers.e57`, which live as a
-        // separate dylib under the framework's PlugIns/) fail with
-        // "Couldn't create reader stage of type 'readers.e57'".
-        let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
-        let paths = PointCloud.getPaths(isTesting: isTesting)
-        setenv("PROJ_DATA", paths.projDBURL, 1)
-        setenv("PDAL_DRIVER_PATH", paths.driversURL, 1)
+        // Point PDAL at the bundled plugin/PROJ data directories (once,
+        // thread-safely). Without it, plugin-based drivers (notably
+        // `readers.e57` / `writers.e57`, which live as a separate dylib
+        // under the framework's PlugIns/) fail with "Couldn't create
+        // reader stage of type 'readers.e57'".
+        PDALRuntime.ensureBootstrapped()
 
         // .e57 inputs route through the libE57Format → writers.copc
         // bridge in CxxPDAL — PDAL 2.10's `readers.e57` throws partway
@@ -494,10 +491,7 @@ public enum PDALConvert {
     /// framework's `PlugIns/` dir on macOS), and subsequent reads
     /// can't find e.g. `readers.e57`.
     public static func isDriverRegistered(_ name: String) -> Bool {
-        let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
-        let paths = PointCloud.getPaths(isTesting: isTesting)
-        setenv("PROJ_DATA", paths.projDBURL, 1)
-        setenv("PDAL_DRIVER_PATH", paths.driversURL, 1)
+        PDALRuntime.ensureBootstrapped()
         return swiftpdal.convert.driver_is_registered(std.string(name))
     }
 

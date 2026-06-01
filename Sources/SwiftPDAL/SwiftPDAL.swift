@@ -159,10 +159,7 @@ public final class PointCloud: PointCloudData {
 
     public static func read(from path: String, readerName: String = "readers.text", outSrs: String = "") throws -> PointCloud {
 
-        let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
-        let paths = Self.getPaths(isTesting: isTesting)
-        setenv("PROJ_DATA", paths.projDBURL, 1)
-        setenv("PDAL_DRIVER_PATH", paths.driversURL, 1)
+        PDALRuntime.ensureBootstrapped()
 
         var outData: UnsafePointer<CChar>?
         var outSize: Int = 0
@@ -393,10 +390,7 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
 
     public func loadInfo(readerName: String = "readers.text") throws {
 
-        let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
-        let paths = PointCloud.getPaths(isTesting: isTesting)
-        setenv("PROJ_DATA", paths.projDBURL, 1)
-        setenv("PDAL_DRIVER_PATH", paths.driversURL, 1)
+        PDALRuntime.ensureBootstrapped()
 
         var outCount: Int = 0
         var outStride: Int = 0
@@ -523,8 +517,12 @@ public final class StreamingPointCloud: PointCloudData, @unchecked Sendable {
         outSrs: String = "",
         onProgress: @escaping (StreamingProgress) -> Bool
     ) throws -> Bounds {
-        let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
-        let _ = PointCloud.getPaths(isTesting: isTesting)
+        // Previously this path computed the bundle paths but never set the
+        // PROJ/driver env vars — so a streaming read only worked if some
+        // other call had already seeded them, which is nondeterministic
+        // under concurrency (intermittent "Failed to create stage" for
+        // plugin readers like readers.e57). Bootstrap handles it once.
+        PDALRuntime.ensureBootstrapped()
 
         var bbox = PDALBounds()
 
