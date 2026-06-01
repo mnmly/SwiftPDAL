@@ -123,6 +123,18 @@ cancellation.
 - ``PDALStage``
 - ``PDALValue``
 
+### Per-dimension statistics + STAC sidecar
+
+Single-pass per-attribute statistics computed during a conversion via
+`filters.stats` — exact mean/stddev/min/max with no extra read — plus a
+STAC pointcloud-extension sidecar writer for catalog tooling.
+
+- ``PDALConvert/convertComputingStatistics(from:to:options:)``
+- ``PointCloudStatistics``
+- ``PointCloudDimensionStatistic``
+- ``PointCloudDimensionSchema``
+- ``PointCloudBounds``
+
 ### Streaming (PDAL pipeline)
 
 Chunked progressive read for whole-file streaming. Distinct from the

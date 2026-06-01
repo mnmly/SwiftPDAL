@@ -39,6 +39,13 @@ struct Result {
     uint64_t point_count = 0;
     /// Pipeline metadata as a JSON string (empty on failure).
     std::string metadata_json;
+    /// Point layout as a JSON array of `{"name","size","type"}` objects,
+    /// where `type` is one of `"signed"`, `"unsigned"`, `"floating"`
+    /// (the STAC pointcloud-extension `pc:schemas` vocabulary). Empty
+    /// when the layout could not be captured. Serialized from the
+    /// finalized layout after execution — the metadata JSON carries
+    /// per-dimension statistics but not dimension sizes/types.
+    std::string schema_json;
     /// Human-readable error detail (empty on success).
     std::string error_message;
 };

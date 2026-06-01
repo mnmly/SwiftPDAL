@@ -195,6 +195,19 @@ public struct ConvertResult: Sendable {
     public let pointCount: UInt64
     /// Pipeline metadata as a JSON string, as emitted by PDAL.
     public let metadataJSON: String
+    /// Dimension layout as a JSON array of `{"name","size","type"}`
+    /// objects (`type` ∈ `signed`/`unsigned`/`floating`), matching the
+    /// STAC pointcloud-extension `pc:schemas` vocabulary. Empty when the
+    /// layout couldn't be captured (e.g. the `.e57` bridge path). The
+    /// pipeline metadata carries per-dimension statistics but not
+    /// dimension sizes/types, so this is the authoritative schema source.
+    public let schemaJSON: String
+
+    public init(pointCount: UInt64, metadataJSON: String, schemaJSON: String = "") {
+        self.pointCount = pointCount
+        self.metadataJSON = metadataJSON
+        self.schemaJSON = schemaJSON
+    }
 }
 
 /// Errors raised by ``PDALConvert/convert(from:to:options:)``.
@@ -367,7 +380,8 @@ public enum PDALConvert {
         }
 
         return ConvertResult(pointCount: result.point_count,
-                             metadataJSON: metadataString)
+                             metadataJSON: metadataString,
+                             schemaJSON: swiftStringFromCxx(result.schema_json))
     }
 
     /// Dispatch path for `.e57` inputs — funnels through the

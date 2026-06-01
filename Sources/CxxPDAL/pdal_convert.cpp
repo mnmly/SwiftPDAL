@@ -295,6 +295,50 @@ private:
     std::thread reader_;
 };
 
+// Serialize a finalized point layout to a JSON array of
+// `{"name","size","type"}` objects, with `type` in the STAC
+// pointcloud-extension vocabulary (signed/unsigned/floating). Built by
+// hand because the full nlohmann header isn't on PDAL's public include
+// path here (same constraint noted in the E57 bridge). Returns an empty
+// string on any failure — schema is best-effort metadata.
+std::string serialize_schema(const pdal::PointLayoutPtr& layout) noexcept
+{
+    if (!layout) return std::string();
+    try {
+        auto escape = [](const std::string& s) {
+            std::string out; out.reserve(s.size() + 2);
+            for (char c : s) {
+                if (c == '"' || c == '\\') { out.push_back('\\'); out.push_back(c); }
+                else if (c == '\n') { out += "\\n"; }
+                else { out.push_back(c); }
+            }
+            return out;
+        };
+        std::ostringstream os;
+        os << '[';
+        bool first = true;
+        for (const auto& dt : layout->dimTypes()) {
+            const std::string name = layout->dimName(dt.m_id);
+            const std::size_t size = pdal::Dimension::size(dt.m_type);
+            const char* base;
+            switch (pdal::Dimension::base(dt.m_type)) {
+                case pdal::Dimension::BaseType::Signed:   base = "signed";   break;
+                case pdal::Dimension::BaseType::Unsigned: base = "unsigned"; break;
+                case pdal::Dimension::BaseType::Floating: base = "floating"; break;
+                default:                                  base = "unknown";  break;
+            }
+            if (!first) os << ',';
+            first = false;
+            os << "{\"name\":\"" << escape(name) << "\",\"size\":" << size
+               << ",\"type\":\"" << base << "\"}";
+        }
+        os << ']';
+        return os.str();
+    } catch (...) {
+        return std::string();
+    }
+}
+
 // Best-effort total-point estimate from the pipeline's root stage's
 // preview(). Stage::preview() is recursive — readers fill in their
 // point count and intermediate stages forward it — so this gives us
@@ -332,11 +376,16 @@ Result execute_pipeline_json(const std::string& json,
         const std::size_t cap =
             (chunk_size > 0) ? static_cast<std::size_t>(chunk_size) : 10000u;
 
+        // Captured from whichever execution path runs, so we can emit the
+        // dimension schema after execution regardless of mode.
+        pdal::PointLayoutPtr schemaLayout;
+
         if (streaming && mgr.pipelineStreamable()) {
             // Fast path: entire pipeline streams.
             ProgressFixedTable table(cap, progress, progress_ctx, est_total);
             mgr.executeStream(table);
             r.point_count = table.total();
+            schemaLayout = table.layout();
         } else if (streaming && progress) {
             // Two-pass path: stream-read into a long-lived PointView for
             // per-chunk progress, then run the non-streamable writer over
@@ -379,6 +428,7 @@ Result execute_pipeline_json(const std::string& json,
                 pdal::PointViewSet outs = writer->execute(phase2Table);
 
                 r.point_count = streamTbl.total();
+                schemaLayout = sink->layout();
                 // Final 100% tick — the writer phase produces no progress
                 // events on its own.
                 if (!progress(r.point_count, est_total, progress_ctx)) {
@@ -394,6 +444,10 @@ Result execute_pipeline_json(const std::string& json,
                 for (const auto& view : mgr.views()) {
                     r.point_count += static_cast<uint64_t>(view->size());
                 }
+                // The manager's own table owns the finalized layout for
+                // mgr's lifetime; the writer's output view layout may be
+                // freed when execute() returns, so don't read it here.
+                schemaLayout = mgr.pointTable().layout();
                 if (!progress(r.point_count, est_total, progress_ctx)) {
                     throw CancelledByCaller();
                 }
@@ -404,10 +458,13 @@ Result execute_pipeline_json(const std::string& json,
             for (const auto& view : mgr.views()) {
                 r.point_count += static_cast<uint64_t>(view->size());
             }
+            schemaLayout = mgr.pointTable().layout();
             if (progress && !progress(r.point_count, est_total, progress_ctx)) {
                 throw CancelledByCaller();
             }
         }
+
+        r.schema_json = serialize_schema(schemaLayout);
 
         std::stringstream meta;
         pdal::MetadataNode root = mgr.getMetadata().clone("metadata");
