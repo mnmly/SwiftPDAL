@@ -52,6 +52,7 @@ enum ChunkPacker {
         extra: UnsafePointer<Float>? = nil,
         extraCount: Int = 0,
         extraNames: [String] = [],
+        rgbShiftBits: UInt32? = nil,
         pointsPerBatch: Int = defaultPointsPerBatch,
         lodLevels: Int = defaultLODLevels,
         coarseVoxelDivisions: Int = defaultCoarseVoxelDivisions
@@ -141,15 +142,25 @@ enum ChunkPacker {
         // No alpha channel in COPC, so set A = 255.
         var colors = [UInt32](repeating: 0, count: count)
         if hasRgb {
-            // Detect 8-bit-stored-as-16-bit (common): if max(channel) <= 255, no shift.
-            var maxVal: UInt16 = 0
-            for i in 0..<count {
-                let r = rgb16[3*i+0], g = rgb16[3*i+1], b = rgb16[3*i+2]
-                if r > maxVal { maxVal = r }
-                if g > maxVal { maxVal = g }
-                if b > maxVal { maxVal = b }
+            // 8-bit-vs-16-bit RGB rescale. Prefer a GLOBAL shift decided once for
+            // the whole file (passed in via `rgbShiftBits`): deciding it per node
+            // mis-classifies uniformly-dark nodes — every channel ≤ 255 in a true
+            // 16-bit file — as "8-bit", emitting their tiny values un-shifted and
+            // rendering them oversaturated (square patches of wrong colour). Fall
+            // back to the per-node heuristic only when no global shift was supplied.
+            let shift: UInt32
+            if let rgbShiftBits {
+                shift = rgbShiftBits
+            } else {
+                var maxVal: UInt16 = 0
+                for i in 0..<count {
+                    let r = rgb16[3*i+0], g = rgb16[3*i+1], b = rgb16[3*i+2]
+                    if r > maxVal { maxVal = r }
+                    if g > maxVal { maxVal = g }
+                    if b > maxVal { maxVal = b }
+                }
+                shift = maxVal > 255 ? 8 : 0
             }
-            let shift: UInt32 = maxVal > 255 ? 8 : 0
             for (dstIndex, srcIndex) in order.enumerated() {
                 let r = UInt32(rgb16[3*srcIndex+0]) >> shift
                 let g = UInt32(rgb16[3*srcIndex+1]) >> shift

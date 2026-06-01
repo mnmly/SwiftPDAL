@@ -684,6 +684,10 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
     /// Names of the requested extra dimensions, in the same order as
     /// ``extraDescs`` — used to key each chunk's `extraScalars`.
     private let extraNames: [String]
+    /// File-wide RGB rescale shift (8 = 16-bit→8-bit, 0 = already 8-bit), decided
+    /// once at open from the root node so dark nodes aren't mis-scaled per-node.
+    /// `nil` when the file has no RGB.
+    private let rgbShiftBits: UInt32?
     private var driverTask: Task<Void, Never>?
     private var workerTasks: [Task<Void, Never>] = []
 
@@ -696,7 +700,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         originShift: SIMD3<Double>,
         workerCount: Int,
         extraDescs: [CopcExtractDesc],
-        extraNames: [String]
+        extraNames: [String],
+        rgbShiftBits: UInt32?
     ) {
         self.info = info
         self.driver = driver
@@ -707,6 +712,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         self.workerCount = workerCount
         self.extraDescs = extraDescs
         self.extraNames = extraNames
+        self.rgbShiftBits = rgbShiftBits
     }
 
     /// Open a COPC file and parse its octree hierarchy.
@@ -886,6 +892,9 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             jobs: jobs
         )
 
+        // Decide the RGB rescale ONCE for the whole file (see ``rgbShiftBits``).
+        let rgbShift = computeGlobalRgbShift(reader: reader)
+
         let workerCount = max(1, options.decodeConcurrency)
         let source = CopcStreamingPointCloudSource(
             info: info,
@@ -896,10 +905,31 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             originShift: originShift,
             workerCount: workerCount,
             extraDescs: extraDescs,
-            extraNames: extraNames
+            extraNames: extraNames,
+            rgbShiftBits: rgbShift
         )
         source.startDriver()
         return source
+    }
+
+    /// Decide the 8-bit-vs-16-bit RGB rescale once, globally, from the **root**
+    /// node. The root is the coarsest LOD — it samples the whole cloud, so it
+    /// contains the bright points needed to detect a true 16-bit file (max >
+    /// 255 → shift 8). Deciding this per node mis-classifies uniformly-dark
+    /// nodes as 8-bit and renders them oversaturated. Returns `nil` when the
+    /// file has no RGB (callers fall back to the per-node heuristic / white).
+    private static func computeGlobalRgbShift(reader: CopcReader) -> UInt32? {
+        let chunk = reader.read_node(0, 0, 0, 0, 0, nil, 0)
+        let count = Int(chunk.point_count())
+        guard count > 0, chunk.has_rgb(), let rgb = chunk.__rgb_dataUnsafe() else { return nil }
+        var maxVal: UInt16 = 0
+        let total = count * 3
+        var i = 0
+        while i < total {
+            if rgb[i] > maxVal { maxVal = rgb[i] }
+            i += 1
+        }
+        return maxVal > 255 ? 8 : 0
     }
 
     private func startDriver() {
@@ -917,6 +947,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         let originShift = self.originShift
         let extraDescs = self.extraDescs
         let extraNames = self.extraNames
+        let rgbShiftBits = self.rgbShiftBits
         let workers = (0..<workerCount).map { slot in
             Task.detached(priority: .utility) {
                 let slotIndex = Int32(slot)
@@ -928,7 +959,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                         id: id,
                         originShift: originShift,
                         extraDescs: extraDescs,
-                        extraNames: extraNames
+                        extraNames: extraNames,
+                        rgbShiftBits: rgbShiftBits
                     )
                     await driver.completeLoad(id: id, chunk: chunk)
                 }
@@ -1351,7 +1383,8 @@ actor StreamingDriver {
         id: ChunkID,
         originShift: SIMD3<Double>,
         extraDescs: [CopcExtractDesc],
-        extraNames: [String]
+        extraNames: [String],
+        rgbShiftBits: UInt32?
     ) -> ResidentChunk? {
         // The decoded chunk is ~Copyable; do everything that touches it inside
         // the descriptor buffer's scope so the C++ ChunkData stays alive while
@@ -1376,7 +1409,8 @@ actor StreamingDriver {
                 originShift: originShift,
                 extra: extraDimCount > 0 ? chunk.__extra_dataUnsafe() : nil,
                 extraCount: extraDimCount,
-                extraNames: extraNames
+                extraNames: extraNames,
+                rgbShiftBits: rgbShiftBits
             )
 
             return ResidentChunk(
