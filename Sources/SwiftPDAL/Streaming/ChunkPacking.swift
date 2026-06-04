@@ -182,20 +182,31 @@ enum ChunkPacker {
                 for (dstIndex, srcIndex) in order.enumerated() {
                     col[dstIndex] = extra[base + srcIndex]
                 }
-                extraScalars[name] = Data(buffer: UnsafeBufferPointer(start: col, count: count))
+                extraScalars[name] = packedData(col)
             }
         }
 
         return Output(
             batches: batches,
-            xyzLow:  Data(buffer: UnsafeBufferPointer(start: xyzLow,  count: count)),
-            xyzMed:  Data(buffer: UnsafeBufferPointer(start: xyzMed,  count: count)),
-            xyzHigh: Data(buffer: UnsafeBufferPointer(start: xyzHigh, count: count)),
-            colors:  Data(buffer: UnsafeBufferPointer(start: colors,  count: count)),
+            xyzLow:  packedData(xyzLow),
+            xyzMed:  packedData(xyzMed),
+            xyzHigh: packedData(xyzHigh),
+            colors:  packedData(colors),
             levels:  Data(levels),
             extraScalars: extraScalars
         )
     }
+}
+
+// Copy a Swift array into `Data` with an explicit buffer-pointer scope.
+// Passing an array straight to `Data(buffer: UnsafeBufferPointer(start:count:))`
+// trips Swift 6's [#TemporaryPointers] warning — the implicit array→pointer
+// conversion yields a pointer valid only for that one call. `Data(buffer:)`
+// copies synchronously so it's safe in practice, but the explicit scope is the
+// correct, warning-free idiom.
+@inline(__always)
+private func packedData<T>(_ array: [T]) -> Data {
+    array.withUnsafeBufferPointer { Data(buffer: $0) }
 }
 
 // Morton-order so consecutive entries are spatially close — gives tight
@@ -237,7 +248,22 @@ private func computeLODLevels(
     let longestAxis = max(extent.x, max(extent.y, extent.z))
     let baseVoxel = longestAxis / Float(coarseVoxelDivisions)
 
-    var occupied: Set<SIMD3<Int32>> = []
+    // Voxel-occupancy dedup keyed by a single UInt64 instead of SIMD3<Int32>.
+    // Hashing one integer is far cheaper than Swift's per-component Hasher
+    // combine over a SIMD3 (the original showed up as Set.insert / Hasher in
+    // the streaming-decode CPU profile). Cell components are non-negative
+    // (positions ≥ boundsMin) and node-local, comfortably under 21 bits even
+    // at the deepest level / largest division count, so the 21-bit-per-axis
+    // pack is collision-free over the values that actually occur.
+    @inline(__always)
+    func cellKey(_ local: SIMD3<Float>) -> UInt64 {
+        let cx = UInt64(max(0, Int32(local.x.rounded(.down)))) & 0x1F_FFFF
+        let cy = UInt64(max(0, Int32(local.y.rounded(.down)))) & 0x1F_FFFF
+        let cz = UInt64(max(0, Int32(local.z.rounded(.down)))) & 0x1F_FFFF
+        return (cx << 42) | (cy << 21) | cz
+    }
+
+    var occupied = Set<UInt64>()
     for level in 0..<(lodLevels - 1) {
         let voxelSize = baseVoxel * powf(0.5, Float(level))
         let invVoxel = 1.0 / max(voxelSize, 1e-6)
@@ -245,12 +271,7 @@ private func computeLODLevels(
         for i in 0..<count {
             if levels[i] != maxLevel { continue }
             let local = (positions[i] - boundsMin) * invVoxel
-            let cell = SIMD3<Int32>(
-                Int32(local.x.rounded(.down)),
-                Int32(local.y.rounded(.down)),
-                Int32(local.z.rounded(.down))
-            )
-            if occupied.insert(cell).inserted {
+            if occupied.insert(cellKey(local)).inserted {
                 levels[i] = UInt8(level)
             }
         }
