@@ -384,6 +384,65 @@ bool Reader::eb_field_at(int32_t index, EbFieldInfo& out) const noexcept {
     return true;
 }
 
+// Fast XYZ(+RGB) extraction straight from the decompressed LAS records,
+// bypassing copc::las::Points::Unpack — which heap-allocates a
+// shared_ptr<Point> per record, parses each field through a std::istream, then
+// returns six freshly-allocated std::vector<double/uint16> from X()/Y()/Z()/
+// Red()/Green()/Blue(). For the streaming-render path (no extra dims) all of
+// that is pure overhead: X/Y/Z are int32 at byte offsets 0/4/8 in every LAS
+// point format, and RGB (3×uint16) sits at the tail of the base record, after
+// which NIR (uint16), when present, follows. We derive the RGB offset from
+// copclib's own PointBaseByteSize so we never hardcode per-format magic.
+//
+// Returns false (caller falls back to the Unpack path) for wavepacket formats
+// 4/5/9/10, where waveform data trails the base record and the "RGB at tail of
+// base" invariant no longer holds. COPC mandates formats 6/7/8, so the fast
+// path covers every real-world stream; 2/3 are handled too.
+static bool read_node_fast(const std::vector<char>& recs, int32_t n,
+                           size_t point_size, int8_t fmt,
+                           const ::copc::las::LasHeader& header,
+                           ChunkData& out) noexcept {
+    if (fmt == 4 || fmt == 5 || fmt == 9 || fmt == 10) return false;
+
+    const bool hasRgb = ::copc::las::FormatHasRgb(static_cast<uint8_t>(fmt));
+    const bool hasNir = ::copc::las::FormatHasNir(static_cast<uint8_t>(fmt));
+    const int32_t base = static_cast<int32_t>(::copc::las::PointBaseByteSize(fmt));
+    const int32_t rgbOff = hasRgb ? base - (hasNir ? 8 : 6) : -1;
+    // Defend against a record stride that can't hold the fields we read.
+    if (static_cast<int32_t>(point_size) < 12) return false;
+    if (rgbOff >= 0 && rgbOff + 6 > static_cast<int32_t>(point_size)) return false;
+
+    const ::copc::Vector3 scale = header.Scale();
+    const ::copc::Vector3 offset = header.Offset();
+
+    out.xyz.resize(static_cast<size_t>(n) * 3);
+    out.rgb.assign(static_cast<size_t>(n) * 3, uint16_t{0});
+
+    const char* p = recs.data();
+    for (int32_t i = 0; i < n; ++i) {
+        const char* rec = p + static_cast<size_t>(i) * point_size;
+        int32_t xi, yi, zi;
+        std::memcpy(&xi, rec + 0, 4);
+        std::memcpy(&yi, rec + 4, 4);
+        std::memcpy(&zi, rec + 8, 4);
+        out.xyz[3 * i + 0] = static_cast<double>(xi) * scale.x + offset.x;
+        out.xyz[3 * i + 1] = static_cast<double>(yi) * scale.y + offset.y;
+        out.xyz[3 * i + 2] = static_cast<double>(zi) * scale.z + offset.z;
+        if (rgbOff >= 0) {
+            uint16_t r, g, b;
+            std::memcpy(&r, rec + rgbOff + 0, 2);
+            std::memcpy(&g, rec + rgbOff + 2, 2);
+            std::memcpy(&b, rec + rgbOff + 4, 2);
+            out.rgb[3 * i + 0] = r;
+            out.rgb[3 * i + 1] = g;
+            out.rgb[3 * i + 2] = b;
+        }
+    }
+    out.has_rgb_ = hasRgb;
+    out.point_count_ = n;
+    return true;
+}
+
 ChunkData Reader::read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
                             int32_t slot,
                             const ExtractDesc* descs, int32_t desc_count) noexcept {
@@ -408,6 +467,21 @@ ChunkData Reader::read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
         impl_->pool[static_cast<size_t>(slot)].decode(
             compressed, node.point_count, fmt, eb, point_size,
             impl_->scratch[static_cast<size_t>(slot)]);
+
+        // Fast path: no extra dims requested → read XYZ/RGB straight from the
+        // decompressed records, skipping the per-point Point object model.
+        if (desc_count <= 0) {
+            const int32_t n = static_cast<int32_t>(node.point_count);
+            if (n <= 0) return out;
+            if (read_node_fast(impl_->scratch[static_cast<size_t>(slot)],
+                               n, point_size, fmt, impl_->header, out)) {
+                record_node_size(static_cast<uint64_t>(n));
+                return out;
+            }
+        }
+
+        // Fallback (extra dims requested, or a fast-path-unsupported format):
+        // full Unpack into copc Point objects.
         ::copc::las::Points points = ::copc::las::Points::Unpack(
             impl_->scratch[static_cast<size_t>(slot)], impl_->header);
 
