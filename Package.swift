@@ -19,11 +19,6 @@ let package = Package(
             name: "SwiftPDAL",
             targets: ["SwiftPDAL"],
         ),
-        .library(
-            name: "SwiftPDAL Dynamic",
-            type: .dynamic,
-            targets: ["SwiftPDAL"],
-        ),
     ],
     dependencies: [
         .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.4.3"),
