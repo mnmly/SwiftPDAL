@@ -394,15 +394,18 @@ bool Reader::eb_field_at(int32_t index, EbFieldInfo& out) const noexcept {
 // which NIR (uint16), when present, follows. We derive the RGB offset from
 // copclib's own PointBaseByteSize so we never hardcode per-format magic.
 //
-// Returns false (caller falls back to the Unpack path) for wavepacket formats
-// 4/5/9/10, where waveform data trails the base record and the "RGB at tail of
-// base" invariant no longer holds. COPC mandates formats 6/7/8, so the fast
-// path covers every real-world stream; 2/3 are handled too.
+// Restricted to point formats 6/7/8 — the only formats COPC permits and the
+// only ones copclib's FormatHasRgb / PointBaseByteSize accept (they THROW for
+// anything else). Since this function is noexcept, calling them on a stray
+// legacy/wavepacket format would std::terminate; instead we return false and
+// let read_node's try/catch-guarded Unpack path handle (and gracefully reject)
+// it. For 6/7/8 the RGB triple sits at the tail of the base record, with NIR
+// (format 8) following it — derived from PointBaseByteSize, never hardcoded.
 static bool read_node_fast(const std::vector<char>& recs, int32_t n,
                            size_t point_size, int8_t fmt,
                            const ::copc::las::LasHeader& header,
                            ChunkData& out) noexcept {
-    if (fmt == 4 || fmt == 5 || fmt == 9 || fmt == 10) return false;
+    if (fmt != 6 && fmt != 7 && fmt != 8) return false;
 
     const bool hasRgb = ::copc::las::FormatHasRgb(static_cast<uint8_t>(fmt));
     const bool hasNir = ::copc::las::FormatHasNir(static_cast<uint8_t>(fmt));
