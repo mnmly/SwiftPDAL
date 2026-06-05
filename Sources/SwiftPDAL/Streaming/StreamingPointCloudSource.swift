@@ -1231,11 +1231,22 @@ actor StreamingDriver {
 
         var tickRemoved: [ChunkID] = []
 
-        // 2. Evict (with hysteresis).
-        for (id, var entry) in resident {
+        // 2. Evict (with hysteresis). Iterate a snapshot of the *keys*, not the
+        //    dictionary itself: a `for (id, var entry) in resident { resident[id]
+        //    = … }` pins the storage via the live iterator, so the first write
+        //    each tick copy-on-writes the WHOLE dict (O(resident.count)
+        //    ResidentEntry copies + retains). That fires every tick — even on a
+        //    static camera where nothing changes — and dominates driver CPU on
+        //    large resident sets. `Array(resident.keys)` is a separate buffer, so
+        //    `resident` stays uniquely-referenced and writes mutate in place.
+        //    Also skip the no-op write when a wanted entry is already current.
+        for id in Array(resident.keys) {
+            guard var entry = resident[id] else { continue }
             if wanted.contains(id) {
-                entry.ticksSinceWanted = 0
-                resident[id] = entry
+                if entry.ticksSinceWanted != 0 {
+                    entry.ticksSinceWanted = 0
+                    resident[id] = entry
+                }
             } else {
                 entry.ticksSinceWanted += 1
                 if entry.ticksSinceWanted >= options.evictionDelayTicks {
