@@ -196,6 +196,56 @@ enum ChunkPacker {
             extraScalars: extraScalars
         )
     }
+
+    /// Emit a node's points **raw** (un-packed) for GPU-side packing: origin-
+    /// shifted `Float3` positions + `RGBA8` colors, both in original decode
+    /// order (the GPU Morton-sorts/quantizes/LODs them). No sort, quantize, or
+    /// LOD here — that's the work being moved to the GPU. Origin shift and the
+    /// global 8/16-bit RGB rescale stay on the CPU (cheap, file-wide), matching
+    /// ``pack(positionsXYZ:rgb16:count:hasRgb:originShift:extra:extraCount:extraNames:rgbShiftBits:pointsPerBatch:lodLevels:coarseVoxelDivisions:)``.
+    ///
+    /// - Returns: `positions` (`count * SIMD3<Float>`, 16 B/point) and `colors`
+    ///   (`count * UInt32` RGBA8), ready to upload into shared `MTLBuffer`s.
+    static func emitRaw(
+        positionsXYZ: UnsafePointer<Double>,
+        rgb16: UnsafePointer<UInt16>,
+        count: Int,
+        hasRgb: Bool,
+        originShift: SIMD3<Double>,
+        rgbShiftBits: UInt32? = nil
+    ) -> (positions: Data, colors: Data) {
+        precondition(count > 0)
+
+        var positions = [SIMD3<Float>](repeating: .zero, count: count)
+        for i in 0 ..< count {
+            positions[i] = SIMD3<Float>(
+                Float(positionsXYZ[3*i+0] - originShift.x),
+                Float(positionsXYZ[3*i+1] - originShift.y),
+                Float(positionsXYZ[3*i+2] - originShift.z)
+            )
+        }
+
+        var colors = [UInt32](repeating: 0xFFFF_FFFF, count: count)
+        if hasRgb {
+            // Same global-vs-per-node rescale decision as pack().
+            let shift: UInt32
+            if let rgbShiftBits {
+                shift = rgbShiftBits
+            } else {
+                var maxVal: UInt16 = 0
+                for i in 0 ..< (count * 3) where rgb16[i] > maxVal { maxVal = rgb16[i] }
+                shift = maxVal > 255 ? 8 : 0
+            }
+            for i in 0 ..< count {
+                let r = UInt32(rgb16[3*i+0]) >> shift
+                let g = UInt32(rgb16[3*i+1]) >> shift
+                let b = UInt32(rgb16[3*i+2]) >> shift
+                colors[i] = (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16) | (UInt32(255) << 24)
+            }
+        }
+
+        return (packedData(positions), packedData(colors))
+    }
 }
 
 // Copy a Swift array into `Data` with an explicit buffer-pointer scope.

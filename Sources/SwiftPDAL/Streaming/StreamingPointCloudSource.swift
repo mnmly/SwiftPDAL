@@ -273,12 +273,53 @@ public struct ResidentChunk: Sendable {
     /// ``StreamingOptions/extraDimensions``.
     public let extraScalars: [String: Data]
 
-    /// Total points in this chunk (sum of `batches[i].numPoints`).
-    public var totalPointCount: Int { batches.reduce(0) { $0 + Int($1.numPoints) } }
-    /// Approximate GPU byte cost: `totalPointCount * 17` (positions +
-    /// colors + levels). Use this to track budget against
-    /// ``StreamingSourceInfo/bytesPerPoint``.
-    public var byteCost: Int { totalPointCount * 17 }
+    /// Raw `Float3` positions (16 B/point, origin-shifted), in original decode
+    /// order. Non-`nil` only when ``StreamingOptions/emitRawPoints`` is set; the
+    /// consumer Morton-sorts, quantizes and LODs these on the GPU. `nil` in the
+    /// packed path (``xyzLow``/etc. carry the data instead).
+    public let rawPositions: Data?
+    /// Raw `RGBA8` colors (4 B/point, `UInt32`), in original decode order,
+    /// parallel to ``rawPositions``. Non-`nil` only in raw mode.
+    public let rawColors: Data?
+    /// Point count in raw mode (`0` in the packed path).
+    public let rawPointCount: Int
+
+    /// Total points in this chunk.
+    public var totalPointCount: Int {
+        rawPointCount > 0 ? rawPointCount : batches.reduce(0) { $0 + Int($1.numPoints) }
+    }
+    /// Approximate GPU byte cost. Packed: `totalPointCount * 17` (positions +
+    /// colors + levels). Raw: `* 20` (Float3 16 B + RGBA8 4 B). Use this to
+    /// track budget against ``StreamingSourceInfo/bytesPerPoint``.
+    public var byteCost: Int { totalPointCount * (rawPointCount > 0 ? 20 : 17) }
+
+    /// Packed chunk (the default CPU-packed path).
+    public init(
+        id: ChunkID,
+        batches: [StreamingRasterBatch],
+        xyzLow: Data, xyzMed: Data, xyzHigh: Data,
+        colors: Data, levels: Data,
+        extraScalars: [String: Data]
+    ) {
+        self.id = id
+        self.batches = batches
+        self.xyzLow = xyzLow; self.xyzMed = xyzMed; self.xyzHigh = xyzHigh
+        self.colors = colors; self.levels = levels
+        self.extraScalars = extraScalars
+        self.rawPositions = nil; self.rawColors = nil; self.rawPointCount = 0
+    }
+
+    /// Raw chunk (``StreamingOptions/emitRawPoints``). Packed buffers are empty;
+    /// the consumer packs ``rawPositions``/``rawColors`` on the GPU.
+    public init(id: ChunkID, rawPositions: Data, rawColors: Data, count: Int) {
+        self.id = id
+        self.batches = []
+        self.xyzLow = Data(); self.xyzMed = Data(); self.xyzHigh = Data()
+        self.colors = Data(); self.levels = Data()
+        self.extraScalars = [:]
+        self.rawPositions = rawPositions; self.rawColors = rawColors
+        self.rawPointCount = count
+    }
 }
 
 // MARK: - Update result
@@ -395,6 +436,15 @@ public struct StreamingOptions: Sendable {
     /// ``extraDimensions``). For inspector/spreadsheet use that wants all
     /// attributes without scanning a graph. Default `false`.
     public var requestAllAvailableDimensions: Bool
+    /// If `true`, emit **raw** un-packed points — origin-shifted `Float3`
+    /// positions + `RGBA8` colors — instead of CPU-packed buffers, so the
+    /// consumer can pack them on the GPU. The decode path skips ``ChunkPacker``
+    /// entirely (using the fast position+color-only decode); the resulting
+    /// ``ResidentChunk`` carries ``ResidentChunk/rawPositions`` /
+    /// ``ResidentChunk/rawColors`` and its packed buffers are empty. Default
+    /// `false` (the proven CPU-packed path). Raw mode is position+color only —
+    /// ``extraDimensions`` is ignored.
+    public var emitRawPoints: Bool
 
     /// Create a configuration.
     ///
@@ -421,7 +471,8 @@ public struct StreamingOptions: Sendable {
         residencyPolicy: ResidencyPolicy = .frustumFirstThenHalo,
         targetChunkScreenSize: Float = 256,
         extraDimensions: [String] = [],
-        requestAllAvailableDimensions: Bool = false
+        requestAllAvailableDimensions: Bool = false,
+        emitRawPoints: Bool = false
     ) {
         self.maxInFlightLoads = maxInFlightLoads
         self.decodeConcurrency = decodeConcurrency
@@ -433,6 +484,7 @@ public struct StreamingOptions: Sendable {
         self.targetChunkScreenSize = targetChunkScreenSize
         self.extraDimensions = extraDimensions
         self.requestAllAvailableDimensions = requestAllAvailableDimensions
+        self.emitRawPoints = emitRawPoints
     }
 }
 
@@ -688,6 +740,9 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
     /// once at open from the root node so dark nodes aren't mis-scaled per-node.
     /// `nil` when the file has no RGB.
     private let rgbShiftBits: UInt32?
+    /// Emit raw (un-packed) points for GPU-side packing instead of CPU-packed
+    /// buffers. See ``StreamingOptions/emitRawPoints``.
+    private let emitRawPoints: Bool
     private var driverTask: Task<Void, Never>?
     private var workerTasks: [Task<Void, Never>] = []
 
@@ -701,7 +756,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         workerCount: Int,
         extraDescs: [CopcExtractDesc],
         extraNames: [String],
-        rgbShiftBits: UInt32?
+        rgbShiftBits: UInt32?,
+        emitRawPoints: Bool
     ) {
         self.info = info
         self.driver = driver
@@ -713,6 +769,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         self.extraDescs = extraDescs
         self.extraNames = extraNames
         self.rgbShiftBits = rgbShiftBits
+        self.emitRawPoints = emitRawPoints
     }
 
     /// Open a COPC file and parse its octree hierarchy.
@@ -906,7 +963,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             workerCount: workerCount,
             extraDescs: extraDescs,
             extraNames: extraNames,
-            rgbShiftBits: rgbShift
+            rgbShiftBits: rgbShift,
+            emitRawPoints: options.emitRawPoints
         )
         source.startDriver()
         return source
@@ -948,6 +1006,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         let extraDescs = self.extraDescs
         let extraNames = self.extraNames
         let rgbShiftBits = self.rgbShiftBits
+        let emitRawPoints = self.emitRawPoints
         let workers = (0..<workerCount).map { slot in
             Task.detached(priority: .utility) {
                 let slotIndex = Int32(slot)
@@ -960,7 +1019,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                         originShift: originShift,
                         extraDescs: extraDescs,
                         extraNames: extraNames,
-                        rgbShiftBits: rgbShiftBits
+                        rgbShiftBits: rgbShiftBits,
+                        emitRawPoints: emitRawPoints
                     )
                     await driver.completeLoad(id: id, chunk: chunk)
                 }
@@ -1384,12 +1444,34 @@ actor StreamingDriver {
         originShift: SIMD3<Double>,
         extraDescs: [CopcExtractDesc],
         extraNames: [String],
-        rgbShiftBits: UInt32?
+        rgbShiftBits: UInt32?,
+        emitRawPoints: Bool
     ) -> ResidentChunk? {
+        // Raw mode: decode position+color only (fast path, no extra descs) and
+        // hand the points back un-packed for GPU-side packing. Reads happen in
+        // this scope while the ~Copyable ChunkData is alive.
+        if emitRawPoints {
+            let chunk = reader.read_node(
+                Int32(id.depth), Int32(id.x), Int32(id.y), Int32(id.z),
+                slot, nil, 0
+            )
+            let count = Int(chunk.point_count())
+            guard count > 0 else { return nil }
+            let raw = ChunkPacker.emitRaw(
+                positionsXYZ: chunk.__xyz_dataUnsafe()!,
+                rgb16: chunk.__rgb_dataUnsafe()!,
+                count: count,
+                hasRgb: chunk.has_rgb(),
+                originShift: originShift,
+                rgbShiftBits: rgbShiftBits
+            )
+            return ResidentChunk(id: id, rawPositions: raw.positions, rawColors: raw.colors, count: count)
+        }
+
         // The decoded chunk is ~Copyable; do everything that touches it inside
         // the descriptor buffer's scope so the C++ ChunkData stays alive while
         // ChunkPacker reads its raw pointers.
-        extraDescs.withUnsafeBufferPointer { descBuf -> ResidentChunk? in
+        return extraDescs.withUnsafeBufferPointer { descBuf -> ResidentChunk? in
             let chunk = reader.read_node(
                 Int32(id.depth), Int32(id.x), Int32(id.y), Int32(id.z),
                 slot, descBuf.baseAddress, Int32(descBuf.count)
