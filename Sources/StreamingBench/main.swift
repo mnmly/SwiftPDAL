@@ -37,10 +37,12 @@ struct StreamingBench {
         let opts = StreamingOptions(
             maxInFlightLoads: perTick,
             decodeConcurrency: concurrency,
-            driverTickInterval: .milliseconds(16)
+            driverTickInterval: .milliseconds(16),
+            emitRawPoints: ProcessInfo.processInfo.environment["SWIFTPDAL_RAW"] != nil
         )
 
         print("file:         \(isRemote ? url.absoluteString : url.path)")
+        print("mode:         \(opts.emitRawPoints ? "RAW (GPU-pack)" : "PACKED (CPU)")")
         print("concurrency:  \(concurrency)")
         print("perTick cap:  \(perTick)")
         print("tick:         16 ms")
@@ -96,9 +98,17 @@ struct StreamingBench {
                 totalAdded += update.added.count
                 for chunk in update.added {
                     totalPointsLoaded += UInt64(chunk.totalPointCount)
-                    bytesLoaded += UInt64(chunk.xyzLow.count + chunk.xyzMed.count
-                                          + chunk.xyzHigh.count + chunk.colors.count
-                                          + chunk.levels.count)
+                    if let pos = chunk.rawPositions, let col = chunk.rawColors {
+                        // Raw mode: verify sizes (Float3 16 B/pt + RGBA8 4 B/pt).
+                        precondition(pos.count == chunk.totalPointCount * 16, "rawPositions size")
+                        precondition(col.count == chunk.totalPointCount * 4, "rawColors size")
+                        precondition(chunk.xyzLow.isEmpty && chunk.levels.isEmpty, "packed buffers must be empty in raw mode")
+                        bytesLoaded += UInt64(pos.count + col.count)
+                    } else {
+                        bytesLoaded += UInt64(chunk.xyzLow.count + chunk.xyzMed.count
+                                              + chunk.xyzHigh.count + chunk.colors.count
+                                              + chunk.levels.count)
+                    }
                 }
             }
             if Date().timeIntervalSince(lastReport) >= 1 {
