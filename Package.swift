@@ -19,6 +19,13 @@ let package = Package(
             name: "SwiftPDAL",
             targets: ["SwiftPDAL"],
         ),
+        // Exposes the copc-lib/lazperf-backed COPC reader (swiftpdal::copc::Reader)
+        // for consumers that only need direct out-of-core node decoding without
+        // the full PDAL/GDAL resident path. Used by the bl_copc_renderer dylib.
+        .library(
+            name: "CxxCOPC",
+            targets: ["CxxCOPC"],
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.4.3"),
