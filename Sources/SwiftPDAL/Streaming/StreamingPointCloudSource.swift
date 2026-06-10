@@ -355,7 +355,9 @@ public struct StreamingOptions: Sendable {
     /// the file. Each reader owns its own `fstream`, so up to this many
     /// node decodes run concurrently on cooperative threads. Setting this
     /// above the physical core count rarely helps; the underlying LAZ
-    /// decompression is single-threaded per chunk.
+    /// decompression is single-threaded per chunk. This is the *per-source*
+    /// reader-pool size; aggregate decode concurrency across all open
+    /// sources is additionally bounded by ``StreamingDecodeGate``.
     public var decodeConcurrency: Int
     /// LOD level source. See ``LODMode``.
     public var lodMode: LODMode
@@ -665,6 +667,11 @@ final class JobQueue: @unchecked Sendable {
 /// publishes residency deltas to a lock-protected queue that
 /// ``pollLatest()`` drains.
 ///
+/// Aggregate decode parallelism across all open sources is additionally
+/// bounded by the process-wide ``StreamingDecodeGate``: a worker acquires a
+/// shared slot before each LAZ decode, so N sources never run more than the
+/// gate's limit of concurrent decodes in total.
+///
 /// - Important: Call ``close()`` when finished to release the file handle
 ///   and stop the driver Task.
 public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @unchecked Sendable {
@@ -953,6 +960,11 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                 let slotIndex = Int32(slot)
                 while !Task.isCancelled {
                     guard let id = await jobs.pop() else { break }
+                    // Bound aggregate decode parallelism across all open
+                    // sources via the process-wide gate. Acquire only after
+                    // claiming a job, and release the moment the decode is
+                    // done — completeLoad doesn't need the slot.
+                    await StreamingDecodeGate.shared.acquire()
                     let chunk = StreamingDriver.decodeAndPack(
                         reader: handleBox.reader,
                         slot: slotIndex,
@@ -962,6 +974,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                         extraNames: extraNames,
                         rgbShiftBits: rgbShiftBits
                     )
+                    StreamingDecodeGate.shared.release()
                     await driver.completeLoad(id: id, chunk: chunk)
                 }
             }

@@ -75,6 +75,7 @@ once with `pdal translate in.las out.copc.laz --writers.copc`.
 - ``CopcStreamingPointCloudSource``
 - ``StreamingSourceInfo``
 - ``StreamingOptions``
+- ``StreamingDecodeGate``
 - ``LODMode``
 - ``StreamingSourceError``
 
