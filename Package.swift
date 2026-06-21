@@ -26,6 +26,12 @@ let package = Package(
             name: "CxxCOPC",
             targets: ["CxxCOPC"],
         ),
+        // CLI that converts any PDAL-readable point cloud into COPC.
+        //   swift run -c release PDAL2COPC <input> [output.copc.laz]
+        .executable(
+            name: "PDAL2COPC",
+            targets: ["PDAL2COPC"],
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.4.3"),
@@ -213,6 +219,17 @@ let package = Package(
             name: "SidecarTool",
             dependencies: ["SwiftPDAL"],
             path: "Sources/SidecarTool",
+            swiftSettings: [
+                .interoperabilityMode(.Cxx)
+            ]
+        ),
+
+        // CLI: convert any PDAL-readable point cloud to COPC. Run with:
+        //   swift run -c release PDAL2COPC /path/to/input [output.copc.laz]
+        .executableTarget(
+            name: "PDAL2COPC",
+            dependencies: ["SwiftPDAL"],
+            path: "Sources/PDAL2COPC",
             swiftSettings: [
                 .interoperabilityMode(.Cxx)
             ]
