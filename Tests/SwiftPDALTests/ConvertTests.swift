@@ -66,6 +66,58 @@ import Foundation
             "ferried custom dim should survive conversion as Extra Bytes (got \(pc.dimensions.map(\.name)))")
 }
 
+@Test func convertStreamingPreservesExtraDimensions() async throws {
+    setenv("SWIFTPDAL_TESTING", "1", 1)
+    guard let input = Bundle.module.path(forResource: "test", ofType: "laz") else {
+        Issue.record("test.laz missing from bundle"); return
+    }
+    let inputURL = URL(fileURLWithPath: input)
+    let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("extradims-stream-\(UUID().uuidString).copc.laz")
+    defer { try? FileManager.default.removeItem(at: outputURL) }
+
+    // Like `convertPreservesExtraDimensionsAsExtraBytes`, but exercises the
+    // STREAMING two-pass capture path (CapturingStreamTable) used for the
+    // non-streamable COPC writer — the case that bites real files. Regression
+    // for the capture mirroring custom dims into the sink layout by raw Id,
+    // which dropped their names and made writers.copc `extra_dims: "all"` fail
+    // with "Dimension '' ... not found" on any file carrying custom dims.
+    //
+    // The two-pass path is only taken when an `onProgress` handler is set
+    // (otherwise the wrapper falls back to a plain non-streaming execute), so
+    // the no-op handler below is load-bearing. Two ferried dims also exercise
+    // the source→sink dim-Id remap in the value copy.
+    let options = ConvertOptions(
+        filters: [PDALStage("filters.ferry",
+                            ["dimensions": .string("X=>my_score, Y=>my_tag")])],
+        streaming: true,
+        onProgress: { _ in true }
+    )
+    _ = try PDALConvert.convert(from: inputURL, to: outputURL, options: options)
+
+    let pc = try PointCloud.read(from: outputURL.path, readerName: "readers.copc")
+    #expect(pc.dimensions.contains { $0.name == "my_score" },
+            "ferried custom dim should survive the streaming path (got \(pc.dimensions.map(\.name)))")
+    #expect(pc.dimensions.contains { $0.name == "my_tag" })
+
+    // Values must round-trip, not just the names: the capture remaps dim Ids
+    // between the source and sink layouts, so a wrong mapping would silently
+    // corrupt point data. Ferry copies X verbatim, so my_score == X per point.
+    guard let xDim = pc.dimensions.first(where: { $0.name == "X" }),
+          let scoreDim = pc.dimensions.first(where: { $0.name == "my_score" }) else {
+        Issue.record("X / my_score missing from output"); return
+    }
+    var mismatches = 0
+    let sampleCount = min(pc.pointCount, 1000)
+    for i in 0..<sampleCount {
+        let p = pc.data + i * pc.stride
+        let x = p.loadUnaligned(fromByteOffset: xDim.offset, as: Float.self)
+        let s = p.loadUnaligned(fromByteOffset: scoreDim.offset, as: Float.self)
+        if x != s { mismatches += 1 }
+    }
+    #expect(mismatches == 0, "ferried my_score should equal X (\(mismatches)/\(sampleCount) mismatched)")
+}
+
 @Test func convertReportsProgress() async throws {
     setenv("SWIFTPDAL_TESTING", "1", 1)
     guard let input = Bundle.module.path(forResource: "test", ofType: "laz") else {

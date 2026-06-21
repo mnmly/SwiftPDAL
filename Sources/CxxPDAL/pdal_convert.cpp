@@ -112,9 +112,24 @@ protected:
         // know the dim set until prepare() ran.
         if (!ready_) {
             dims_ = layout()->dimTypes();
+            pdal::PointLayoutPtr srcLayout = layout();
             pdal::PointLayoutPtr sinkLayout = sink_->layout();
+            // Register each dim in the sink BY NAME, not by raw Id. Custom
+            // (proprietary) dimensions carry layout-local Ids whose name
+            // binding lives only in the source layout; copying the bare Id
+            // into the sink leaves it nameless, which later breaks
+            // `writers.copc` with extra_dims="all" — it enumerates the sink
+            // layout and rejects the empty name ("Dimension '' ... not
+            // found"). registerOrAssignDim re-binds the name in the sink and
+            // returns its sink-local Id, which we keep (in dim order) for the
+            // value copy below since it may differ from the source Id.
+            sinkDims_.clear();
+            sinkDims_.reserve(dims_.size());
             for (const auto& d : dims_) {
-                sinkLayout->registerDim(d.m_id, d.m_type);
+                const std::string name = srcLayout->dimName(d.m_id);
+                pdal::Dimension::Id sinkId =
+                    sinkLayout->registerOrAssignDim(name, d.m_type);
+                sinkDims_.emplace_back(sinkId, d.m_type);
             }
             // The sink table will lazily finalize on first setField, but
             // doing it explicitly here keeps the layout stable for the
@@ -134,10 +149,15 @@ protected:
         for (pdal::PointId i = 0; i < n; ++i) {
             pdal::PointRef src(*this, i);
             src.getPackedData(dims_, pack.data());
-            // setField at idx == view->size() grows the view + table.
-            for (const auto& d : dims_) {
-                sink_->setField(d.m_id, d.m_type, base + i,
-                                pack.data() + offsetOf(d));
+            // Read packed in source dim order; write to the sink's
+            // (possibly remapped) dim Id. sinkDims_ is in the same order as
+            // dims_, so the packed offset advances in lockstep. setField at
+            // idx == view->size() grows the view + table.
+            std::size_t off = 0;
+            for (std::size_t k = 0; k < dims_.size(); ++k) {
+                sink_->setField(sinkDims_[k].m_id, sinkDims_[k].m_type,
+                                base + i, pack.data() + off);
+                off += pdal::Dimension::size(dims_[k].m_type);
             }
         }
         total_ += static_cast<uint64_t>(n);
@@ -148,22 +168,13 @@ protected:
     }
 
 private:
-    // Cached dim offsets inside the packed buffer.
-    std::size_t offsetOf(const pdal::DimType& target) const {
-        std::size_t off = 0;
-        for (const auto& d : dims_) {
-            if (d.m_id == target.m_id) return off;
-            off += pdal::Dimension::size(d.m_type);
-        }
-        return 0;
-    }
-
     pdal::PointViewPtr sink_;
     ProgressFn         cb_;
     void*              ctx_;
     uint64_t           est_total_;
     uint64_t           total_ = 0;
-    pdal::DimTypeList  dims_;
+    pdal::DimTypeList  dims_;      // source dims, in packed order
+    pdal::DimTypeList  sinkDims_;  // sink-local Ids, same order as dims_
     bool               ready_ = false;
 };
 
