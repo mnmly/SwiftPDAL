@@ -120,6 +120,36 @@ The Metal viewer features:
 - Efficient GPU-based point rendering
 - Interactive performance
 
+## Command-line tools
+
+### PDAL2COPC
+
+Convert any PDAL-readable point cloud (LAS/LAZ, PLY, PCD, BPF, E57, XYZ/TXT, …)
+into a Cloud-Optimized Point Cloud (`*.copc.laz`):
+
+```bash
+swift run -c release PDAL2COPC <input> [output.copc.laz] [--no-sidecar]
+```
+
+- The output path defaults to `<input-stem>.copc.laz` next to the input.
+- Custom per-point dimensions are preserved (`writers.copc` with
+  `extra_dims: "all"`).
+- By default it also writes a STAC pointcloud-extension sidecar at
+  `<output>.json` — the statistics fall out of the same streaming write
+  pass, so there's no extra read. Pass `--no-sidecar` to skip it.
+
+To install it as a self-contained command on your `PATH`, use the helper
+script. It Release-builds via `xcodebuild` and installs the binary,
+frameworks, and resource bundle into a Homebrew-style prefix:
+
+```bash
+scripts/install-cli.sh ~/.local      # no sudo; ~/.local/bin must be on PATH
+scripts/install-cli.sh               # default /usr/local (needs sudo)
+```
+
+> Note: `swift build`/`swift run` cannot build the streaming C++ reference
+> type, so `xcodebuild` is the supported path for the installable binary.
+
 ## Building from Source
 
 ### Prerequisites
