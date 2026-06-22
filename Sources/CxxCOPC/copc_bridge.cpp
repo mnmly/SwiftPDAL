@@ -169,10 +169,14 @@ public:
         decomp_->reset(std::move(cb));
 
         out_bytes.resize(static_cast<size_t>(point_count) * point_size);
-        char buf[256]; // any LAS point record fits
+        // Decompress each record straight into its slot in out_bytes. lazperf
+        // writes exactly `point_size` bytes per call (the record size the
+        // decompressor was built for: base format + Extra Bytes). A fixed-size
+        // stack bounce buffer is unsafe: files with many Extra Bytes dimensions
+        // produce records larger than any fixed cap (e.g. a 320-byte record for
+        // ~65 EB dims overflows a 256-byte buffer and smashes the stack).
         for (int i = 0; i < point_count; ++i) {
-            decomp_->decompress(buf);
-            std::memcpy(out_bytes.data() + static_cast<size_t>(i) * point_size, buf, point_size);
+            decomp_->decompress(out_bytes.data() + static_cast<size_t>(i) * point_size);
         }
     }
 

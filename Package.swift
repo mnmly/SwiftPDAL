@@ -241,6 +241,7 @@ let package = Package(
             resources: [
                 .copy("Resources/test.laz"),
                 .copy("Resources/test.copc.laz"),
+                .copy("Resources/wide_record.copc.laz"),
                 .copy("Resources/bunnyFloat.e57"),
                 .copy("Resources/Stanford_Dragon.ply")
             ],
