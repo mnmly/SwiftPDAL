@@ -145,6 +145,11 @@ public struct StreamingCameraView: Sendable, Equatable {
     public let viewProjection: simd_float4x4
     /// Pixels per world-unit at unit distance. Drives the desired LOD
     /// depth target. Approximation: `screenHeight / (2 * tan(fov/2))`.
+    /// Under an orthographic projection this is already pixels per
+    /// world-unit *at any distance* (`viewportHeight * 0.5 * P[1][1]`,
+    /// where `P[1][1] = 2/orthoHeight`) — the wanted-set scorer
+    /// auto-detects ortho from ``viewProjection``'s w-row and skips the
+    /// distance division in that case.
     public let pixelScale: Float
     /// Soft tolerance on depth selection. Nodes within ±N depth levels
     /// of the target depth remain resident.
@@ -275,10 +280,12 @@ public struct ResidentChunk: Sendable {
 
     /// Total points in this chunk (sum of `batches[i].numPoints`).
     public var totalPointCount: Int { batches.reduce(0) { $0 + Int($1.numPoints) } }
-    /// Approximate GPU byte cost: `totalPointCount * 17` (positions +
-    /// colors + levels). Use this to track budget against
-    /// ``StreamingSourceInfo/bytesPerPoint``.
-    public var byteCost: Int { totalPointCount * 17 }
+    /// Approximate GPU byte cost: `totalPointCount * (17 + 4 per extra
+    /// dimension)` — positions + colors + levels, plus one Float32 per point
+    /// per streamed extra dimension. Use this to track budget against
+    /// ``StreamingSourceInfo/bytesPerPoint`` +
+    /// ``StreamingSourceInfo/extraBytesPerPoint``.
+    public var byteCost: Int { totalPointCount * (17 + 4 * extraScalars.count) }
 }
 
 // MARK: - Update result
@@ -554,10 +561,37 @@ final class UpdateQueue: @unchecked Sendable {
     private let lock = NSLock()
     private var added: [ResidentChunk] = []
     private var removed: [ChunkID] = []
+    private var addedBytes = 0
+
+    /// Byte cost of queued-but-undrained `added` chunks. The driver reads
+    /// this to stop scheduling decodes while the consumer isn't draining —
+    /// otherwise the backlog grows without bound (a stalled consumer under
+    /// memory pressure feeds back into more memory pressure).
+    var pendingAddedBytes: Int {
+        lock.lock(); defer { lock.unlock() }
+        return addedBytes
+    }
 
     func enqueue(added: [ResidentChunk], removed: [ChunkID]) {
         lock.lock(); defer { lock.unlock() }
+        var removed = removed
+        if !removed.isEmpty && !self.added.isEmpty {
+            // An eviction cancels a queued-but-undrained add of the same
+            // chunk: the consumer never saw the add, so drop the payload
+            // and swallow the matching removal. Without this, camera
+            // thrash accumulates full payloads for already-evicted chunks.
+            let rm = Set(removed)
+            var swallowed = Set<ChunkID>()
+            self.added.removeAll { chunk in
+                guard rm.contains(chunk.id) else { return false }
+                swallowed.insert(chunk.id)
+                addedBytes -= chunk.byteCost
+                return true
+            }
+            if !swallowed.isEmpty { removed.removeAll { swallowed.contains($0) } }
+        }
         self.added.append(contentsOf: added)
+        for chunk in added { addedBytes += chunk.byteCost }
         self.removed.append(contentsOf: removed)
     }
 
@@ -567,6 +601,7 @@ final class UpdateQueue: @unchecked Sendable {
         let u = StreamingUpdate(added: added, removed: removed)
         added.removeAll(keepingCapacity: true)
         removed.removeAll(keepingCapacity: true)
+        addedBytes = 0
         return u
     }
 }
@@ -896,7 +931,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             originShift: originShift,
             options: options,
             queue: queue,
-            jobs: jobs
+            jobs: jobs,
+            budgetBytesPerPoint: 17 + 4 * extraNames.count
         )
 
         // Decide the RGB rescale ONCE for the whole file (see ``rgbShiftBits``).
@@ -942,10 +978,18 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
     private func startDriver() {
         let driver = self.driver
         let tickInterval = driver.tickInterval
+        // Idle backoff: a static camera with a fully-drained pipeline
+        // doesn't need a wakeup every `tickInterval` (WABF configures
+        // 16ms, i.e. 60Hz). Sleep longer after a tick that did no
+        // meaningful work; `submit(view:)` is latest-wins, so a camera
+        // move mid-sleep is still picked up on the next wake — worst-case
+        // reaction time only grows to `idleInterval` when the system was
+        // genuinely idle.
+        let idleInterval = max(tickInterval, .milliseconds(100))
         driverTask = Task.detached(priority: .utility) {
             while !Task.isCancelled {
-                await driver.runOneTick()
-                try? await Task.sleep(for: tickInterval)
+                let didWork = await driver.runOneTick()
+                try? await Task.sleep(for: didWork ? tickInterval : idleInterval)
             }
         }
 
@@ -1088,6 +1132,11 @@ actor StreamingDriver {
     private let nodeIndexByID: [ChunkID: Int]
     private let allNodeIDs: Set<ChunkID>
     private let totalNodeBytes: Int
+    /// Estimated bytes per point for budget accounting: 17 (positions +
+    /// colors + levels) plus 4 per requested extra dimension. Extra dims
+    /// were previously invisible to the budget, so a schema-heavy file
+    /// could exceed it by `4 × dims / 17` without ever tripping admission.
+    private let budgetBytesPerPoint: Int
     private let maxNodeDepth: Int
     private let originShift: SIMD3<Double>
     private let options: StreamingOptions
@@ -1098,8 +1147,11 @@ actor StreamingDriver {
     private var latestView: StreamingCameraView?
     private var budgetBytes: Int = .max
 
+    /// Residency bookkeeping only — deliberately does NOT retain the decoded
+    /// ``ResidentChunk`` payload. The payload is handed to the consumer via
+    /// the publish queue and never read again driver-side; retaining it here
+    /// duplicated the entire resident set (~budget bytes) in host memory.
     private struct ResidentEntry {
-        var chunk: ResidentChunk
         var ticksSinceWanted: Int
     }
     private var resident: [ChunkID: ResidentEntry] = [:]
@@ -1129,13 +1181,15 @@ actor StreamingDriver {
         originShift: SIMD3<Double>,
         options: StreamingOptions,
         queue: UpdateQueue,
-        jobs: JobQueue
+        jobs: JobQueue,
+        budgetBytesPerPoint: Int = 17
     ) {
         self.handleBox = handle
         self.nodes = nodes
         self.nodeIndexByID = Dictionary(uniqueKeysWithValues: nodes.enumerated().map { ($1.id, $0) })
         self.allNodeIDs = Set(nodes.lazy.map(\.id))
-        self.totalNodeBytes = nodes.reduce(0) { $0 + $1.pointCount * 17 }
+        self.budgetBytesPerPoint = budgetBytesPerPoint
+        self.totalNodeBytes = nodes.reduce(0) { $0 + $1.pointCount * budgetBytesPerPoint }
         self.maxNodeDepth = nodes.reduce(0) { max($0, $1.id.depth) }
         self.originShift = originShift
         self.options = options
@@ -1170,7 +1224,7 @@ actor StreamingDriver {
         if closed { return }
         let wasInFlight = inFlight.remove(id) != nil
         guard wasInFlight, let chunk else { return }
-        resident[id] = ResidentEntry(chunk: chunk, ticksSinceWanted: 0)
+        resident[id] = ResidentEntry(ticksSinceWanted: 0)
         queue.enqueue(added: [chunk], removed: [])
     }
 
@@ -1214,19 +1268,26 @@ actor StreamingDriver {
         )
     }
 
-    func runOneTick() {
-        if closed { return }
-        guard let view = latestView else { return }
+    /// Runs one residency-policy pass. Returns whether the tick did any
+    /// meaningful work (wanted-set recompute, eviction, or scheduling) —
+    /// ``CopcStreamingPointCloudSource/startDriver()`` uses this to back
+    /// off the tick cadence when the camera and resident set are static.
+    @discardableResult
+    func runOneTick() -> Bool {
+        if closed { return false }
+        guard let view = latestView else { return false }
 
         // 1. Score nodes against the camera + budget — cached when the
         //    (view, budget) pair is unchanged from the previous tick.
         let wanted: Set<ChunkID>
         let wantedOrdered: [ChunkID]
+        let wasCacheMiss: Bool
         if let cv = cachedView, cv == view, cachedBudget == budgetBytes {
             wanted = cachedWanted
             wantedOrdered = cachedWantedSorted
             lastTickCandidates = cachedCandidates
             wantedCacheHits &+= 1
+            wasCacheMiss = false
         } else {
             let computed = computeWantedSet(view: view, budget: budgetBytes)
             wanted = computed.set
@@ -1237,6 +1298,7 @@ actor StreamingDriver {
             cachedWantedSorted = wantedOrdered
             cachedCandidates = lastTickCandidates
             wantedCacheMisses &+= 1
+            wasCacheMiss = true
         }
         lastTickWanted = wanted.count
         lastTickResident = resident.count
@@ -1282,6 +1344,17 @@ actor StreamingDriver {
         //    chunks publish to ``UpdateQueue`` from
         //    ``completeLoad(id:chunk:)``, so a slow decode does not
         //    stall subsequent ticks.
+        // Backpressure: if the consumer isn't draining the publish queue
+        // (stalled frame loop, memory pressure), stop scheduling decodes —
+        // decoded-but-unconsumed chunks are pure memory growth. Resumes
+        // automatically on the next tick after a drain. Counts as an
+        // active tick (not idle): work is pending behind the consumer's
+        // drain, so we want to retry at the fast cadence and resume
+        // promptly once the queue drains, rather than backing off while
+        // genuinely busy.
+        let backlogCap = min(max(64 << 20, budgetBytes / 4), 512 << 20)
+        if queue.pendingAddedBytes >= backlogCap { return true }
+
         var toLoad: [ChunkID] = []
         toLoad.reserveCapacity(options.maxInFlightLoads)
         for id in wantedOrdered {
@@ -1290,9 +1363,17 @@ actor StreamingDriver {
             if inFlight.contains(id) { continue }
             toLoad.append(id)
         }
-        if toLoad.isEmpty { return }
+        if toLoad.isEmpty {
+            // Nothing new to schedule this tick — still "active" if the
+            // wanted set changed, something was evicted, or wanted chunks
+            // remain non-resident (queued behind the maxInFlightLoads cap
+            // or still decoding). Only a pure no-op tick backs off.
+            let pendingWantedWork = wanted.contains { resident[$0] == nil }
+            return wasCacheMiss || !tickRemoved.isEmpty || pendingWantedWork
+        }
         for id in toLoad { inFlight.insert(id) }
         jobs.enqueue(toLoad)
+        return true
     }
 
     private func computeWantedSet(view: StreamingCameraView, budget: Int)
@@ -1335,9 +1416,29 @@ actor StreamingDriver {
         let target = max(options.targetChunkScreenSize, 1)
         let pixelScale = max(view.pixelScale, 1e-6)
 
+        // Ortho detection: for projection·view built from a rigid view
+        // matrix and an orthographic projection, the w-row collapses to
+        // (0,0,0,1) — there's no perspective divide. Apparent on-screen
+        // size under ortho is therefore distance-independent (no
+        // foreshortening), so dividing by distance would skew the wanted
+        // set toward whichever chunks happen to sit near the camera
+        // position rather than the ones matching the true projected
+        // footprint. `pixelScale` is already pixels-per-world-unit in
+        // that case (see its doc comment), so the ortho branch below
+        // uses it directly.
+        let m = view.viewProjection
+        let isOrthographic =
+            abs(m.columns.0.w) < 1e-6 && abs(m.columns.1.w) < 1e-6 &&
+            abs(m.columns.2.w) < 1e-6 && abs(m.columns.3.w - 1) < 1e-3
+
         func score(for node: NodeMeta) -> Float {
-            let distance = simd_length(node.center - view.position) + 1e-3
-            let screenPx = max(node.extent * pixelScale / distance, 1e-6)
+            let screenPx: Float
+            if isOrthographic {
+                screenPx = max(node.extent * pixelScale, 1e-6)
+            } else {
+                let distance = simd_length(node.center - view.position) + 1e-3
+                screenPx = max(node.extent * pixelScale / distance, 1e-6)
+            }
             let err = abs(log2(screenPx / target))
             return 1 / (1 + err)
         }
@@ -1346,12 +1447,12 @@ actor StreamingDriver {
         case .distanceOnly:
             // No frustum gate — everything is a candidate.
             for node in nodes {
-                visible.append(Scored(id: node.id, score: score(for: node), bytes: node.pointCount * 17))
+                visible.append(Scored(id: node.id, score: score(for: node), bytes: node.pointCount * budgetBytesPerPoint))
             }
         case .frustumFirstThenHalo:
             let planes = FrustumPlanes(viewProjection: view.viewProjection)
             for node in nodes {
-                let s = Scored(id: node.id, score: score(for: node), bytes: node.pointCount * 17)
+                let s = Scored(id: node.id, score: score(for: node), bytes: node.pointCount * budgetBytesPerPoint)
                 if planes.intersects(min: node.minXYZ, max: node.maxXYZ) {
                     visible.append(s)
                 } else {
@@ -1453,7 +1554,9 @@ actor StreamingDriver {
 
 // MARK: - Frustum
 
-/// 6-plane frustum extracted from a view-projection matrix (Gribb-Hartmann).
+/// 6-plane frustum extracted from a view-projection matrix (Gribb-Hartmann),
+/// adapted for Metal's clip-space z convention (z ∈ [0, w], not OpenGL's
+/// [-w, w]).
 struct FrustumPlanes: Sendable {
     let planes: [SIMD4<Float>]  // ax + by + cz + d >= 0 means "inside"
 
@@ -1465,10 +1568,15 @@ struct FrustumPlanes: Sendable {
         let r2 = SIMD4<Float>(m.columns.0.z, m.columns.1.z, m.columns.2.z, m.columns.3.z)
         let r3 = SIMD4<Float>(m.columns.0.w, m.columns.1.w, m.columns.2.w, m.columns.3.w)
 
+        // Metal clips z to [0, w] (not OpenGL's [-w, w]), so the near
+        // half-space is `r2` alone — `r3 + r2` is the OpenGL near plane
+        // and never culls anything under Metal's convention (under ortho,
+        // w≡1 makes it `1 + z ≥ 0`, always true). Under reversed-Z the
+        // same pair still bounds the same clip-space slab.
         planes = [
             r3 + r0, r3 - r0,   // left, right
             r3 + r1, r3 - r1,   // bottom, top
-            r3 + r2, r3 - r2,   // near, far
+            r2, r3 - r2,        // near (z ≥ 0, Metal clip), far (z ≤ w)
         ]
     }
 
