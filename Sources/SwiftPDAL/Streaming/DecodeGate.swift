@@ -16,11 +16,27 @@ import Foundation
 /// ``currentLimit``. Lowering applies lazily — running decodes finish and
 /// new acquires park until headroom frees up — so there is no preemption.
 ///
+/// ## Priority lane
+///
+/// Waiters park in one of two FIFO lanes. A freed slot is handed to the
+/// oldest *priority* waiter first, falling back to the oldest *normal*
+/// waiter only when the priority lane is empty. Callers mark the
+/// coarse-coverage nodes of a newly-visible cloud — a COPC octree's
+/// root/near-root depths — as priority via ``acquire(priority:)`` so their
+/// time-to-first-points isn't blocked behind dozens of far-cloud leaf-node
+/// decodes when many sources are open at once.
+///
+/// The normal lane cannot starve indefinitely: priority work is confined to
+/// the coarse depths of each octree, which are a small, bounded fraction of
+/// any COPC's node set (a handful of nodes near the root versus the
+/// exponentially larger leaf population), so the priority lane drains and
+/// normal waiters make progress.
+///
 /// The implementation is a hand-rolled adjustable async semaphore built on
 /// `NSLock` plus parked `CheckedContinuation`s, mirroring the package's
 /// internal `JobQueue`: continuations are always resumed *outside* the
-/// lock, and every parked waiter is guaranteed to be resumed by either
-/// the internal `release()` path or ``setLimit(_:)``.
+/// lock, and every parked waiter — in either lane — is guaranteed to be
+/// resumed by either the internal `release()` path or ``setLimit(_:)``.
 public final class StreamingDecodeGate: @unchecked Sendable {
     /// The shared process-wide gate used by every streaming source.
     public static let shared = StreamingDecodeGate()
@@ -28,7 +44,19 @@ public final class StreamingDecodeGate: @unchecked Sendable {
     private let lock = NSLock()
     private var limit: Int
     private var inFlight: Int = 0
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    /// Waiters that requested priority (coarse-coverage nodes); drained first.
+    private var priorityWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Ordinary waiters; drained only when the priority lane is empty.
+    private var normalWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Dequeue the next waiter to hand a freed slot to — the oldest priority
+    /// waiter, else the oldest normal waiter, else `nil` (both lanes FIFO).
+    /// Must be called with `lock` held.
+    private func dequeueNextWaiter() -> CheckedContinuation<Void, Never>? {
+        if !priorityWaiters.isEmpty { return priorityWaiters.removeFirst() }
+        if !normalWaiters.isEmpty { return normalWaiters.removeFirst() }
+        return nil
+    }
 
     /// Default limit: leave two cores free for the rest of the process,
     /// but never drop below two concurrent decodes.
@@ -59,9 +87,10 @@ public final class StreamingDecodeGate: @unchecked Sendable {
     /// Set a new concurrency cap, taking effect immediately.
     ///
     /// Raising the limit resumes as many parked waiters as the new
-    /// headroom allows (each counted as in-flight before being resumed).
-    /// Lowering the limit applies lazily: in-flight decodes are never
-    /// preempted; subsequent acquires park until releases free up room.
+    /// headroom allows (priority lane first, then normal — each counted as
+    /// in-flight before being resumed). Lowering the limit applies lazily:
+    /// in-flight decodes are never preempted; subsequent acquires park until
+    /// releases free up room.
     ///
     /// - Parameter newLimit: The desired cap; clamped to ≥ 1.
     public func setLimit(_ newLimit: Int) {
@@ -69,9 +98,9 @@ public final class StreamingDecodeGate: @unchecked Sendable {
         let toResume: [CheckedContinuation<Void, Never>] = lock.withLock {
             limit = clamped
             var resumed: [CheckedContinuation<Void, Never>] = []
-            while inFlight < limit, !waiters.isEmpty {
+            while inFlight < limit, let c = dequeueNextWaiter() {
                 inFlight += 1
-                resumed.append(waiters.removeFirst())
+                resumed.append(c)
             }
             return resumed
         }
@@ -81,9 +110,14 @@ public final class StreamingDecodeGate: @unchecked Sendable {
     /// Wait until a decode slot is available, then claim it.
     ///
     /// Returns immediately if the in-flight count is below the limit;
-    /// otherwise parks FIFO until a ``release()`` or ``setLimit(_:)``
-    /// hands off a slot. Always pair with exactly one ``release()``.
-    func acquire() async {
+    /// otherwise parks FIFO within its lane until a ``release()`` or
+    /// ``setLimit(_:)`` hands off a slot. Always pair with exactly one
+    /// ``release()``.
+    ///
+    /// - Parameter priority: When `true`, park in the priority lane so this
+    ///   acquire is served before any normal waiter. Used for a cloud's
+    ///   coarse-coverage nodes so their points reach the screen first.
+    func acquire(priority: Bool = false) async {
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
             enum Action { case resume, wait }
             // No await happens while holding the lock.
@@ -92,7 +126,11 @@ public final class StreamingDecodeGate: @unchecked Sendable {
                     inFlight += 1
                     return .resume
                 }
-                waiters.append(c)
+                if priority {
+                    priorityWaiters.append(c)
+                } else {
+                    normalWaiters.append(c)
+                }
                 return .wait
             }
             switch action {
@@ -104,15 +142,15 @@ public final class StreamingDecodeGate: @unchecked Sendable {
 
     /// Return a previously acquired slot.
     ///
-    /// Hands the freed slot to the oldest parked waiter when one exists
-    /// and there is room under the current limit; otherwise just lowers
-    /// the in-flight count.
+    /// Hands the freed slot to the oldest priority waiter (else the oldest
+    /// normal waiter) when one exists and there is room under the current
+    /// limit; otherwise just lowers the in-flight count.
     func release() {
         let toResume: CheckedContinuation<Void, Never>? = lock.withLock {
             inFlight -= 1
-            if inFlight < limit, !waiters.isEmpty {
+            if inFlight < limit, let c = dequeueNextWaiter() {
                 inFlight += 1
-                return waiters.removeFirst()
+                return c
             }
             return nil
         }

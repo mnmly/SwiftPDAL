@@ -179,6 +179,60 @@ private func waitUntil(
         #expect(done.count == 4)
         #expect(tracker.maxObserved == 1)
     }
+
+    @Test func priorityLaneServedFirst() async {
+        let gate = StreamingDecodeGate(limit: 1)
+        let holdRelease = ReleaseToken()
+        let holderIn = Counter()
+        let order = OrderLog()
+
+        await withTaskGroup(of: Void.self) { group in
+            // Occupy the single slot and hold it.
+            group.addTask {
+                await gate.acquire()
+                holderIn.increment()
+                await holdRelease.wait()
+                gate.release()
+            }
+            _ = await waitUntil { holderIn.count == 1 }
+
+            // Park a NORMAL waiter first…
+            group.addTask {
+                await gate.acquire(priority: false)
+                order.record("normal")
+                gate.release()
+            }
+            // …let it reach its park point before enqueuing the next.
+            try? await Task.sleep(for: .milliseconds(30))
+
+            // …then a PRIORITY waiter, parked strictly after the normal one.
+            group.addTask {
+                await gate.acquire(priority: true)
+                order.record("priority")
+                gate.release()
+            }
+            try? await Task.sleep(for: .milliseconds(30))
+
+            // Free the single slot. Even though the normal waiter parked
+            // first, the priority lane must be served ahead of it.
+            holdRelease.fire()
+
+            _ = await waitUntil { order.count == 2 }
+        }
+
+        #expect(order.count == 2)
+        #expect(order.first == "priority")
+    }
+}
+
+/// Lock-protected ordered log of resume events, for asserting which lane a
+/// freed slot was handed to first.
+private final class OrderLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [String] = []
+    func record(_ s: String) { lock.withLock { entries.append(s) } }
+    var first: String? { lock.withLock { entries.first } }
+    var count: Int { lock.withLock { entries.count } }
 }
 
 /// One-shot async gate: callers `await wait()` until `fire()` is called,
