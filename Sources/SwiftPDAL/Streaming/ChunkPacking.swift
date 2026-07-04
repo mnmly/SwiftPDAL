@@ -75,138 +75,174 @@ enum ChunkPacker {
         }
 
         let order = mortonOrder(positions: positions, boundsMin: boundsMin, boundsMax: boundsMax)
-        let sortedPositions = order.map { positions[$0] }
+
+        // Materialize the positions in Morton order exactly once. Both the LOD
+        // pass (which greedily assigns levels while walking points in Morton
+        // order — see `computeLODLevels`) and the per-batch quantize pass below
+        // consume this ordering; keeping one contiguous copy lets those passes
+        // stream sequentially instead of chasing `order` indirectly through the
+        // source `positions` several times (a cache pessimization that grows
+        // with node size). This is the single reorder; the quantize/colors/extra
+        // passes fuse their reorder into the write, so no other temporary is
+        // built.
+        var orderedPositions = [SIMD3<Float>](repeating: .zero, count: count)
+        positions.withUnsafeBufferPointer { src in
+            order.withUnsafeBufferPointer { ord in
+                orderedPositions.withUnsafeMutableBufferPointer { dst in
+                    for i in 0..<count { dst[i] = src[ord[i]] }
+                }
+            }
+        }
 
         let levels = computeLODLevels(
-            positions: sortedPositions,
+            positions: orderedPositions,
             boundsMin: boundsMin,
             boundsMax: boundsMax,
             lodLevels: max(1, min(lodLevels, 8)),
             coarseVoxelDivisions: max(1, coarseVoxelDivisions)
         )
 
+        // Allocate the packed position buffers at their final size and quantize
+        // straight into them — one traversal, no intermediate [UInt32] arrays or
+        // per-array `Data` copies. Each point is quantized against its batch's
+        // AABB, so batches are still built by walking the Morton-ordered points
+        // in `pointsPerBatch`-sized runs.
         var batches: [StreamingRasterBatch] = []
-        var xyzLow  = [UInt32](repeating: 0, count: count)
-        var xyzMed  = [UInt32](repeating: 0, count: count)
-        var xyzHigh = [UInt32](repeating: 0, count: count)
+        var xyzLow  = Data(count: count * MemoryLayout<UInt32>.stride)
+        var xyzMed  = Data(count: count * MemoryLayout<UInt32>.stride)
+        var xyzHigh = Data(count: count * MemoryLayout<UInt32>.stride)
 
         let batchSize = max(pointsPerBatch, 1)
-        var first = 0
-        while first < count {
-            let end = min(first + batchSize, count)
-            var batchMin = SIMD3<Float>(repeating:  .greatestFiniteMagnitude)
-            var batchMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
-            for i in first..<end {
-                batchMin = simd_min(batchMin, sortedPositions[i])
-                batchMax = simd_max(batchMax, sortedPositions[i])
+        let stepsMinusOne = Float(steps30Bit - 1)
+
+        orderedPositions.withUnsafeBufferPointer { pos in
+            xyzLow.withUnsafeMutableBytes { lowRaw in
+                xyzMed.withUnsafeMutableBytes { medRaw in
+                    xyzHigh.withUnsafeMutableBytes { highRaw in
+                        let low  = lowRaw.bindMemory(to: UInt32.self)
+                        let med  = medRaw.bindMemory(to: UInt32.self)
+                        let high = highRaw.bindMemory(to: UInt32.self)
+
+                        var first = 0
+                        while first < count {
+                            let end = min(first + batchSize, count)
+
+                            // Per-batch AABB over the Morton-ordered slice (kept
+                            // hot in cache for the quantize sub-pass below).
+                            var batchMin = SIMD3<Float>(repeating:  .greatestFiniteMagnitude)
+                            var batchMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+                            for i in first..<end {
+                                batchMin = simd_min(batchMin, pos[i])
+                                batchMax = simd_max(batchMax, pos[i])
+                            }
+                            let size = simd_max(batchMax - batchMin, SIMD3<Float>(repeating: 1e-6))
+
+                            for i in first..<end {
+                                let n = simd_clamp(
+                                    (pos[i] - batchMin) / size,
+                                    .zero, SIMD3<Float>(repeating: 0.99999994)
+                                )
+                                let qx = UInt32(n.x * stepsMinusOne)
+                                let qy = UInt32(n.y * stepsMinusOne)
+                                let qz = UInt32(n.z * stepsMinusOne)
+
+                                let xL = (qx >> 20) & mask10Bit
+                                let yL = (qy >> 20) & mask10Bit
+                                let zL = (qz >> 20) & mask10Bit
+                                let xM = (qx >> 10) & mask10Bit
+                                let yM = (qy >> 10) & mask10Bit
+                                let zM = (qz >> 10) & mask10Bit
+                                let xH =  qx        & mask10Bit
+                                let yH =  qy        & mask10Bit
+                                let zH =  qz        & mask10Bit
+
+                                low[i]  = xL | (yL << 10) | (zL << 20)
+                                med[i]  = xM | (yM << 10) | (zM << 20)
+                                high[i] = xH | (yH << 10) | (zH << 20)
+                            }
+
+                            batches.append(StreamingRasterBatch(
+                                state: 1,
+                                min: batchMin,
+                                max: batchMax,
+                                numPoints: UInt32(end - first),
+                                firstPoint: UInt32(first),
+                                fileIndex: 0
+                            ))
+                            first = end
+                        }
+                    }
+                }
             }
-            let size = simd_max(batchMax - batchMin, SIMD3<Float>(repeating: 1e-6))
-            let stepsMinusOne = Float(steps30Bit - 1)
-
-            for i in first..<end {
-                let n = simd_clamp(
-                    (sortedPositions[i] - batchMin) / size,
-                    .zero, SIMD3<Float>(repeating: 0.99999994)
-                )
-                let qx = UInt32(n.x * stepsMinusOne)
-                let qy = UInt32(n.y * stepsMinusOne)
-                let qz = UInt32(n.z * stepsMinusOne)
-
-                let xL = (qx >> 20) & mask10Bit
-                let yL = (qy >> 20) & mask10Bit
-                let zL = (qz >> 20) & mask10Bit
-                let xM = (qx >> 10) & mask10Bit
-                let yM = (qy >> 10) & mask10Bit
-                let zM = (qz >> 10) & mask10Bit
-                let xH =  qx        & mask10Bit
-                let yH =  qy        & mask10Bit
-                let zH =  qz        & mask10Bit
-
-                xyzLow[i]  = xL | (yL << 10) | (zL << 20)
-                xyzMed[i]  = xM | (yM << 10) | (zM << 20)
-                xyzHigh[i] = xH | (yH << 10) | (zH << 20)
-            }
-
-            batches.append(StreamingRasterBatch(
-                state: 1,
-                min: batchMin,
-                max: batchMax,
-                numPoints: UInt32(end - first),
-                firstPoint: UInt32(first),
-                fileIndex: 0
-            ))
-            first = end
         }
 
-        // Pack colors. LAS RGB is 16-bit per channel; rescale to 8-bit.
-        // No alpha channel in COPC, so set A = 255.
-        var colors = [UInt32](repeating: 0, count: count)
-        if hasRgb {
-            // 8-bit-vs-16-bit RGB rescale. Prefer a GLOBAL shift decided once for
-            // the whole file (passed in via `rgbShiftBits`): deciding it per node
-            // mis-classifies uniformly-dark nodes — every channel ≤ 255 in a true
-            // 16-bit file — as "8-bit", emitting their tiny values un-shifted and
-            // rendering them oversaturated (square patches of wrong colour). Fall
-            // back to the per-node heuristic only when no global shift was supplied.
-            let shift: UInt32
-            if let rgbShiftBits {
-                shift = rgbShiftBits
-            } else {
-                var maxVal: UInt16 = 0
-                for i in 0..<count {
-                    let r = rgb16[3*i+0], g = rgb16[3*i+1], b = rgb16[3*i+2]
-                    if r > maxVal { maxVal = r }
-                    if g > maxVal { maxVal = g }
-                    if b > maxVal { maxVal = b }
+        // Pack colors straight into the output `Data`. LAS RGB is 16-bit per
+        // channel; rescale to 8-bit. No alpha channel in COPC, so set A = 255.
+        var colors = Data(count: count * MemoryLayout<UInt32>.stride)
+        colors.withUnsafeMutableBytes { raw in
+            let dst = raw.bindMemory(to: UInt32.self)
+            if hasRgb {
+                // 8-bit-vs-16-bit RGB rescale. Prefer a GLOBAL shift decided once
+                // for the whole file (passed in via `rgbShiftBits`): deciding it
+                // per node mis-classifies uniformly-dark nodes — every channel
+                // ≤ 255 in a true 16-bit file — as "8-bit", emitting their tiny
+                // values un-shifted and rendering them oversaturated (square
+                // patches of wrong colour). Fall back to the per-node heuristic
+                // only when no global shift was supplied.
+                let shift: UInt32
+                if let rgbShiftBits {
+                    shift = rgbShiftBits
+                } else {
+                    var maxVal: UInt16 = 0
+                    for i in 0..<count {
+                        let r = rgb16[3*i+0], g = rgb16[3*i+1], b = rgb16[3*i+2]
+                        if r > maxVal { maxVal = r }
+                        if g > maxVal { maxVal = g }
+                        if b > maxVal { maxVal = b }
+                    }
+                    shift = maxVal > 255 ? 8 : 0
                 }
-                shift = maxVal > 255 ? 8 : 0
+                for dstIndex in 0..<count {
+                    let srcIndex = order[dstIndex]
+                    let r = UInt32(rgb16[3*srcIndex+0]) >> shift
+                    let g = UInt32(rgb16[3*srcIndex+1]) >> shift
+                    let b = UInt32(rgb16[3*srcIndex+2]) >> shift
+                    dst[dstIndex] = (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16) | (UInt32(255) << 24)
+                }
+            } else {
+                for i in 0..<count { dst[i] = 0xFFFFFFFF }
             }
-            for (dstIndex, srcIndex) in order.enumerated() {
-                let r = UInt32(rgb16[3*srcIndex+0]) >> shift
-                let g = UInt32(rgb16[3*srcIndex+1]) >> shift
-                let b = UInt32(rgb16[3*srcIndex+2]) >> shift
-                colors[dstIndex] = (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16) | (UInt32(255) << 24)
-            }
-        } else {
-            for i in 0..<count { colors[i] = 0xFFFFFFFF }
         }
 
         // Permute requested extra scalars into Morton order (dim-major input:
         // extra[d*count + srcIndex]) so each dim lines up with the packed
-        // positions/colors. Each output blob is `count` Float32.
+        // positions/colors. Each output blob is `count` Float32, written
+        // straight into its `Data`.
         var extraScalars: [String: Data] = [:]
         if let extra, extraCount > 0, extraCount == extraNames.count {
             for (d, name) in extraNames.enumerated() {
                 let base = d * count
-                var col = [Float](repeating: 0, count: count)
-                for (dstIndex, srcIndex) in order.enumerated() {
-                    col[dstIndex] = extra[base + srcIndex]
+                var colData = Data(count: count * MemoryLayout<Float>.stride)
+                colData.withUnsafeMutableBytes { raw in
+                    let col = raw.bindMemory(to: Float.self)
+                    for dstIndex in 0..<count {
+                        col[dstIndex] = extra[base + order[dstIndex]]
+                    }
                 }
-                extraScalars[name] = packedData(col)
+                extraScalars[name] = colData
             }
         }
 
         return Output(
             batches: batches,
-            xyzLow:  packedData(xyzLow),
-            xyzMed:  packedData(xyzMed),
-            xyzHigh: packedData(xyzHigh),
-            colors:  packedData(colors),
+            xyzLow:  xyzLow,
+            xyzMed:  xyzMed,
+            xyzHigh: xyzHigh,
+            colors:  colors,
             levels:  Data(levels),
             extraScalars: extraScalars
         )
     }
-}
-
-// Copy a Swift array into `Data` with an explicit buffer-pointer scope.
-// Passing an array straight to `Data(buffer: UnsafeBufferPointer(start:count:))`
-// trips Swift 6's [#TemporaryPointers] warning — the implicit array→pointer
-// conversion yields a pointer valid only for that one call. `Data(buffer:)`
-// copies synchronously so it's safe in practice, but the explicit scope is the
-// correct, warning-free idiom.
-@inline(__always)
-private func packedData<T>(_ array: [T]) -> Data {
-    array.withUnsafeBufferPointer { Data(buffer: $0) }
 }
 
 // Morton-order so consecutive entries are spatially close — gives tight
@@ -227,9 +263,66 @@ private func mortonOrder(
         let qx = UInt32(nrm.x), qy = UInt32(nrm.y), qz = UInt32(nrm.z)
         keys[i] = (mortonSpread10(qx) << 2) | (mortonSpread10(qy) << 1) | mortonSpread10(qz)
     }
-    var indices = Array(0..<count)
-    indices.sort { keys[$0] < keys[$1] }
-    return indices
+    return lsdRadixSortIndices(byKeys: keys, count: count)
+}
+
+// Stable LSD radix sort returning the index permutation that orders `keys`
+// ascending. Morton keys are 30-bit, so three 10-bit passes (a 1024-bucket
+// counting sort each, ping-ponging the index buffers) cover every bit and
+// yield exactly the ascending order the previous `indices.sort { keys[$0] <
+// keys[$1] }` produced. This replaces that O(P log P) comparison sort — the
+// dominant per-chunk pack cost on the decode workers — with O(P) work.
+//
+// Radix is stable: points sharing a Morton key (i.e. the same coarse voxel)
+// keep their input order, whereas the old introsort left them in an arbitrary
+// order. That tie ordering is not semantically meaningful, so the packed
+// output is unchanged apart from how equal-key points are interleaved.
+private func lsdRadixSortIndices(byKeys keys: [UInt32], count: Int) -> [Int] {
+    guard count > 1 else { return Array(0..<count) }
+
+    var src = Array(0..<count)                       // current index order
+    var dst = [Int](repeating: 0, count: count)      // scatter target (swapped in)
+    var offsets = [Int](repeating: 0, count: 1024)   // bucket offsets, reused per pass
+
+    keys.withUnsafeBufferPointer { key in
+        offsets.withUnsafeMutableBufferPointer { off in
+            for pass in 0..<3 {
+                let shift = UInt32(pass * 10)
+
+                // Count how many indices fall in each 10-bit bucket.
+                for j in 0..<1024 { off[j] = 0 }
+                src.withUnsafeBufferPointer { s in
+                    for i in 0..<count {
+                        off[Int((key[s[i]] >> shift) & 1023)] += 1
+                    }
+                }
+
+                // Exclusive prefix sum → each bucket's starting write offset.
+                var running = 0
+                for j in 0..<1024 {
+                    let c = off[j]
+                    off[j] = running
+                    running += c
+                }
+
+                // Stable scatter: walking `src` in order keeps equal keys in
+                // their current relative order.
+                src.withUnsafeBufferPointer { s in
+                    dst.withUnsafeMutableBufferPointer { d in
+                        for i in 0..<count {
+                            let idx = s[i]
+                            let bucket = Int((key[idx] >> shift) & 1023)
+                            d[off[bucket]] = idx
+                            off[bucket] += 1
+                        }
+                    }
+                }
+                swap(&src, &dst)
+            }
+        }
+    }
+    // Three passes = three swaps, so the sorted order is back in `src`.
+    return src
 }
 
 private func computeLODLevels(
