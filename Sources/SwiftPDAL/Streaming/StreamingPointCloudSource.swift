@@ -5,6 +5,7 @@ import CxxStdlib
 
 typealias CopcReader = swiftpdal.copc.Reader
 typealias CopcNodeInfo = swiftpdal.copc.NodeInfo
+typealias CopcNodeKey = swiftpdal.copc.NodeKey
 typealias CopcEbFieldInfo = swiftpdal.copc.EbFieldInfo
 typealias CopcExtractDesc = swiftpdal.copc.ExtractDesc
 
@@ -550,6 +551,100 @@ struct NodeMeta: Sendable {
     let maxXYZ: SIMD3<Float>
     let center: SIMD3<Float>
     let extent: Float          // longest-axis size
+    /// File offset of this node's compressed LAZ block. Drives
+    /// offset-adjacency clustering for coalesced prefetch (``NodePrefetch``).
+    let offset: UInt64
+    /// Compressed byte size of this node's block. Bounds a cluster's read span.
+    let byteSize: Int
+}
+
+// MARK: - Prefetch clustering
+
+/// Offset-adjacency clustering for coalesced node prefetch.
+///
+/// COPC stores sibling nodes contiguously, so decoding N adjacent nodes need
+/// not pay N seeks / N HTTP round-trips: they can be read as one (or a few)
+/// spans. This groups load-priority-ordered nodes into clusters of
+/// offset-adjacent siblings — the C++ ``CopcReader/prefetch_nodes`` then reads
+/// each cluster's span in one shot and slices it into a per-slot cache that
+/// `read_node` consumes.
+enum NodePrefetch {
+    /// Max byte gap between two consecutive compressed blocks to still cluster
+    /// them for one read on a **local** file. Mirrors `kPrefetchGapLocal` in
+    /// `copc_bridge.cpp` — keep the two in sync. A local seek is cheap, so we
+    /// only bridge a gap smaller than the cost of reading it (256 KB).
+    static let gapLocalBytes: UInt64 = 256 * 1024
+    /// HTTP counterpart of ``gapLocalBytes``. Mirrors `kPrefetchGapHttp` — a
+    /// round-trip dominates, so bridging up to a megabyte of wasted body beats
+    /// a second RTT on any plausible link.
+    static let gapHttpBytes: UInt64 = 1024 * 1024
+    /// Max nodes per cluster. Caps cancellation granularity (a cluster is
+    /// popped + prefetched atomically) and per-slot prefetch memory.
+    static let maxNodesPerCluster = 8
+    /// Max total compressed bytes per cluster. Bounds first-decode latency (a
+    /// worker reads the whole cluster span before decoding its first node) and
+    /// per-slot prefetch memory. ~16 MB.
+    static let maxBytesPerCluster = 16 * 1024 * 1024
+
+    /// Gap threshold for the given transport.
+    static func gapBytes(isRemote: Bool) -> UInt64 {
+        isRemote ? gapHttpBytes : gapLocalBytes
+    }
+
+    /// Group load-priority-ordered nodes into offset-adjacent clusters,
+    /// preserving overall load priority.
+    ///
+    /// - Parameters:
+    ///   - ordered: nodes in load-priority order (best to load first), each
+    ///     with its compressed-block file `offset` and byte `size`.
+    ///   - gapBytes: max gap between consecutive blocks to keep them in one
+    ///     cluster (see ``gapBytes(isRemote:)``).
+    ///   - maxNodes: hard cap on nodes per cluster.
+    ///   - maxBytes: hard cap on total compressed bytes per cluster.
+    /// - Returns: clusters of chunk IDs. Clusters are ordered by their best
+    ///   (earliest-in-`ordered`) member; within a cluster, members are ordered
+    ///   best-first so the most important node decodes first.
+    static func cluster(
+        _ ordered: [(id: ChunkID, offset: UInt64, size: Int)],
+        gapBytes: UInt64,
+        maxNodes: Int = maxNodesPerCluster,
+        maxBytes: Int = maxBytesPerCluster
+    ) -> [[ChunkID]] {
+        if ordered.isEmpty { return [] }
+
+        // Tag each node with its load priority (index in `ordered`) before
+        // sorting by offset, so we can restore priority order afterward.
+        struct Item { let id: ChunkID; let offset: UInt64; let size: Int; let priority: Int }
+        var items = ordered.enumerated().map {
+            Item(id: $1.id, offset: $1.offset, size: $1.size, priority: $0)
+        }
+        items.sort { $0.offset < $1.offset }
+
+        struct Group { var members: [(id: ChunkID, priority: Int)]; var end: UInt64; var bytes: Int; var best: Int }
+        var groups: [Group] = []
+        for it in items {
+            let gap = groups.last.map { it.offset > $0.end ? it.offset - $0.end : 0 }
+            if var g = groups.last,
+               g.members.count < maxNodes,
+               g.bytes + it.size <= maxBytes,
+               (gap ?? .max) <= gapBytes {
+                g.members.append((it.id, it.priority))
+                g.end = max(g.end, it.offset + UInt64(it.size))
+                g.bytes += it.size
+                g.best = min(g.best, it.priority)
+                groups[groups.count - 1] = g
+            } else {
+                groups.append(Group(members: [(it.id, it.priority)],
+                                    end: it.offset + UInt64(it.size),
+                                    bytes: it.size,
+                                    best: it.priority))
+            }
+        }
+
+        return groups
+            .sorted { $0.best < $1.best }
+            .map { $0.members.sorted { $0.priority < $1.priority }.map(\.id) }
+    }
 }
 
 // MARK: - Publish queue
@@ -610,44 +705,47 @@ final class UpdateQueue: @unchecked Sendable {
 
 /// Lock-protected FIFO of pending decode jobs.
 ///
-/// The driver actor's tick enqueues ``ChunkID``s; persistent slot
-/// workers `await pop()` to drain them. When the queue is empty,
-/// `pop()` suspends on a continuation and resumes when the next
-/// `enqueue` lands or `close()` is called. Closing returns `nil` from
-/// any waiting `pop` so workers can exit cleanly.
+/// The driver actor's tick enqueues **clusters** (`[ChunkID]`) of
+/// offset-adjacent nodes; persistent slot workers `await pop()` to drain
+/// them one cluster at a time. A worker prefetches a whole cluster's
+/// compressed blocks in one coalesced read, then decodes each member. When
+/// the queue is empty, `pop()` suspends on a continuation and resumes when
+/// the next `enqueue` lands or `close()` is called. Closing returns `nil`
+/// from any waiting `pop` so workers can exit cleanly.
 ///
 /// The queue is non-actor so the driver can enqueue without an extra
 /// actor hop; concurrency control is a single `NSLock`.
 final class JobQueue: @unchecked Sendable {
     private let lock = NSLock()
-    private var pending: [ChunkID] = []
-    private var waiters: [CheckedContinuation<ChunkID?, Never>] = []
+    private var pending: [[ChunkID]] = []
+    private var waiters: [CheckedContinuation<[ChunkID]?, Never>] = []
     private var closed = false
 
-    func enqueue<S: Sequence>(_ ids: S) where S.Element == ChunkID {
-        var handoffs: [(CheckedContinuation<ChunkID?, Never>, ChunkID)] = []
+    func enqueue<S: Sequence>(_ clusters: S) where S.Element == [ChunkID] {
+        var handoffs: [(CheckedContinuation<[ChunkID]?, Never>, [ChunkID])] = []
         lock.withLock {
             if closed { return }
-            var leftover: [ChunkID] = []
-            for id in ids {
+            var leftover: [[ChunkID]] = []
+            for cluster in clusters {
+                if cluster.isEmpty { continue }
                 if !waiters.isEmpty {
-                    handoffs.append((waiters.removeFirst(), id))
+                    handoffs.append((waiters.removeFirst(), cluster))
                 } else {
-                    leftover.append(id)
+                    leftover.append(cluster)
                 }
             }
             if !leftover.isEmpty { pending.append(contentsOf: leftover) }
         }
-        for (w, id) in handoffs { w.resume(returning: id) }
+        for (w, cluster) in handoffs { w.resume(returning: cluster) }
     }
 
-    func pop() async -> ChunkID? {
-        return await withCheckedContinuation { (c: CheckedContinuation<ChunkID?, Never>) in
-            // Resolve immediately if we have a job (or are closed);
+    func pop() async -> [ChunkID]? {
+        return await withCheckedContinuation { (c: CheckedContinuation<[ChunkID]?, Never>) in
+            // Resolve immediately if we have a cluster (or are closed);
             // otherwise park the continuation in `waiters` and let
             // enqueue/close resume it later. Either way, no await
             // happens while holding the lock.
-            enum Action { case resume(ChunkID?), wait }
+            enum Action { case resume([ChunkID]?), wait }
             let action: Action = lock.withLock {
                 if closed { return .resume(nil) }
                 if !pending.isEmpty { return .resume(pending.removeFirst()) }
@@ -661,17 +759,21 @@ final class JobQueue: @unchecked Sendable {
         }
     }
 
-    /// Drop any pending jobs matching the given IDs. Already-popped
-    /// jobs (in-flight on a worker) are not affected.
+    /// Drop the given IDs from any pending clusters. Removing an ID shrinks
+    /// its cluster; an emptied cluster disappears. Already-popped clusters
+    /// (in-flight on a worker) are not affected.
     func remove(_ ids: Set<ChunkID>) {
         if ids.isEmpty { return }
         lock.withLock {
-            pending.removeAll { ids.contains($0) }
+            for i in pending.indices {
+                pending[i].removeAll { ids.contains($0) }
+            }
+            pending.removeAll { $0.isEmpty }
         }
     }
 
     func close() {
-        let toResume: [CheckedContinuation<ChunkID?, Never>] = lock.withLock {
+        let toResume: [CheckedContinuation<[ChunkID]?, Never>] = lock.withLock {
             closed = true
             let w = waiters
             waiters.removeAll()
@@ -778,7 +880,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         guard let reader = CopcReader.open(std.string(url.path), poolSize) else {
             throw StreamingSourceError.openFailed(url)
         }
-        return makeSource(reader: reader, options: options)
+        return makeSource(reader: reader, options: options, isRemote: false)
     }
 
     /// Open a COPC file streamed over HTTP and parse its octree hierarchy.
@@ -810,15 +912,17 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         guard let reader = CopcReader.open_http(std.string(url.absoluteString), poolSize) else {
             throw StreamingSourceError.openFailed(url)
         }
-        return makeSource(reader: reader, options: options)
+        return makeSource(reader: reader, options: options, isRemote: true)
     }
 
     /// Build a live streaming source from an already-opened COPC reader.
     /// Shared by ``open(_:options:)`` and ``open(remoteURL:options:)`` — the
-    /// only difference between them is how the reader is constructed.
+    /// only difference between them is how the reader is constructed and, for
+    /// prefetch, the coalescing gap threshold (`isRemote`).
     private static func makeSource(
         reader: CopcReader,
-        options: StreamingOptions
+        options: StreamingOptions,
+        isRemote: Bool
     ) -> CopcStreamingPointCloudSource {
         let bMin = reader.bounds_min()
         let bMax = reader.bounds_max()
@@ -853,7 +957,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                 id: ChunkID(depth: Int(n.depth), x: Int(n.x), y: Int(n.y), z: Int(n.z)),
                 pointCount: Int(n.point_count),
                 minXYZ: mn, maxXYZ: mx,
-                center: center, extent: extent
+                center: center, extent: extent,
+                offset: n.offset, byteSize: Int(n.byte_size)
             ))
             maxDepth = max(maxDepth, Int(n.depth))
         }
@@ -932,7 +1037,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             options: options,
             queue: queue,
             jobs: jobs,
-            budgetBytesPerPoint: 17 + 4 * extraNames.count
+            budgetBytesPerPoint: 17 + 4 * extraNames.count,
+            isRemote: isRemote
         )
 
         // Decide the RGB rescale ONCE for the whole file (see ``rgbShiftBits``).
@@ -1003,23 +1109,48 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             Task.detached(priority: .utility) {
                 let slotIndex = Int32(slot)
                 while !Task.isCancelled {
-                    guard let id = await jobs.pop() else { break }
-                    // Bound aggregate decode parallelism across all open
-                    // sources via the process-wide gate. Acquire only after
-                    // claiming a job, and release the moment the decode is
-                    // done — completeLoad doesn't need the slot.
-                    await StreamingDecodeGate.shared.acquire()
-                    let chunk = StreamingDriver.decodeAndPack(
-                        reader: handleBox.reader,
-                        slot: slotIndex,
-                        id: id,
-                        originShift: originShift,
-                        extraDescs: extraDescs,
-                        extraNames: extraNames,
-                        rgbShiftBits: rgbShiftBits
-                    )
-                    StreamingDecodeGate.shared.release()
-                    await driver.completeLoad(id: id, chunk: chunk)
+                    guard let cluster = await jobs.pop() else { break }
+                    if cluster.isEmpty { continue }
+                    // Coalesced prefetch of the whole cluster's compressed
+                    // blocks in one (or a few) span reads — pure I/O (seek+read
+                    // / ranged GET), so it runs OUTSIDE the decode gate. Skip a
+                    // lone node: read_node's own read is already one seek, so
+                    // prefetching it would only add a redundant copy.
+                    if cluster.count > 1 {
+                        let keys = cluster.map { id -> CopcNodeKey in
+                            var k = CopcNodeKey()
+                            k.depth = Int32(id.depth)
+                            k.x = Int32(id.x)
+                            k.y = Int32(id.y)
+                            k.z = Int32(id.z)
+                            return k
+                        }
+                        keys.withUnsafeBufferPointer { buf in
+                            handleBox.reader.prefetch_nodes(buf.baseAddress, Int32(buf.count), slotIndex)
+                        }
+                    }
+                    for id in cluster {
+                        // Bound aggregate decode parallelism across all open
+                        // sources via the process-wide gate. Acquire per node
+                        // (not per cluster) and release the moment the decode is
+                        // done — completeLoad doesn't need the slot.
+                        // COPC depth 0 (root) and 1 are the coarse-coverage nodes
+                        // that put a newly-visible cloud's first points on screen;
+                        // take the gate's priority lane so they don't queue behind
+                        // far-cloud leaf decodes.
+                        await StreamingDecodeGate.shared.acquire(priority: id.depth <= 1)
+                        let chunk = StreamingDriver.decodeAndPack(
+                            reader: handleBox.reader,
+                            slot: slotIndex,
+                            id: id,
+                            originShift: originShift,
+                            extraDescs: extraDescs,
+                            extraNames: extraNames,
+                            rgbShiftBits: rgbShiftBits
+                        )
+                        StreamingDecodeGate.shared.release()
+                        await driver.completeLoad(id: id, chunk: chunk)
+                    }
                 }
             }
         }
@@ -1142,6 +1273,10 @@ actor StreamingDriver {
     private let options: StreamingOptions
     private let queue: UpdateQueue
     private let jobs: JobQueue
+    /// `true` when the source is HTTP-backed. Selects the prefetch coalescing
+    /// gap threshold (an HTTP round-trip justifies a wider gap than a local
+    /// seek). See ``NodePrefetch/gapBytes(isRemote:)``.
+    private let isRemote: Bool
     let tickInterval: Duration
 
     private var latestView: StreamingCameraView?
@@ -1182,7 +1317,8 @@ actor StreamingDriver {
         options: StreamingOptions,
         queue: UpdateQueue,
         jobs: JobQueue,
-        budgetBytesPerPoint: Int = 17
+        budgetBytesPerPoint: Int = 17,
+        isRemote: Bool = false
     ) {
         self.handleBox = handle
         self.nodes = nodes
@@ -1195,6 +1331,7 @@ actor StreamingDriver {
         self.options = options
         self.queue = queue
         self.jobs = jobs
+        self.isRemote = isRemote
         self.tickInterval = options.driverTickInterval
     }
 
@@ -1372,7 +1509,20 @@ actor StreamingDriver {
             return wasCacheMiss || !tickRemoved.isEmpty || pendingWantedWork
         }
         for id in toLoad { inFlight.insert(id) }
-        jobs.enqueue(toLoad)
+        // Group the load-priority-ordered nodes into offset-adjacent clusters so
+        // a worker can prefetch each cluster's compressed blocks in one coalesced
+        // read instead of one seek / round-trip per node. Clustering preserves
+        // load priority (clusters ordered by their best member). See ``NodePrefetch``.
+        let toLoadNodes = toLoad.compactMap { id -> (id: ChunkID, offset: UInt64, size: Int)? in
+            guard let idx = nodeIndexByID[id] else { return nil }
+            let n = nodes[idx]
+            return (id, n.offset, n.byteSize)
+        }
+        let clusters = NodePrefetch.cluster(
+            toLoadNodes,
+            gapBytes: NodePrefetch.gapBytes(isRemote: isRemote)
+        )
+        jobs.enqueue(clusters)
         return true
     }
 

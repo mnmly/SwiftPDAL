@@ -21,8 +21,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
+#include <istream>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // --- Node-size histogram ---------------------------------------------------
@@ -188,6 +191,30 @@ private:
 } // namespace
 // --------------------------------------------------------------------------
 
+// --- Node prefetch coalescing thresholds ----------------------------------
+// Max byte gap between two consecutive COPC compressed blocks that
+// prefetch_nodes will still bridge in one read. Mirrored on the Swift side
+// (NodePrefetch.gapLocalBytes / gapHttpBytes) — keep the two in sync.
+namespace {
+// Local files: a seek is cheap, so only coalesce across a gap smaller than the
+// cost of reading (and discarding) the gap bytes — 256 KB.
+constexpr uint64_t kPrefetchGapLocal = 256ull * 1024;
+// HTTP: a round-trip dominates, so coalesce across gaps up to a megabyte — a
+// megabyte of wasted body is cheaper than a second RTT on any plausible link.
+constexpr uint64_t kPrefetchGapHttp = 1024ull * 1024;
+
+// Pack a voxel key into a single uint64 to key the per-slot cache. Layout is
+// arbitrary (only needs to be stable + collision-free between prefetch and
+// read_node within a slot); mirrors Swift's ChunkID packing for readability.
+inline uint64_t pack_node_key(int32_t d, int32_t x, int32_t y, int32_t z) noexcept {
+    return (static_cast<uint64_t>(d & 0x1F) << 57) |
+           (static_cast<uint64_t>(x & 0x7FFFF) << 38) |
+           (static_cast<uint64_t>(y & 0x7FFFF) << 19) |
+            static_cast<uint64_t>(z & 0x7FFFF);
+}
+} // namespace
+// --------------------------------------------------------------------------
+
 namespace swiftpdal { namespace copc {
 
 struct Reader::Impl {
@@ -203,6 +230,14 @@ struct Reader::Impl {
     std::vector<std::unique_ptr<::copc::Reader>> readers;
     std::vector<PooledDecompressor> pool;   // parallel to `readers`
     std::vector<std::vector<char>> scratch; // reusable decompressed-bytes buffer per slot
+    // Per-slot prefetch state. `prefetch_streams` are dedicated raw byte
+    // streams for coalesced span reads (local: an ifstream owned here; HTTP:
+    // an aliasing pointer into `streams`, non-owning). `prefetch_cache` holds
+    // sliced compressed blocks keyed by packed voxel key — read_node pops on
+    // hit. Both are parallel to `readers`; a slot is only ever touched by its
+    // single worker, so neither needs locking.
+    std::vector<std::unique_ptr<std::ifstream>> prefetch_local_streams;
+    std::vector<std::unordered_map<uint64_t, std::vector<char>>> prefetch_cache;
     std::vector<::copc::Node> nodes;
     ::copc::las::LasHeader header;
     std::vector<EbFieldInfo> eb_fields;  // resolved Extra Bytes schema
@@ -274,8 +309,15 @@ Reader* Reader::open(const std::string& path, int32_t pool_size) noexcept {
         r->impl_->readers.reserve(static_cast<size_t>(pool_size));
         r->impl_->pool.resize(static_cast<size_t>(pool_size));
         r->impl_->scratch.resize(static_cast<size_t>(pool_size));
+        r->impl_->prefetch_cache.resize(static_cast<size_t>(pool_size));
+        r->impl_->prefetch_local_streams.reserve(static_cast<size_t>(pool_size));
         for (int32_t i = 0; i < pool_size; ++i) {
             r->impl_->readers.emplace_back(std::make_unique<::copc::FileReader>(path));
+            // A dedicated raw ifstream per slot for coalesced prefetch reads.
+            // Separate from copc-lib's own internal fstream, so a prefetch seek
+            // never disturbs a concurrent decode's read position.
+            auto pf = std::make_unique<std::ifstream>(path, std::ios::in | std::ios::binary);
+            r->impl_->prefetch_local_streams.emplace_back(std::move(pf));
         }
         r->impl_->nodes  = r->impl_->readers[0]->GetAllNodes();
         r->impl_->header = r->impl_->readers[0]->CopcConfig().LasHeader();
@@ -297,6 +339,9 @@ Reader* Reader::open_http(const std::string& url, int32_t pool_size) noexcept {
         r->impl_->readers.reserve(static_cast<size_t>(pool_size));
         r->impl_->pool.resize(static_cast<size_t>(pool_size));
         r->impl_->scratch.resize(static_cast<size_t>(pool_size));
+        r->impl_->prefetch_cache.resize(static_cast<size_t>(pool_size));
+        // No dedicated prefetch streams for HTTP: coalesced reads reuse each
+        // slot's own range istream (see prefetch_nodes).
         for (int32_t i = 0; i < pool_size; ++i) {
             // Each slot gets an independent HTTP stream with its own read
             // position — required by read_node's lock-free per-slot contract.
@@ -470,7 +515,20 @@ ChunkData Reader::read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
         const uint16_t eb = impl_->header.EbByteSize();
         const uint16_t point_size = ::copc::las::PointByteSize(fmt, eb);
 
-        std::vector<char> compressed = reader->GetPointDataCompressed(node);
+        // Consult this slot's prefetch cache first: a prior prefetch_nodes may
+        // have already read this node's compressed block as part of a coalesced
+        // span. Single-use — pop it so the cache stays bounded. On a miss (no
+        // prefetch, cancelled cluster, or short read) fall back to the direct
+        // read, exactly as before.
+        std::vector<char> compressed;
+        auto& cache = impl_->prefetch_cache[static_cast<size_t>(slot)];
+        auto hit = cache.find(pack_node_key(depth, x, y, z));
+        if (hit != cache.end()) {
+            compressed = std::move(hit->second);
+            cache.erase(hit);
+        } else {
+            compressed = reader->GetPointDataCompressed(node);
+        }
         impl_->pool[static_cast<size_t>(slot)].decode(
             compressed, node.point_count, fmt, eb, point_size,
             impl_->scratch[static_cast<size_t>(slot)]);
@@ -575,6 +633,96 @@ ChunkData Reader::read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
     }
 }
 
+void Reader::prefetch_nodes(const NodeKey* keys, int32_t count, int32_t slot) noexcept {
+    if (!impl_ || impl_->closed) return;
+    if (slot < 0 || static_cast<size_t>(slot) >= impl_->readers.size()) return;
+
+    auto& cache = impl_->prefetch_cache[static_cast<size_t>(slot)];
+    // Clear leftover blocks from a prior (possibly cancelled) cluster so per-slot
+    // memory stays bounded to at most one cluster's span.
+    cache.clear();
+    if (keys == nullptr || count <= 0) return;
+
+    const bool http = !impl_->streams.empty();
+    const uint64_t gap = http ? kPrefetchGapHttp : kPrefetchGapLocal;
+
+    try {
+        ::copc::Reader* reader = impl_->readers[static_cast<size_t>(slot)].get();
+
+        // Resolve each requested node's on-disk (offset, byte_size). FindNode is
+        // an in-memory hierarchy lookup (same one read_node does), so this adds
+        // no I/O. Skip nodes that aren't present or are empty.
+        struct Blk { uint64_t key; uint64_t offset; uint64_t size; };
+        std::vector<Blk> blks;
+        blks.reserve(static_cast<size_t>(count));
+        for (int32_t i = 0; i < count; ++i) {
+            ::copc::VoxelKey vk(keys[i].depth, keys[i].x, keys[i].y, keys[i].z);
+            ::copc::Node node = reader->FindNode(vk);
+            if (!node.IsValid() || node.byte_size <= 0) continue;
+            blks.push_back({ pack_node_key(keys[i].depth, keys[i].x, keys[i].y, keys[i].z),
+                             node.offset, static_cast<uint64_t>(node.byte_size) });
+        }
+        if (blks.empty()) return;
+
+        std::sort(blks.begin(), blks.end(),
+                  [](const Blk& a, const Blk& b) { return a.offset < b.offset; });
+
+        // Raw byte stream for this slot: local uses its dedicated ifstream; HTTP
+        // reuses the slot's range istream (the same object copc-lib reads
+        // through — safe because a slot is serviced by exactly one worker, so
+        // prefetch and decode never interleave within a slot).
+        std::istream* s = http
+            ? impl_->streams[static_cast<size_t>(slot)].get()
+            : impl_->prefetch_local_streams[static_cast<size_t>(slot)].get();
+        if (!s) return;
+
+        // Coalesce offset-adjacent blocks into spans (gap <= threshold), one
+        // read per span, then slice each block out of the span into the cache.
+        std::vector<char> span;
+        size_t i = 0;
+        while (i < blks.size()) {
+            const uint64_t span_start = blks[i].offset;
+            uint64_t span_end = blks[i].offset + blks[i].size;
+            size_t j = i + 1;
+            while (j < blks.size()) {
+                const uint64_t next_off = blks[j].offset;
+                // Sorted ascending, so next_off >= span_start. Gap is the gap
+                // past the current span end; clamp overlap/adjacency to 0.
+                const uint64_t g = (next_off > span_end) ? (next_off - span_end) : 0;
+                if (g > gap) break;
+                span_end = std::max(span_end, next_off + blks[j].size);
+                ++j;
+            }
+
+            // One read for [span_start, span_end).
+            const uint64_t span_len = span_end - span_start;
+            span.resize(static_cast<size_t>(span_len));
+            s->clear();
+            s->seekg(static_cast<std::streamoff>(span_start), std::ios::beg);
+            s->read(span.data(), static_cast<std::streamsize>(span_len));
+            const uint64_t got = static_cast<uint64_t>(std::max<std::streamsize>(0, s->gcount()));
+            s->clear();  // leave the stream usable for the next seek (prefetch or decode)
+
+            // Slice each block out of the covered span into the cache. Any block
+            // a short read didn't fully cover is skipped — read_node then falls
+            // back to a direct read for it.
+            for (size_t k = i; k < j; ++k) {
+                const uint64_t rel = blks[k].offset - span_start;
+                if (rel + blks[k].size > got) continue;
+                cache.emplace(
+                    blks[k].key,
+                    std::vector<char>(span.begin() + static_cast<std::ptrdiff_t>(rel),
+                                      span.begin() + static_cast<std::ptrdiff_t>(rel + blks[k].size)));
+            }
+            i = j;
+        }
+    } catch (const std::exception&) {
+        cache.clear();
+    } catch (...) {
+        cache.clear();
+    }
+}
+
 void Reader::close() noexcept {
     if (!impl_ || impl_->closed) return;
     impl_->closed = true;
@@ -582,6 +730,8 @@ void Reader::close() noexcept {
     // Streams cleared after readers: an istream-backed Reader references its
     // stream by raw pointer, so the reader must go first.
     impl_->streams.clear();
+    impl_->prefetch_local_streams.clear();
+    impl_->prefetch_cache.clear();
     impl_->pool.clear();
     impl_->scratch.clear();
     impl_->nodes.clear();

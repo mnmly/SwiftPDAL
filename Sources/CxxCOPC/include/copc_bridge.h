@@ -28,6 +28,16 @@ struct NodeInfo {
     int32_t byte_size = 0;
 };
 
+// A COPC octree voxel key `(depth, x, y, z)`. Passed in bulk to
+// Reader::prefetch_nodes to warm a slot's compressed-block cache with one
+// coalesced read of offset-adjacent siblings.
+struct NodeKey {
+    int32_t depth = 0;
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t z = 0;
+};
+
 // One custom "Extra Bytes" dimension declared in the file's Extra Bytes VLR.
 // Filled by Reader::eb_field_at. `offset` is the byte offset of this field
 // within a point's ExtraBytes() blob; `data_type` is the LAS Extra Bytes type
@@ -150,6 +160,23 @@ public:
     ChunkData read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
                         int32_t slot,
                         const ExtractDesc* descs, int32_t desc_count) noexcept;
+
+    // Warm slot `slot`'s compressed-block cache for the given nodes. COPC
+    // stores sibling nodes contiguously, so a camera move wanting several
+    // adjacent nodes can pay one span read instead of one seek / round-trip
+    // per node. Resolves each key's (offset, byte_size), sorts by offset,
+    // coalesces offset-adjacent blocks into groups (gap <= a local/HTTP
+    // threshold), issues one read per group, and slices the span into the
+    // per-slot cache. A subsequent read_node on the same slot pops its block
+    // from the cache (single-use) instead of reading directly. The cache is
+    // cleared on entry, so a cancelled cluster's leftover blocks can't
+    // accumulate. Reads I/O only — the caller runs it outside the decode gate.
+    //
+    // No-op behavior is preserved: read_node without a prior prefetch (or on a
+    // cache miss) reads directly, exactly as before. Uses the same per-slot
+    // isolation contract as read_node — each concurrent caller must target a
+    // distinct slot in [0, pool_size).
+    void prefetch_nodes(const NodeKey* keys, int32_t count, int32_t slot) noexcept;
 
     // Drop the underlying file readers + caches. Subsequent calls become
     // no-ops returning failure / zero. Idempotent. The Reader itself
