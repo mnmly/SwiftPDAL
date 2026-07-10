@@ -550,9 +550,13 @@ private func nearCornerView(for bounds: Bounds, originShift: SIMD3<Double>) -> (
     // Phase 1: camera covers the scene; let chunks become resident.
     // Budget intentionally < total file bytes — otherwise the whole-file
     // shortcut admits every node and nothing can ever be evicted on
-    // camera move.
+    // camera move. It must also be comfortably larger than the view-stable
+    // coarse skeleton: with the hierarchy-residency invariant on, the
+    // coarsest ancestors are wanted from *any* camera, so a budget that
+    // barely fits them leaves nothing view-specific to evict. 8 MB fits the
+    // skeleton plus near-camera detail that phase 2 can drop.
     let (eye1, vp1) = wideViewMatrix(for: source.info.bounds, originShift: source.info.originShift)
-    source.setBudget(2 * 1_048_576)   // 2 MB; fixture is ~36 MB packed
+    source.setBudget(8 * 1_048_576)   // 8 MB; fixture is ~36 MB packed
     source.submit(view: StreamingCameraView(position: eye1, viewProjection: vp1, pixelScale: 1000))
 
     var residentCount = 0

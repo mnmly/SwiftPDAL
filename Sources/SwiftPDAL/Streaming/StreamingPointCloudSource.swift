@@ -89,6 +89,18 @@ public struct ChunkID: Hashable, Sendable, CustomStringConvertible {
     public var z:     Int { Int( rawValue        & 0x7FFFF) }
 
     public var description: String { "ChunkID(d=\(depth), \(x),\(y),\(z))" }
+
+    /// The COPC hierarchy parent of this chunk, or `nil` for the root.
+    ///
+    /// Mirrors copc-lib's `VoxelKey::GetParent()`: the parent one octree
+    /// level up covers the same region at coarser density (`depth - 1`,
+    /// with each axis index halved). A COPC hierarchy is connected from the
+    /// root — every non-root node that carries points has a real parent
+    /// node — so walking ``parent`` repeatedly always reaches the root.
+    public var parent: ChunkID? {
+        guard depth > 0 else { return nil }
+        return ChunkID(depth: depth - 1, x: x >> 1, y: y >> 1, z: z >> 1)
+    }
 }
 
 // MARK: - Source info
@@ -415,6 +427,26 @@ public struct StreamingOptions: Sendable {
     /// ``extraDimensions``). For inspector/spreadsheet use that wants all
     /// attributes without scanning a graph. Default `false`.
     public var requestAllAvailableDimensions: Bool
+    /// Enforce the COPC hierarchy residency invariant: a non-root node is
+    /// only ever published as resident once its parent is resident, and a
+    /// node is only evicted once none of its children remain resident.
+    ///
+    /// COPC partitions a region's points across octree levels — full
+    /// density at any point is the *union* of a node and all its ancestors.
+    /// With this on (the default), the residency scorer still prioritizes
+    /// by screen-space error, but the wanted set is expanded to include
+    /// each admitted node's missing ancestor chain (charged to the byte
+    /// budget, ancestors first), eviction proceeds leaf-first, and every
+    /// published ``StreamingUpdate`` lists parents before descendants in
+    /// ``StreamingUpdate/added`` and descendants before parents in
+    /// ``StreamingUpdate/removed``. The net effect is that a consumer never
+    /// renders a fine node's sparse slice without the coarser ancestors
+    /// that fill in the rest of its density.
+    ///
+    /// Set to `false` to restore the pre-invariant score-only behavior
+    /// (finer nodes may become resident before their ancestors). Only do
+    /// this if a consumer deliberately relies on the old, unordered deltas.
+    public var enforceHierarchyResidency: Bool
 
     /// Create a configuration.
     ///
@@ -431,6 +463,8 @@ public struct StreamingOptions: Sendable {
     ///   - extraDimensions: Per-point dimension names to stream (opt-in;
     ///     empty preserves the position+color-only path).
     ///   - requestAllAvailableDimensions: Stream every available dimension.
+    ///   - enforceHierarchyResidency: Keep the resident set closed under
+    ///     parent (default `true`). See ``enforceHierarchyResidency``.
     public init(
         maxInFlightLoads: Int = 4,
         decodeConcurrency: Int = 4,
@@ -441,7 +475,8 @@ public struct StreamingOptions: Sendable {
         residencyPolicy: ResidencyPolicy = .frustumFirstThenHalo,
         targetChunkScreenSize: Float = 256,
         extraDimensions: [String] = [],
-        requestAllAvailableDimensions: Bool = false
+        requestAllAvailableDimensions: Bool = false,
+        enforceHierarchyResidency: Bool = true
     ) {
         self.maxInFlightLoads = maxInFlightLoads
         self.decodeConcurrency = decodeConcurrency
@@ -453,6 +488,7 @@ public struct StreamingOptions: Sendable {
         self.targetChunkScreenSize = targetChunkScreenSize
         self.extraDimensions = extraDimensions
         self.requestAllAvailableDimensions = requestAllAvailableDimensions
+        self.enforceHierarchyResidency = enforceHierarchyResidency
     }
 }
 
@@ -1303,6 +1339,19 @@ actor StreamingDriver {
     private var inFlight: Set<ChunkID> = []
     private var closed = false
 
+    /// Number of currently-resident children per node, keyed by parent ID.
+    /// Maintained on every admit/evict so leaf-first eviction can test
+    /// "has a resident child" in O(1). Only meaningful when
+    /// ``StreamingOptions/enforceHierarchyResidency`` is on.
+    private var residentChildCount: [ChunkID: Int] = [:]
+    /// Decoded-but-not-yet-published chunks held back because their parent
+    /// is not resident yet. Guarantees the published resident set stays
+    /// closed under parent even though decodes complete out of order.
+    /// Bounded by the in-flight fan-out (a handful of chains), unlike the
+    /// full resident set which is deliberately never retained here. Only
+    /// used when ``StreamingOptions/enforceHierarchyResidency`` is on.
+    private var pendingResident: [ChunkID: ResidentChunk] = [:]
+
     // Wanted-set cache. `wanted` depends only on the camera view, the
     // budget, and the immutable node hierarchy — eviction and in-flight
     // residency state don't change it. Caching avoids the O(nodes)
@@ -1360,6 +1409,8 @@ actor StreamingDriver {
         reader.close()
         resident.removeAll()
         inFlight.removeAll()
+        residentChildCount.removeAll()
+        pendingResident.removeAll()
     }
 
     /// Called by a worker task once a chunk has been decoded.
@@ -1371,8 +1422,60 @@ actor StreamingDriver {
         if closed { return }
         let wasInFlight = inFlight.remove(id) != nil
         guard wasInFlight, let chunk else { return }
+        guard options.enforceHierarchyResidency else {
+            markResident(id)
+            queue.enqueue(added: [chunk], removed: [])
+            return
+        }
+        // Hierarchy invariant: a child may not be published as resident
+        // before its parent. Decodes complete out of order, so hold this
+        // chunk until its parent is resident, then release parent-first.
+        pendingResident[id] = chunk
+        flushPending()
+    }
+
+    /// Mark `id` resident and maintain the parent's resident-child count.
+    private func markResident(_ id: ChunkID) {
         resident[id] = ResidentEntry(ticksSinceWanted: 0)
-        queue.enqueue(added: [chunk], removed: [])
+        if let p = id.parent { residentChildCount[p, default: 0] += 1 }
+    }
+
+    /// Remove `id` from residency and maintain the parent's resident-child
+    /// count. Callers guarantee `id` itself has no resident children
+    /// (leaf-first eviction).
+    private func removeResident(_ id: ChunkID) {
+        resident.removeValue(forKey: id)
+        residentChildCount.removeValue(forKey: id)
+        guard let p = id.parent, let c = residentChildCount[p] else { return }
+        if c <= 1 { residentChildCount.removeValue(forKey: p) }
+        else { residentChildCount[p] = c - 1 }
+    }
+
+    /// Release held-back chunks whose parent is now resident, in
+    /// parent-before-child order, and publish them as one `added` delta.
+    ///
+    /// Runs to a fixpoint: releasing a parent can unblock its children in a
+    /// later pass. The published array is sorted by depth ascending so a
+    /// consumer applying it in order never sees a child before its parent.
+    private func flushPending() {
+        guard !pendingResident.isEmpty else { return }
+        var released: [ResidentChunk] = []
+        var progressed = true
+        while progressed {
+            progressed = false
+            for id in Array(pendingResident.keys) {
+                let parentResident = id.parent.map { resident[$0] != nil } ?? true
+                guard parentResident, let chunk = pendingResident.removeValue(forKey: id)
+                else { continue }
+                markResident(id)
+                released.append(chunk)
+                progressed = true
+            }
+        }
+        if !released.isEmpty {
+            released.sort { $0.id.depth < $1.id.depth }
+            queue.enqueue(added: released, removed: [])
+        }
     }
 
     /// Diagnostic counts for tests. Reset on each tick.
@@ -1414,6 +1517,19 @@ actor StreamingDriver {
             wantedByDepth: wantedByDepth
         )
     }
+
+    // MARK: Test hooks (internal; not part of the public contract)
+    //
+    // The hierarchy-residency unit tests drive the driver against a
+    // synthetic hierarchy without a decode pipeline, so they need to read
+    // the otherwise-private wanted/resident/in-flight state. `completeLoad`,
+    // `runOneTick`, `setView`, and `setBudget` are already internal.
+    func _wantedSetForTest(view: StreamingCameraView, budget: Int)
+    -> (set: Set<ChunkID>, ordered: [ChunkID]) {
+        computeWantedSet(view: view, budget: budget)
+    }
+    var _residentIDsForTest: Set<ChunkID> { Set(resident.keys) }
+    var _inFlightIDsForTest: Set<ChunkID> { inFlight }
 
     /// Runs one residency-policy pass. Returns whether the tick did any
     /// meaningful work (wanted-set recompute, eviction, or scheduling) —
@@ -1462,6 +1578,7 @@ actor StreamingDriver {
         //    large resident sets. `Array(resident.keys)` is a separate buffer, so
         //    `resident` stays uniquely-referenced and writes mutate in place.
         //    Also skip the no-op write when a wanted entry is already current.
+        let enforce = options.enforceHierarchyResidency
         for id in Array(resident.keys) {
             guard var entry = resident[id] else { continue }
             if wanted.contains(id) {
@@ -1472,15 +1589,42 @@ actor StreamingDriver {
             } else {
                 entry.ticksSinceWanted += 1
                 if entry.ticksSinceWanted >= options.evictionDelayTicks {
-                    tickRemoved.append(id)
-                    resident.removeValue(forKey: id)
+                    // Leaf-first: never evict a node while a descendant is
+                    // still resident — that would re-open the density hole
+                    // the invariant exists to prevent. Keep it resident and
+                    // retry once its children have been evicted. A node's
+                    // ancestors are always co-wanted (the wanted set is
+                    // closed under parent), so this only ever defers the
+                    // eviction of a node whose whole subtree is leaving.
+                    if enforce && (residentChildCount[id] ?? 0) > 0 {
+                        resident[id] = entry
+                    } else {
+                        tickRemoved.append(id)
+                        removeResident(id)
+                    }
                 } else {
                     resident[id] = entry
                 }
             }
         }
 
+        // Drop held-back chunks that are no longer wanted (camera moved on
+        // before their parent chain materialized) — the consumer never saw
+        // them, so there is nothing to evict.
+        if enforce && !pendingResident.isEmpty {
+            for id in Array(pendingResident.keys) where !wanted.contains(id) {
+                pendingResident.removeValue(forKey: id)
+            }
+            // A parent that landed between decode completions may have
+            // unblocked stragglers; release them now.
+            flushPending()
+        }
+
         if !tickRemoved.isEmpty {
+            // Publish descendants before ancestors so a consumer applying
+            // `removed` in array order never frees a parent out from under a
+            // still-resident child.
+            if enforce { tickRemoved.sort { $0.depth > $1.depth } }
             queue.enqueue(added: [], removed: tickRemoved)
         }
 
@@ -1633,27 +1777,66 @@ actor StreamingDriver {
         var ordered: [ChunkID] = []
         ordered.reserveCapacity(visible.count + hidden.count)
         var used = 0
-        for c in visible {
-            if used + c.bytes > budget { continue }
-            wanted.insert(c.id)
-            ordered.append(c.id)
-            used += c.bytes
+        let enforce = options.enforceHierarchyResidency
+
+        // Admit a candidate, keeping the wanted set closed under parent.
+        //
+        // With the invariant on, a candidate drags in its missing ancestor
+        // chain (root-first). Ancestors are charged to the budget first —
+        // they cover more area per byte — and the candidate's own level is
+        // only admitted if it still fits after them. When the full chain
+        // won't fit, the longest root-anchored prefix that does fit is
+        // admitted and the deeper tail is deferred (never admitted orphaned,
+        // so a finer node never appears without the coarse coverage behind
+        // it). With the invariant off this degrades to the original
+        // single-node budget admit.
+        func admit(_ id: ChunkID) {
+            if wanted.contains(id) { return }
+            guard enforce else {
+                let b = nodeBytes(id)
+                if used + b <= budget {
+                    wanted.insert(id); ordered.append(id); used += b
+                }
+                return
+            }
+            var chain: [ChunkID] = []
+            var cur: ChunkID? = id
+            while let c = cur, !wanted.contains(c) {
+                guard nodeIndexByID[c] != nil else {
+                    // Candidate itself absent → nothing to admit; a missing
+                    // ancestor (shouldn't happen in a connected COPC tree)
+                    // just stops the climb.
+                    if c == id { return }
+                    break
+                }
+                chain.append(c)
+                cur = c.parent
+            }
+            for node in chain.reversed() {   // root-first
+                let b = nodeBytes(node)
+                if used + b > budget { break }
+                wanted.insert(node); ordered.append(node); used += b
+            }
         }
+
+        for c in visible { admit(c.id) }
 
         // Pass 2 (halo): fill remaining headroom from nearest non-visible
         // chunks. Only reachable under .frustumFirstThenHalo; under
         // .distanceOnly the hidden array is empty.
         if !hidden.isEmpty && used < budget {
             hidden.sort { $0.score > $1.score }
-            for c in hidden {
-                if used + c.bytes > budget { continue }
-                wanted.insert(c.id)
-                ordered.append(c.id)
-                used += c.bytes
-            }
+            for c in hidden { admit(c.id) }
         }
 
         return (wanted, ordered)
+    }
+
+    /// GPU byte cost of a single node's payload, or `0` if the node is not
+    /// in the hierarchy. Mirrors the `Scored.bytes` accounting.
+    private func nodeBytes(_ id: ChunkID) -> Int {
+        guard let idx = nodeIndexByID[id] else { return 0 }
+        return nodes[idx].pointCount * budgetBytesPerPoint
     }
 
     /// Decode + pack a single COPC node into a render-ready chunk.
