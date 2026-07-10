@@ -8,7 +8,11 @@ import simd
 /// quantizes each batch's positions into 30-bit-per-axis fixed-point against
 /// the per-batch AABB, and assigns per-point LOD levels via density-aware
 /// voxel occupancy (the per-chunk local variant — global accuracy requires
-/// a sidecar; see `docs/streaming.md`).
+/// a sidecar; see `docs/streaming.md`). Each batch slice is then stored
+/// level-ascending (stable within a level, preserving Morton order per
+/// bucket) with cumulative level counts packed into
+/// `StreamingRasterBatch.padding3...padding6` so the renderer can bound its
+/// draw loops to the LOD prefix.
 ///
 /// Renderer-side constants (kept in sync with `ComputeRasteriserTypes.swift`):
 /// - `steps30Bit  = 1 << 30 = 1_073_741_824`
@@ -74,7 +78,7 @@ enum ChunkPacker {
             boundsMax = simd_max(boundsMax, p)
         }
 
-        let order = mortonOrder(positions: positions, boundsMin: boundsMin, boundsMax: boundsMax)
+        var order = mortonOrder(positions: positions, boundsMin: boundsMin, boundsMax: boundsMax)
 
         // Materialize the positions in Morton order exactly once. Both the LOD
         // pass (which greedily assigns levels while walking points in Morton
@@ -94,12 +98,27 @@ enum ChunkPacker {
             }
         }
 
-        let levels = computeLODLevels(
+        var levels = computeLODLevels(
             positions: orderedPositions,
             boundsMin: boundsMin,
             boundsMax: boundsMax,
             lodLevels: max(1, min(lodLevels, 8)),
             coarseVoxelDivisions: max(1, coarseVoxelDivisions)
+        )
+
+        // Bucket each batch slice level-ascending (stable, so Morton order is
+        // preserved within a level) and compose the permutation into `order`,
+        // so the colors and extraScalars gathers below — both of which walk
+        // `order` — reorder every sidecar consistently. The renderer's cull
+        // pass uses the per-batch cumulative counts (padding3..6) to bound
+        // its draw loops to the LOD prefix.
+        let batchSize = max(pointsPerBatch, 1)
+        precondition(batchSize <= 65535, "pointsPerBatch must fit the uint16 LOD prefix counts")
+        bucketSortBatchSlicesByLevel(
+            order: &order,
+            positions: &orderedPositions,
+            levels: &levels,
+            batchStride: batchSize
         )
 
         // Allocate the packed position buffers at their final size and quantize
@@ -112,7 +131,6 @@ enum ChunkPacker {
         var xyzMed  = Data(count: count * MemoryLayout<UInt32>.stride)
         var xyzHigh = Data(count: count * MemoryLayout<UInt32>.stride)
 
-        let batchSize = max(pointsPerBatch, 1)
         let stepsMinusOne = Float(steps30Bit - 1)
 
         orderedPositions.withUnsafeBufferPointer { pos in
@@ -161,14 +179,31 @@ enum ChunkPacker {
                                 high[i] = xH | (yH << 10) | (zH << 20)
                             }
 
-                            batches.append(StreamingRasterBatch(
+                            var batch = StreamingRasterBatch(
                                 state: 1,
                                 min: batchMin,
                                 max: batchMax,
                                 numPoints: UInt32(end - first),
                                 firstPoint: UInt32(first),
                                 fileIndex: 0
-                            ))
+                            )
+                            // Cumulative LOD counts over the (level-sorted)
+                            // slice: cum[L] = points with level <= L, packed
+                            // two uint16 per padding word. cum[7] == numPoints
+                            // > 0, so padding6 != 0 distinguishes bucketed
+                            // batches from legacy ones.
+                            var cumulative = [Int](repeating: 0, count: 8)
+                            for i in first..<end {
+                                cumulative[Int(levels[i]) & 7] += 1
+                            }
+                            for level in 1..<8 {
+                                cumulative[level] += cumulative[level - 1]
+                            }
+                            batch.padding3 = UInt32(cumulative[0]) | (UInt32(cumulative[1]) << 16)
+                            batch.padding4 = UInt32(cumulative[2]) | (UInt32(cumulative[3]) << 16)
+                            batch.padding5 = UInt32(cumulative[4]) | (UInt32(cumulative[5]) << 16)
+                            batch.padding6 = UInt32(cumulative[6]) | (UInt32(cumulative[7]) << 16)
+                            batches.append(batch)
                             first = end
                         }
                     }
@@ -242,6 +277,53 @@ enum ChunkPacker {
             levels:  Data(levels),
             extraScalars: extraScalars
         )
+    }
+}
+
+// Stable per-batch-slice 8-bucket counting sort by LOD level: within each
+// [first, first+batchStride) slice, points are reordered level-ascending while
+// preserving Morton order inside each level. The identical permutation is
+// applied to `order` so every array derived from it stays consistent with the
+// permuted positions/levels. Mirrors `bucketSortBatchSlicesByLevel` in
+// Satin-ComputeRasteriser's PackedPointCloudFixtures.
+private func bucketSortBatchSlicesByLevel(
+    order: inout [Int],
+    positions: inout [SIMD3<Float>],
+    levels: inout [UInt8],
+    batchStride: Int
+) {
+    let count = positions.count
+    var first = 0
+    while first < count {
+        let end = min(first + batchStride, count)
+
+        var cursors = [Int](repeating: 0, count: 9)
+        for i in first..<end {
+            cursors[(Int(levels[i]) & 7) + 1] += 1
+        }
+        for level in 1..<9 {
+            cursors[level] += cursors[level - 1]
+        }
+
+        // permutation[j] = source index (in the whole array) of the point
+        // that lands at slice-relative position j.
+        var permutation = [Int](repeating: 0, count: end - first)
+        for i in first..<end {
+            let level = Int(levels[i]) & 7
+            permutation[cursors[level]] = i
+            cursors[level] += 1
+        }
+
+        let orderSlice = permutation.map { order[$0] }
+        let positionSlice = permutation.map { positions[$0] }
+        let levelSlice = permutation.map { levels[$0] }
+        for j in 0..<permutation.count {
+            order[first + j] = orderSlice[j]
+            positions[first + j] = positionSlice[j]
+            levels[first + j] = levelSlice[j]
+        }
+
+        first = end
     }
 }
 

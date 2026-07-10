@@ -210,9 +210,19 @@ public struct StreamingRasterBatch: Sendable {
     /// Index into the renderer's `files` array. The streaming source
     /// always emits `0`; a multi-file compositor rewrites it.
     public var fileIndex: UInt32
+    /// Cumulative LOD level counts `cum[0] | cum[1] << 16` (two `uint16`),
+    /// where `cum[L]` is the number of points in this batch with LOD level
+    /// ≤ `L`. Batch points are stored level-ascending, so `cum[L]` is the
+    /// prefix length the renderer may draw at a given LOD threshold.
     public var padding3: UInt32 = 0
+    /// Cumulative LOD level counts `cum[2] | cum[3] << 16`. See ``padding3``.
     public var padding4: UInt32 = 0
+    /// Cumulative LOD level counts `cum[4] | cum[5] << 16`. See ``padding3``.
     public var padding5: UInt32 = 0
+    /// Cumulative LOD level counts `cum[6] | cum[7] << 16`. See ``padding3``.
+    /// `cum[7] == numPoints > 0` for every bucketed batch, so
+    /// `padding6 == 0` is the legacy sentinel: consumers treat such a batch
+    /// as unbucketed and fall back to full-range draws.
     public var padding6: UInt32 = 0
     public var padding7: UInt32 = 0
     public var padding8: UInt32 = 0
