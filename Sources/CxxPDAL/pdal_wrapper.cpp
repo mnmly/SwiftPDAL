@@ -138,11 +138,24 @@ static Stage* createConfiguredStage(
     StageFactory& factory,
     Stage** outFilter,
     const DimensionMap& dimensionMap = {},
-    const std::string& outSrs = "")
+    const std::string& outSrs = "",
+    double resolution = 0.0)
 {
-    // 1. Resolve Reader
+    // 1. Resolve Reader.
+    //
+    // A positive `resolution` requests a coarse, LOD-limited COPC read: PDAL's
+    // readers.copc reads only octree nodes coarser than `resolution` (in the
+    // cloud's own units) and skips the deep levels entirely — orders of magnitude
+    // faster + lighter than a full decode. Only readers.copc honours the option,
+    // and only genuine COPC files (conventionally *.copc.laz/*.copc.las) can be
+    // read by it, so force that reader for those; otherwise `resolution` is
+    // ignored and the read is full-resolution as before.
+    bool wantCopcResolution = resolution > 0.0 &&
+        (filename.ends_with(".copc.laz") || filename.ends_with(".copc.las"));
+
     std::string inferredReaderName = factory.inferReaderDriver(filename);
     std::string reader_name = (filename.ends_with(".pts")) ? "readers.text" :
+                              wantCopcResolution ? "readers.copc" :
                               (!inferredReaderName.empty() ? inferredReaderName : reader_name_backup);
 
     Stage* reader = factory.createStage(reader_name);
@@ -151,6 +164,9 @@ static Stage* createConfiguredStage(
     // 2. Configure Reader Options
     Options options;
     options.add("filename", filename);
+    if (wantCopcResolution) {
+        options.add("resolution", resolution);
+    }
     if (filename.ends_with(".xyz")) {
         options.add("skip", 0);
         options.add("separator", " ");
@@ -324,13 +340,13 @@ static void extractBounds(pdal::PointViewPtr view, PDALBounds& bbox) {
     bbox.max_z = _bbox.maxz;
 }
 
-int pdal_read_binary(const char* reader_name_backup, const char* filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, const char* out_srs){
+int pdal_read_binary(const char* reader_name_backup, const char* filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, const char* out_srs, double resolution){
 
     try {
         StageFactory factory;
         Stage* filter = nullptr;
 
-        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, {}, out_srs ? out_srs : "");
+        Stage* finalStage = createConfiguredStage(reader_name_backup, filename, factory, &filter, {}, out_srs ? out_srs : "", resolution);
         if (!finalStage) return PDAL_ERR_CREATE_STAGE;
 
         PointTable table;

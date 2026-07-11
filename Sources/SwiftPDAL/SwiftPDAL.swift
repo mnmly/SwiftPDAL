@@ -175,7 +175,13 @@ public final class PointCloud: PointCloudData {
         return (projDBURL, driversURL)
     }
 
-    public static func read(from path: String, readerName: String = "readers.text", outSrs: String = "") throws -> PointCloud {
+    /// - Parameter resolution: when `> 0` and `path` is a COPC file
+    ///   (`*.copc.laz`/`*.copc.las`), read only octree nodes coarser than this
+    ///   spacing (in the cloud's own units) via `readers.copc` — a fast,
+    ///   LOD-limited coarse read (far fewer points, much less memory). `0` (the
+    ///   default) reads at full resolution, unchanged.
+    public static func read(from path: String, readerName: String = "readers.text",
+                            outSrs: String = "", resolution: Double = 0) throws -> PointCloud {
 
         PDALRuntime.ensureBootstrapped()
 
@@ -201,7 +207,8 @@ public final class PointCloud: PointCloudData {
                         &dimList,
                         &dimCount,
                         &bbox,
-                        srsPtr
+                        srsPtr,
+                        resolution
                     )
                 }
             }

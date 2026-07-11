@@ -85,7 +85,10 @@ int pdal_pipeline_get_metadata_json(PDALPipeline pipeline, char* buffer, size_t 
 // New function to read LAS file and extract points as separate arrays.
 // out_srs: optional target SRS (e.g. "EPSG:3857") to reproject into. Empty or
 // NULL leaves points in the source's native CRS (no reprojection).
-int pdal_read_binary(const char* reader_name_backup, const char* filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, const char* out_srs = "");
+// resolution: when > 0 and the file is a COPC (*.copc.laz/*.copc.las), read only
+// octree nodes coarser than this spacing (cloud units) via readers.copc — a fast,
+// LOD-limited coarse read. 0 (default) = full-resolution read, unchanged.
+int pdal_read_binary(const char* reader_name_backup, const char* filename, const char** outData, size_t* outSize, size_t* outCount, size_t* outStride, PDALDimensionInfo** dimList, size_t* dimCount, PDALBounds& bbox, const char* out_srs = "", double resolution = 0.0);
 
 void pdal_free_data(const char* data, PDALDimensionInfo* dimList, size_t dimCount);
 
