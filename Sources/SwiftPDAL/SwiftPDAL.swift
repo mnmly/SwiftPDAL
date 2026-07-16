@@ -154,25 +154,74 @@ public final class PointCloud: PointCloudData {
             #endif
         }
 
-        // PDAL_DRIVER_PATH governs only optional loadable plugins; the core
-        // LAS/COPC/stats drivers are statically linked. Its location tracks
-        // the bundle layout, so it stays branch-specific.
-        let driversURL: String
-        if isTesting {
-            driversURL = Bundle.module.bundleURL.deletingLastPathComponent()
-                .appendingPathComponent("pdalcpp.framework/Versions/A/PlugIns").path()
-        } else {
-            #if os(iOS)
-            // iOS statically links pdalcpp — no dylib plugins to discover;
-            // an empty path disables PDAL's plugin search.
-            driversURL = ""
-            #else
-            driversURL = Bundle.module.bundleURL.deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent("Frameworks/pdalcpp.framework/Versions/A/PlugIns").path()
-            #endif
-        }
+        // PDAL_DRIVER_PATH governs only optional loadable plugins (e.g.
+        // `readers.e57`); the core LAS/COPC/stats drivers are statically
+        // linked. Locate the plugin dir by searching for `pdalcpp.framework`
+        // rather than assuming a fixed depth below the module bundle — the
+        // depth differs across layouts and a wrong guess silently disables
+        // plugin loading (see ``locatePluginDir(isTesting:)``).
+        #if os(iOS)
+        // iOS statically links pdalcpp — no dylib plugins to discover; an
+        // empty path disables PDAL's plugin search.
+        let driversURL = ""
+        #else
+        let driversURL = locatePluginDir(isTesting: isTesting)
+        #endif
         return (projDBURL, driversURL)
+    }
+
+    /// Locate the `pdalcpp.framework` `PlugIns` directory (the value for
+    /// `PDAL_DRIVER_PATH`) across every layout SwiftPDAL runs in.
+    ///
+    /// The framework's depth relative to ``Bundle/module`` is not fixed:
+    /// - `swift run` / plain executables: the library resource bundle sits
+    ///   directly in the SPM Products dir, next to `pdalcpp.framework`.
+    /// - `swift test`: SwiftPM copies the library resource bundle *inside*
+    ///   `<Tests>.xctest/Contents/Resources/`, while `pdalcpp.framework` stays
+    ///   a peer of the `.xctest` bundle one directory up. The old
+    ///   `bundleURL.deletingLastPathComponent()` therefore landed in the
+    ///   xctest `Resources` dir — which has no `pdalcpp.framework` — so
+    ///   `PDAL_DRIVER_PATH` pointed nowhere and `createStage("readers.e57")`
+    ///   returned null ("Failed to create stage").
+    /// - Shipped `.framework`: plugins live under an app's `Frameworks/`.
+    ///
+    /// Rather than special-casing each, this walks up from the module bundle
+    /// (and the main executable dir) looking for the framework, returning the
+    /// nearest match. Falls back to the historical fixed-depth path when the
+    /// search finds nothing, so behavior is unchanged in any layout that
+    /// already worked.
+    private static func locatePluginDir(isTesting: Bool) -> String {
+        let fm = FileManager.default
+        // PlugIns dir relative to a candidate base directory.
+        let relatives = [
+            "pdalcpp.framework/Versions/A/PlugIns",            // SPM Products dir
+            "Frameworks/pdalcpp.framework/Versions/A/PlugIns", // shipped app/framework
+        ]
+        var seeds: [URL] = [Bundle.module.bundleURL]
+        if let exeDir = Bundle.main.executableURL?.deletingLastPathComponent() {
+            seeds.append(exeDir)
+        }
+        for seed in seeds {
+            var dir = seed
+            for _ in 0..<8 {   // bounded walk toward the filesystem root
+                for rel in relatives {
+                    let candidate = dir.appendingPathComponent(rel)
+                    if fm.fileExists(atPath: candidate.path()) { return candidate.path() }
+                }
+                let parent = dir.deletingLastPathComponent()
+                if parent.path() == dir.path() { break }   // reached root
+                dir = parent
+            }
+        }
+        // Fallback: the historical fixed-depth computation, preserved so any
+        // layout that resolved before still resolves identically.
+        if isTesting {
+            return Bundle.module.bundleURL.deletingLastPathComponent()
+                .appendingPathComponent("pdalcpp.framework/Versions/A/PlugIns").path()
+        }
+        return Bundle.module.bundleURL.deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Frameworks/pdalcpp.framework/Versions/A/PlugIns").path()
     }
 
     /// - Parameter resolution: when `> 0` and `path` is a COPC file
