@@ -142,6 +142,43 @@ public struct StreamingSourceInfo: Sendable {
     /// (`4 * requestedDimensionCount`), accounted separately from
     /// ``bytesPerPoint``. `0` when no extra dimensions were requested.
     public let extraBytesPerPoint: Int
+
+    /// Create source metadata.
+    ///
+    /// Exposed so consumers can build a mock ``StreamingPointCloudSource``
+    /// for unit tests without opening a real COPC file. The concrete
+    /// ``CopcStreamingPointCloudSource`` fills this in from the file's header
+    /// and hierarchy at open.
+    ///
+    /// - Parameters:
+    ///   - bounds: File-level AABB in source-file coordinates.
+    ///   - originShift: Translation applied to every chunk's packed positions.
+    ///   - totalPoints: Total point count across the whole file.
+    ///   - maxDepth: Maximum octree depth present in the hierarchy.
+    ///   - pointsPerBatch: Renderer batch granularity.
+    ///   - bytesPerPoint: On-GPU byte cost per point.
+    ///   - availableDimensions: Per-point dimension names available to stream.
+    ///   - extraBytesPerPoint: Host-side byte cost per point of requested
+    ///     extra dimensions. Defaults to `0`.
+    public init(
+        bounds: Bounds,
+        originShift: SIMD3<Double>,
+        totalPoints: UInt64,
+        maxDepth: Int,
+        pointsPerBatch: Int,
+        bytesPerPoint: Int,
+        availableDimensions: [String],
+        extraBytesPerPoint: Int = 0
+    ) {
+        self.bounds = bounds
+        self.originShift = originShift
+        self.totalPoints = totalPoints
+        self.maxDepth = maxDepth
+        self.pointsPerBatch = pointsPerBatch
+        self.bytesPerPoint = bytesPerPoint
+        self.availableDimensions = availableDimensions
+        self.extraBytesPerPoint = extraBytesPerPoint
+    }
 }
 
 // MARK: - Camera
@@ -309,6 +346,44 @@ public struct ResidentChunk: Sendable {
     /// ``StreamingSourceInfo/bytesPerPoint`` +
     /// ``StreamingSourceInfo/extraBytesPerPoint``.
     public var byteCost: Int { totalPointCount * (17 + 4 * extraScalars.count) }
+
+    /// Create a resident chunk.
+    ///
+    /// Exposed so consumers can build a mock ``StreamingPointCloudSource``
+    /// for unit tests without opening a real COPC file. The concrete
+    /// ``CopcStreamingPointCloudSource`` populates every field from a decoded
+    /// node; a mock can supply whatever the test needs (empty buffers are
+    /// fine for residency-protocol tests that never touch the GPU).
+    ///
+    /// - Parameters:
+    ///   - id: Stable identifier matching the source COPC node.
+    ///   - batches: Per-batch metadata (one per `pointsPerBatch` partition).
+    ///   - xyzLow: Packed positions, low-significance fragment.
+    ///   - xyzMed: Packed positions, middle fragment.
+    ///   - xyzHigh: Packed positions, high-significance fragment.
+    ///   - colors: RGBA8 packed colors, one `UInt32` per point.
+    ///   - levels: Per-point LOD level, one `UInt8` per point.
+    ///   - extraScalars: Optional per-point scalar dimensions keyed by name.
+    ///     Defaults to empty (the position+color-only path).
+    public init(
+        id: ChunkID,
+        batches: [StreamingRasterBatch],
+        xyzLow: Data,
+        xyzMed: Data,
+        xyzHigh: Data,
+        colors: Data,
+        levels: Data,
+        extraScalars: [String: Data] = [:]
+    ) {
+        self.id = id
+        self.batches = batches
+        self.xyzLow = xyzLow
+        self.xyzMed = xyzMed
+        self.xyzHigh = xyzHigh
+        self.colors = colors
+        self.levels = levels
+        self.extraScalars = extraScalars
+    }
 }
 
 // MARK: - Update result
@@ -330,6 +405,49 @@ public struct StreamingUpdate: Sendable {
     public init(added: [ResidentChunk], removed: [ChunkID]) {
         self.added = added
         self.removed = removed
+    }
+}
+
+// MARK: - Decode-queue telemetry
+
+/// A thread-safe snapshot of the source's decode pipeline, returned by
+/// ``StreamingPointCloudSource/decodeStats()``.
+///
+/// Poll this to observe streaming progress and back-pressure without an
+/// `await`: a rising ``pendingRequests`` with a flat ``decodedChunks`` means
+/// decodes are queued behind the concurrency cap (see
+/// ``StreamingDecodeGate``); a ``pendingRequests`` and ``inFlightDecodes`` of
+/// zero with the wanted set filled means the pipeline is idle/caught up.
+public struct StreamingDecodeStats: Sendable {
+    /// Nodes scheduled for decode but not yet being decoded — either waiting
+    /// in the internal job queue or parked on the process-wide decode gate.
+    /// **Instantaneous**: reflects the pipeline at the moment of the call.
+    public let pendingRequests: Int
+    /// Nodes currently being decoded on a worker (past the gate, mid-LAZ
+    /// decompress + pack). **Instantaneous.** Bounded in practice by
+    /// ``StreamingOptions/decodeConcurrency`` and the shared
+    /// ``StreamingDecodeGate`` limit.
+    public let inFlightDecodes: Int
+    /// Total chunks successfully decoded over the source's lifetime.
+    /// **Monotonic**: only ever increases (never reset while the source is
+    /// open).
+    public let decodedChunks: UInt64
+    /// Total points across all successfully decoded chunks over the source's
+    /// lifetime. **Monotonic.**
+    public let decodedPoints: UInt64
+
+    /// Create a decode-stats snapshot. All counters default to zero so a mock
+    /// source can return an empty snapshot.
+    public init(
+        pendingRequests: Int = 0,
+        inFlightDecodes: Int = 0,
+        decodedChunks: UInt64 = 0,
+        decodedPoints: UInt64 = 0
+    ) {
+        self.pendingRequests = pendingRequests
+        self.inFlightDecodes = inFlightDecodes
+        self.decodedChunks = decodedChunks
+        self.decodedPoints = decodedPoints
     }
 }
 
@@ -448,6 +566,65 @@ public struct StreamingOptions: Sendable {
     /// this if a consumer deliberately relies on the old, unordered deltas.
     public var enforceHierarchyResidency: Bool
 
+    /// Depth (inclusive) at/below which octree nodes are pinned permanently
+    /// resident, or `nil` (the default) to disable coarse pinning entirely.
+    ///
+    /// When set, the source keeps every node with `depth <= alwaysResidentDepth`
+    /// resident for the lifetime of the source: they are scheduled *before*
+    /// any scored chunk (coarse coverage arrives first), never appear in a
+    /// ``StreamingUpdate/removed`` delta, and are de-duplicated against
+    /// re-admission. COPC's full density at any point is the union of a node
+    /// and all its ancestors, so a handful of shallow nodes — a negligible
+    /// fraction of the points — blanket the whole scene at low density.
+    /// Pinning them turns a fine node's transient "empty until its parents
+    /// arrive" hole into "briefly coarse", which is the correct streaming UX.
+    ///
+    /// ## Budget accounting
+    ///
+    /// Pinned nodes **are** charged against the byte/point budget set via
+    /// ``StreamingPointCloudSource/setBudget(_:)`` — they occupy the same GPU
+    /// residency the scorer draws from. Their cost is charged first; the
+    /// screen-space-error scorer then fills whatever headroom remains. If the
+    /// pinned set alone meets or exceeds the budget, scored residency clamps
+    /// to zero rather than evicting any pinned node — the pins are honored
+    /// regardless of budget, so size the budget to comfortably exceed the
+    /// pinned set's footprint.
+    ///
+    /// ## Hierarchy-invariant interaction
+    ///
+    /// A depth-limited prefix `0...alwaysResidentDepth` is already closed
+    /// under parent, so pinning composes cleanly with
+    /// ``enforceHierarchyResidency``: pinned nodes publish parent-first (the
+    /// root has no parent and lands immediately, then depth 1, …) and a
+    /// scored fine node's ancestor-chain climb terminates at the pinned
+    /// prefix instead of re-charging it. Pins are never evicted, so leaf-first
+    /// eviction never has to pull one out from under a resident descendant.
+    ///
+    /// A value `< 0` is treated the same as `nil` (off). Values above the
+    /// file's ``StreamingSourceInfo/maxDepth`` simply pin every node.
+    public var alwaysResidentDepth: Int?
+
+    /// Aggregate concurrent-decode cap for the process-wide
+    /// ``StreamingDecodeGate``, or `nil` (the default) to auto-size it.
+    ///
+    /// The gate bounds how many LAZ decodes run at once across *all* open
+    /// streaming sources (not just this one). Its default floor is
+    /// `activeProcessorCount - 2` (leaving two cores for the rest of the
+    /// process), which can sit *below* a source's own ``decodeConcurrency`` —
+    /// silently capping a source configured for, say, 18 workers at 16
+    /// concurrent decodes.
+    ///
+    /// - `nil` (default): on open, the gate is raised to *at least* this
+    ///   source's ``decodeConcurrency`` via
+    ///   ``StreamingDecodeGate/ensureLimitAtLeast(_:)``, so a single source
+    ///   always gets the parallelism it asked for while still composing with
+    ///   other open sources (the gate ends at the max request). Never lowered.
+    /// - non-`nil`: on open, the gate is set to exactly this value via
+    ///   ``StreamingDecodeGate/setLimit(_:)`` — an explicit aggregate ceiling
+    ///   for hosts that open many sources. Set it `>=` ``decodeConcurrency``
+    ///   to avoid throttling this source's own workers.
+    public var decodeGateLimit: Int?
+
     /// Create a configuration.
     ///
     /// - Parameters:
@@ -465,6 +642,12 @@ public struct StreamingOptions: Sendable {
     ///   - requestAllAvailableDimensions: Stream every available dimension.
     ///   - enforceHierarchyResidency: Keep the resident set closed under
     ///     parent (default `true`). See ``enforceHierarchyResidency``.
+    ///   - alwaysResidentDepth: Depth at/below which nodes are pinned
+    ///     permanently resident, or `nil` (default) to disable pinning.
+    ///     See ``alwaysResidentDepth``.
+    ///   - decodeGateLimit: Explicit process-wide decode-gate cap, or `nil`
+    ///     (default) to auto-size it to at least ``decodeConcurrency``.
+    ///     See ``decodeGateLimit``.
     public init(
         maxInFlightLoads: Int = 4,
         decodeConcurrency: Int = 4,
@@ -476,7 +659,9 @@ public struct StreamingOptions: Sendable {
         targetChunkScreenSize: Float = 256,
         extraDimensions: [String] = [],
         requestAllAvailableDimensions: Bool = false,
-        enforceHierarchyResidency: Bool = true
+        enforceHierarchyResidency: Bool = true,
+        alwaysResidentDepth: Int? = nil,
+        decodeGateLimit: Int? = nil
     ) {
         self.maxInFlightLoads = maxInFlightLoads
         self.decodeConcurrency = decodeConcurrency
@@ -489,6 +674,8 @@ public struct StreamingOptions: Sendable {
         self.extraDimensions = extraDimensions
         self.requestAllAvailableDimensions = requestAllAvailableDimensions
         self.enforceHierarchyResidency = enforceHierarchyResidency
+        self.alwaysResidentDepth = alwaysResidentDepth
+        self.decodeGateLimit = decodeGateLimit
     }
 }
 
@@ -586,6 +773,49 @@ public protocol StreamingPointCloudSource: AnyObject, Sendable {
     /// Subsequent calls to ``pollLatest()`` return `nil` and ``submit(view:)``
     /// becomes a no-op.
     func close()
+
+    /// Retarget the residency scorer's desired on-screen chunk size at
+    /// runtime.
+    ///
+    /// Mirrors ``StreamingOptions/targetChunkScreenSize`` but adjustable on a
+    /// live source — no restart, re-open, or budget change. The new value
+    /// takes effect on the next residency tick's re-score: it changes which
+    /// nodes the scorer *wants*, biasing toward finer detail (lower values)
+    /// or coarser coverage (higher values). Already-resident chunks are left
+    /// alone until they fall out of the wanted set through the normal
+    /// eviction hysteresis / refinement, so retargeting never causes a
+    /// visible flush. Values are clamped to `>= 1`.
+    ///
+    /// A default no-op implementation is provided so existing conformers stay
+    /// source-compatible; ``CopcStreamingPointCloudSource`` overrides it.
+    ///
+    /// - Parameter pixels: New target on-screen size, in pixels, of a node's
+    ///   longest AABB axis.
+    func setTargetChunkScreenSize(_ pixels: Float)
+
+    /// A thread-safe, non-blocking snapshot of the decode pipeline.
+    ///
+    /// Poll this alongside ``pollLatest()`` to drive progress UI or diagnose
+    /// back-pressure. See ``StreamingDecodeStats`` for the monotonic-vs-
+    /// instantaneous semantics of each field.
+    ///
+    /// A default implementation returning an empty snapshot is provided so
+    /// existing conformers stay source-compatible;
+    /// ``CopcStreamingPointCloudSource`` overrides it.
+    ///
+    /// - Returns: The current ``StreamingDecodeStats``.
+    func decodeStats() -> StreamingDecodeStats
+}
+
+public extension StreamingPointCloudSource {
+    /// Default no-op: a source that doesn't support runtime retargeting
+    /// simply ignores the new value. See
+    /// ``setTargetChunkScreenSize(_:)``.
+    func setTargetChunkScreenSize(_ pixels: Float) {}
+
+    /// Default: an empty snapshot for sources without a decode pipeline
+    /// (e.g. test mocks). See ``decodeStats()``.
+    func decodeStats() -> StreamingDecodeStats { StreamingDecodeStats() }
 }
 
 // MARK: - Node metadata snapshot
@@ -747,6 +977,60 @@ final class UpdateQueue: @unchecked Sendable {
     }
 }
 
+// MARK: - Decode-stats box
+
+/// Lock-protected backing store for ``StreamingDecodeStats``.
+///
+/// Mutated only from the driver actor (which serializes all transitions) and
+/// read synchronously off the render/main thread via
+/// ``CopcStreamingPointCloudSource/decodeStats()`` — the `NSLock` guards that
+/// cross-thread read against a concurrent write, mirroring ``UpdateQueue``.
+///
+/// The instantaneous counters (`pending`, `active`) are driven by the exact
+/// decode-lifecycle transitions and clamped at zero defensively; the
+/// cumulative counters (`chunks`, `points`) only ever increase and survive
+/// ``reset()`` (called on close).
+final class DecodeStatsBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = 0
+    private var active = 0
+    private var chunks: UInt64 = 0
+    private var points: UInt64 = 0
+
+    /// `n` nodes were just scheduled for decode (enqueued, not yet decoding).
+    func scheduled(_ n: Int) { lock.withLock { pending += n } }
+
+    /// `n` still-pending nodes were cancelled before a worker picked them up.
+    func cancelledPending(_ n: Int) { lock.withLock { pending = max(0, pending - n) } }
+
+    /// A worker began decoding a node: one pending request becomes active.
+    func decodeBegan() { lock.withLock { pending = max(0, pending - 1); active += 1 } }
+
+    /// A worker finished a decode. Decrements the active count and, on
+    /// success, bumps the cumulative chunk/point totals.
+    func decodeEnded(points p: Int, success: Bool) {
+        lock.withLock {
+            active = max(0, active - 1)
+            if success { chunks &+= 1; points &+= UInt64(max(0, p)) }
+        }
+    }
+
+    /// Clear the instantaneous counters (on shutdown). Cumulative totals kept.
+    func reset() { lock.withLock { pending = 0; active = 0 } }
+
+    /// A consistent snapshot of all four counters.
+    func snapshot() -> StreamingDecodeStats {
+        lock.withLock {
+            StreamingDecodeStats(
+                pendingRequests: pending,
+                inFlightDecodes: active,
+                decodedChunks: chunks,
+                decodedPoints: points
+            )
+        }
+    }
+}
+
 // MARK: - Job queue
 
 /// Lock-protected FIFO of pending decode jobs.
@@ -864,6 +1148,9 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
     private let driver: StreamingDriver
     private let queue: UpdateQueue
     private let jobs: JobQueue
+    /// Lock-protected decode-pipeline counters, written by the driver/workers
+    /// and read synchronously by ``decodeStats()``.
+    private let statsBox: DecodeStatsBox
     private let handleBox: SendableCopcReader
     private let originShift: SIMD3<Double>
     private let workerCount: Int
@@ -886,6 +1173,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         driver: StreamingDriver,
         queue: UpdateQueue,
         jobs: JobQueue,
+        statsBox: DecodeStatsBox,
         handle: SendableCopcReader,
         originShift: SIMD3<Double>,
         workerCount: Int,
@@ -897,6 +1185,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         self.driver = driver
         self.queue = queue
         self.jobs = jobs
+        self.statsBox = statsBox
         self.handleBox = handle
         self.originShift = originShift
         self.workerCount = workerCount
@@ -1075,6 +1364,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
 
         let queue = UpdateQueue()
         let jobs = JobQueue()
+        let statsBox = DecodeStatsBox()
         let handleBox = SendableCopcReader(reader: reader)
         let driver = StreamingDriver(
             handle: handleBox,
@@ -1083,6 +1373,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             options: options,
             queue: queue,
             jobs: jobs,
+            statsBox: statsBox,
             budgetBytesPerPoint: 17 + 4 * extraNames.count,
             isRemote: isRemote
         )
@@ -1091,11 +1382,25 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         let rgbShift = computeGlobalRgbShift(reader: reader)
 
         let workerCount = max(1, options.decodeConcurrency)
+
+        // Size the process-wide decode gate so this source's own workers are
+        // never throttled below its configured `decodeConcurrency`. The gate's
+        // default floor (`activeProcessorCount - 2`) otherwise silently caps a
+        // high-concurrency source (e.g. 18 workers pegged at 16). An explicit
+        // `decodeGateLimit` sets a hard aggregate ceiling instead. See
+        // ``StreamingOptions/decodeGateLimit``.
+        if let explicit = options.decodeGateLimit {
+            StreamingDecodeGate.shared.setLimit(explicit)
+        } else {
+            StreamingDecodeGate.shared.ensureLimitAtLeast(workerCount)
+        }
+
         let source = CopcStreamingPointCloudSource(
             info: info,
             driver: driver,
             queue: queue,
             jobs: jobs,
+            statsBox: statsBox,
             handle: handleBox,
             originShift: originShift,
             workerCount: workerCount,
@@ -1154,6 +1459,12 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         let workers = (0..<workerCount).map { slot in
             Task.detached(priority: .utility) {
                 let slotIndex = Int32(slot)
+                // One reusable pack scratch per worker: the ~2.5 MB of per-chunk
+                // temporaries (morton/radix/LOD-table/bucket buffers) are
+                // allocated once here and grown as needed, instead of malloc'd +
+                // zero-filled + freed on every chunk across N workers. See
+                // ``ChunkPacker/Workspace``.
+                let packWorkspace = ChunkPacker.Workspace()
                 while !Task.isCancelled {
                     guard let cluster = await jobs.pop() else { break }
                     if cluster.isEmpty { continue }
@@ -1185,6 +1496,11 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                         // take the gate's priority lane so they don't queue behind
                         // far-cloud leaf decodes.
                         await StreamingDecodeGate.shared.acquire(priority: id.depth <= 1)
+                        // Past the gate → genuinely decoding now. Moves this
+                        // node from "pending" to "in-flight" in the decode
+                        // telemetry (``decodeStats()``); the matching
+                        // decrement happens in `completeLoad`.
+                        await driver.beginDecode(id: id)
                         let chunk = StreamingDriver.decodeAndPack(
                             reader: handleBox.reader,
                             slot: slotIndex,
@@ -1192,7 +1508,8 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                             originShift: originShift,
                             extraDescs: extraDescs,
                             extraNames: extraNames,
-                            rgbShiftBits: rgbShiftBits
+                            rgbShiftBits: rgbShiftBits,
+                            workspace: packWorkspace
                         )
                         StreamingDecodeGate.shared.release()
                         await driver.completeLoad(id: id, chunk: chunk)
@@ -1209,6 +1526,14 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
 
     public func setBudget(_ bytes: Int) {
         Task { await driver.setBudget(bytes) }
+    }
+
+    public func setTargetChunkScreenSize(_ pixels: Float) {
+        Task { await driver.setTargetScreenSize(pixels) }
+    }
+
+    public func decodeStats() -> StreamingDecodeStats {
+        statsBox.snapshot()
     }
 
     public func pollLatest() -> StreamingUpdate? {
@@ -1288,6 +1613,32 @@ public struct StreamingDebugSnapshot: Sendable {
     /// Wanted chunk count bucketed by COPC depth. Same indexing as
     /// ``residentByDepth``.
     public let wantedByDepth: [Int]
+
+    /// Create a debug snapshot. Exposed so a mock source can synthesize one;
+    /// the shape is not part of the stable contract (see the type doc).
+    public init(
+        candidates: Int,
+        wanted: Int,
+        resident: Int,
+        inFlight: Int,
+        frustumVisible: Int,
+        totalNodes: Int,
+        cacheHits: Int,
+        cacheMisses: Int,
+        residentByDepth: [Int],
+        wantedByDepth: [Int]
+    ) {
+        self.candidates = candidates
+        self.wanted = wanted
+        self.resident = resident
+        self.inFlight = inFlight
+        self.frustumVisible = frustumVisible
+        self.totalNodes = totalNodes
+        self.cacheHits = cacheHits
+        self.cacheMisses = cacheMisses
+        self.residentByDepth = residentByDepth
+        self.wantedByDepth = wantedByDepth
+    }
 }
 
 // MARK: - Driver actor
@@ -1319,11 +1670,37 @@ actor StreamingDriver {
     private let options: StreamingOptions
     private let queue: UpdateQueue
     private let jobs: JobQueue
+    /// Decode-pipeline telemetry shared with the owning source (read via
+    /// ``CopcStreamingPointCloudSource/decodeStats()``). Written only from
+    /// this actor's serialized transitions.
+    private let statsBox: DecodeStatsBox
     /// `true` when the source is HTTP-backed. Selects the prefetch coalescing
     /// gap threshold (an HTTP round-trip justifies a wider gap than a local
     /// seek). See ``NodePrefetch/gapBytes(isRemote:)``.
     private let isRemote: Bool
     let tickInterval: Duration
+
+    /// Nodes pinned permanently resident (`depth <= alwaysResidentDepth`),
+    /// empty when ``StreamingOptions/alwaysResidentDepth`` is `nil`/negative.
+    /// Always closed under parent (a depth prefix of a connected COPC tree),
+    /// so it composes cleanly with the hierarchy-residency invariant.
+    private let pinnedIDs: Set<ChunkID>
+    /// Total budget cost of ``pinnedIDs`` (charged before scored residency).
+    private let pinnedBytes: Int
+    /// Pinned IDs sorted coarse-first (depth ascending), used to seed the
+    /// wanted-set load order so coarse coverage is scheduled before detail.
+    private let pinnedOrdered: [ChunkID]
+
+    /// Live, runtime-adjustable target on-screen chunk size for the scorer.
+    /// Seeded from ``StreamingOptions/targetChunkScreenSize`` and updated by
+    /// ``setTargetScreenSize(_:)``. Always clamped `>= 1`.
+    private var currentTargetScreenSize: Float
+
+    /// Nodes a worker has started decoding but not yet reported complete.
+    /// Drives the pending-vs-in-flight split in ``StreamingDecodeStats`` and
+    /// lets ``cancel(_:)`` account only the still-pending (not-yet-decoding)
+    /// cancellations against ``DecodeStatsBox/pending``.
+    private var decoding: Set<ChunkID> = []
 
     private var latestView: StreamingCameraView?
     private var budgetBytes: Int = .max
@@ -1376,6 +1753,7 @@ actor StreamingDriver {
         options: StreamingOptions,
         queue: UpdateQueue,
         jobs: JobQueue,
+        statsBox: DecodeStatsBox = DecodeStatsBox(),
         budgetBytesPerPoint: Int = 17,
         isRemote: Bool = false
     ) {
@@ -1390,16 +1768,56 @@ actor StreamingDriver {
         self.options = options
         self.queue = queue
         self.jobs = jobs
+        self.statsBox = statsBox
         self.isRemote = isRemote
         self.tickInterval = options.driverTickInterval
+        self.currentTargetScreenSize = max(options.targetChunkScreenSize, 1)
+
+        // Resolve the pinned (always-resident) set once from the immutable
+        // hierarchy. `nil` or a negative depth disables pinning.
+        if let d = options.alwaysResidentDepth, d >= 0 {
+            let pinned = nodes.filter { $0.id.depth <= d }
+            self.pinnedIDs = Set(pinned.map(\.id))
+            self.pinnedBytes = pinned.reduce(0) { $0 + $1.pointCount * budgetBytesPerPoint }
+            self.pinnedOrdered = pinned.sorted { $0.id.depth < $1.id.depth }.map(\.id)
+        } else {
+            self.pinnedIDs = []
+            self.pinnedBytes = 0
+            self.pinnedOrdered = []
+        }
     }
 
     func setView(_ v: StreamingCameraView) { latestView = v }
     func setBudget(_ b: Int) { budgetBytes = b }
 
+    /// Retarget the screen-space-error scorer at runtime. Invalidates the
+    /// wanted-set cache so the next tick re-scores against the new target;
+    /// resident chunks are untouched until they naturally leave the wanted
+    /// set. Clamped `>= 1` to match the scorer's own guard.
+    func setTargetScreenSize(_ v: Float) {
+        let clamped = max(v, 1)
+        guard clamped != currentTargetScreenSize else { return }
+        currentTargetScreenSize = clamped
+        cachedView = nil   // force a wanted-set recompute next tick
+    }
+
+    /// Worker hook: a node moved from the pending queue into active decode.
+    func beginDecode(id: ChunkID) {
+        if closed { return }
+        if decoding.insert(id).inserted { statsBox.decodeBegan() }
+    }
+
     func cancel(_ ids: [ChunkID]) {
         let set = Set(ids)
+        // Only still-pending (not-yet-decoding) cancellations release a
+        // pending slot in the telemetry; actively-decoding nodes still run to
+        // completion and are accounted by `completeLoad`.
+        var pendingCancelled = 0
+        for id in ids where inFlight.contains(id) && !decoding.contains(id) {
+            pendingCancelled += 1
+        }
         for id in ids { inFlight.remove(id) }
+        if pendingCancelled > 0 { statsBox.cancelledPending(pendingCancelled) }
         jobs.remove(set)
     }
 
@@ -1411,6 +1829,8 @@ actor StreamingDriver {
         inFlight.removeAll()
         residentChildCount.removeAll()
         pendingResident.removeAll()
+        decoding.removeAll()
+        statsBox.reset()
     }
 
     /// Called by a worker task once a chunk has been decoded.
@@ -1420,6 +1840,12 @@ actor StreamingDriver {
     /// from `inFlight` after being scheduled) are dropped here.
     func completeLoad(id: ChunkID, chunk: ResidentChunk?) {
         if closed { return }
+        // Decode telemetry: a node that a worker began decoding has now
+        // finished (whether or not it is still wanted). Success = it produced
+        // a chunk; cumulative point total comes from the chunk itself.
+        if decoding.remove(id) != nil {
+            statsBox.decodeEnded(points: chunk?.totalPointCount ?? 0, success: chunk != nil)
+        }
         let wasInFlight = inFlight.remove(id) != nil
         guard wasInFlight, let chunk else { return }
         guard options.enforceHierarchyResidency else {
@@ -1530,6 +1956,9 @@ actor StreamingDriver {
     }
     var _residentIDsForTest: Set<ChunkID> { Set(resident.keys) }
     var _inFlightIDsForTest: Set<ChunkID> { inFlight }
+    var _pinnedIDsForTest: Set<ChunkID> { pinnedIDs }
+    var _targetScreenSizeForTest: Float { currentTargetScreenSize }
+    func _statsSnapshotForTest() -> StreamingDecodeStats { statsBox.snapshot() }
 
     /// Runs one residency-policy pass. Returns whether the tick did any
     /// meaningful work (wanted-set recompute, eviction, or scheduling) —
@@ -1587,6 +2016,11 @@ actor StreamingDriver {
                     resident[id] = entry
                 }
             } else {
+                // Pinned nodes are permanently resident and never evicted.
+                // They are always in `wanted` (seeded by `computeWantedSet`),
+                // so this branch is normally unreachable for them — the guard
+                // is defensive against a future scorer change.
+                if pinnedIDs.contains(id) { continue }
                 entry.ticksSinceWanted += 1
                 if entry.ticksSinceWanted >= options.evictionDelayTicks {
                     // Leaf-first: never evict a node while a descendant is
@@ -1663,6 +2097,7 @@ actor StreamingDriver {
             return wasCacheMiss || !tickRemoved.isEmpty || pendingWantedWork
         }
         for id in toLoad { inFlight.insert(id) }
+        statsBox.scheduled(toLoad.count)
         // Group the load-priority-ordered nodes into offset-adjacent clusters so
         // a worker can prefetch each cluster's compressed blocks in one coalesced
         // read instead of one seek / round-trip per node. Clustering preserves
@@ -1717,7 +2152,7 @@ actor StreamingDriver {
         // it both hit `err ≈ 0` at their natural depth; the chunks
         // that win the budget race are the ones at the *right* level
         // for their distance, not just the closest ones.
-        let target = max(options.targetChunkScreenSize, 1)
+        let target = currentTargetScreenSize
         let pixelScale = max(view.pixelScale, 1e-6)
 
         // Ortho detection: for projection·view built from a rigid view
@@ -1775,9 +2210,23 @@ actor StreamingDriver {
         visible.sort { $0.score > $1.score }
         var wanted = Set<ChunkID>()
         var ordered: [ChunkID] = []
-        ordered.reserveCapacity(visible.count + hidden.count)
+        ordered.reserveCapacity(visible.count + hidden.count + pinnedOrdered.count)
         var used = 0
         let enforce = options.enforceHierarchyResidency
+
+        // Seed the pinned (always-resident) prefix first: pinned nodes are
+        // wanted unconditionally and charged to the budget before any scored
+        // node, and scheduled coarse-first. If the pinned set alone meets or
+        // exceeds the budget, the scored admission below finds no headroom and
+        // clamps to zero — the pins are honored regardless of budget. The
+        // pinned prefix is closed under parent, so it also anchors every
+        // scored node's ancestor-chain climb (which stops at the first
+        // already-wanted node).
+        if !pinnedIDs.isEmpty {
+            wanted.formUnion(pinnedIDs)
+            ordered.append(contentsOf: pinnedOrdered)
+            used += pinnedBytes
+        }
 
         // Admit a candidate, keeping the wanted set closed under parent.
         //
@@ -1852,7 +2301,8 @@ actor StreamingDriver {
         originShift: SIMD3<Double>,
         extraDescs: [CopcExtractDesc],
         extraNames: [String],
-        rgbShiftBits: UInt32?
+        rgbShiftBits: UInt32?,
+        workspace: ChunkPacker.Workspace? = nil
     ) -> ResidentChunk? {
         // The decoded chunk is ~Copyable; do everything that touches it inside
         // the descriptor buffer's scope so the C++ ChunkData stays alive while
@@ -1878,7 +2328,8 @@ actor StreamingDriver {
                 extra: extraDimCount > 0 ? chunk.__extra_dataUnsafe() : nil,
                 extraCount: extraDimCount,
                 extraNames: extraNames,
-                rgbShiftBits: rgbShiftBits
+                rgbShiftBits: rgbShiftBits,
+                workspace: workspace
             )
 
             return ResidentChunk(

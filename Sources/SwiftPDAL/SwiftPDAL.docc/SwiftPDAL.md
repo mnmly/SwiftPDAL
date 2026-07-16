@@ -86,6 +86,7 @@ once with `pdal translate in.las out.copc.laz --writers.copc`.
 - ``ResidentChunk``
 - ``StreamingRasterBatch``
 - ``StreamingUpdate``
+- ``StreamingDecodeStats``
 
 ### Bulk point-cloud reading
 

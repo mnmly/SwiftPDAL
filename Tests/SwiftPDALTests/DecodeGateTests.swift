@@ -155,6 +155,47 @@ private func waitUntil(
         #expect(tracker.maxObserved <= 4)
     }
 
+    @Test func ensureLimitAtLeastOnlyRaises() async {
+        let gate = StreamingDecodeGate(limit: 4)
+        // Below current → no-op (never lowers, unlike setLimit).
+        gate.ensureLimitAtLeast(2)
+        #expect(gate.currentLimit == 4)
+        // Above current → raises.
+        gate.ensureLimitAtLeast(9)
+        #expect(gate.currentLimit == 9)
+        // Equal → no-op.
+        gate.ensureLimitAtLeast(9)
+        #expect(gate.currentLimit == 9)
+    }
+
+    @Test func ensureLimitAtLeastResumesParkedWaiters() async {
+        let gate = StreamingDecodeGate(limit: 1)
+        let tracker = ConcurrencyTracker()
+        let done = Counter()
+
+        // Saturate the single slot, then park 5 more waiters.
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<6 {
+                group.addTask {
+                    await gate.acquire()
+                    tracker.enter()
+                    try? await Task.sleep(for: .milliseconds(30))
+                    tracker.leave()
+                    gate.release()
+                    done.increment()
+                }
+            }
+            // Give them time to park, then raise the cap — parked waiters must
+            // resume up to the new headroom.
+            try? await Task.sleep(for: .milliseconds(10))
+            gate.ensureLimitAtLeast(5)
+        }
+
+        #expect(done.count == 6)
+        #expect(tracker.maxObserved >= 2, "raising the cap must let parked waiters run concurrently")
+        #expect(tracker.maxObserved <= 5)
+    }
+
     @Test func clampsToOne() async {
         let gate = StreamingDecodeGate(limit: 1)
         gate.setLimit(0)

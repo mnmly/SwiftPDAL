@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -120,6 +121,78 @@ namespace {
             std::atexit(dump_histogram);
         }
     }
+} // namespace
+// --------------------------------------------------------------------------
+
+// --- Per-stage decode profiler (env-gated) --------------------------------
+// Accumulates wall-clock nanoseconds spent in each per-chunk read_node stage
+// (find / fetch-compressed / lazperf-decode / xyz-rgb-extract), lock-free
+// across the decode thread pool, and dumps per-chunk averages to stderr on
+// process exit. Enable with SWIFTPDAL_DECODE_PROFILE=1. Zero cost when off
+// (a single cached atomic-bool check per stage).
+namespace {
+    std::atomic<uint64_t> g_prof_calls {0};
+    std::atomic<uint64_t> g_prof_find_ns {0};
+    std::atomic<uint64_t> g_prof_fetch_ns {0};
+    std::atomic<uint64_t> g_prof_decode_ns {0};
+    std::atomic<uint64_t> g_prof_extract_ns {0};
+    std::atomic<uint64_t> g_prof_points {0};
+    std::atomic<uint64_t> g_prof_fetch_hits {0};   // served from prefetch cache
+    std::atomic<uint64_t> g_prof_fetch_miss {0};   // direct GetPointDataCompressed
+    std::atomic<bool>     g_prof_atexit {false};
+    std::atomic<int>      g_prof_enabled {0};       // 0=unchecked,1=on,2=off
+
+    bool profile_enabled() {
+        int s = g_prof_enabled.load(std::memory_order_acquire);
+        if (s) return s == 1;
+        const char* v = std::getenv("SWIFTPDAL_DECODE_PROFILE");
+        bool on = v && v[0] && !(v[0] == '0' && v[1] == 0);
+        int expected = 0;
+        g_prof_enabled.compare_exchange_strong(expected, on ? 1 : 2);
+        return on;
+    }
+
+    void dump_profile() {
+        uint64_t calls = g_prof_calls.load();
+        if (calls == 0) return;
+        auto per = [calls](std::atomic<uint64_t>& a) {
+            return (double)a.load() / (double)calls / 1000.0;   // µs/chunk
+        };
+        double f = per(g_prof_find_ns), fe = per(g_prof_fetch_ns),
+               d = per(g_prof_decode_ns), e = per(g_prof_extract_ns);
+        std::fprintf(stderr, "\n=== swiftpdal read_node per-stage profile ===\n");
+        std::fprintf(stderr, "  chunks decoded : %llu\n", (unsigned long long)calls);
+        std::fprintf(stderr, "  points decoded : %llu (avg %.0f pts/chunk)\n",
+                     (unsigned long long)g_prof_points.load(),
+                     (double)g_prof_points.load() / (double)calls);
+        std::fprintf(stderr, "  prefetch hit/miss: %llu / %llu\n",
+                     (unsigned long long)g_prof_fetch_hits.load(),
+                     (unsigned long long)g_prof_fetch_miss.load());
+        std::fprintf(stderr, "  --- µs / chunk (sum of thread time, not wall) ---\n");
+        std::fprintf(stderr, "  find (hierarchy lookup) : %8.2f\n", f);
+        std::fprintf(stderr, "  fetch (read compressed) : %8.2f\n", fe);
+        std::fprintf(stderr, "  decode (lazperf)        : %8.2f\n", d);
+        std::fprintf(stderr, "  extract (xyz/rgb pack)  : %8.2f\n", e);
+        std::fprintf(stderr, "  TOTAL C++ per chunk     : %8.2f\n", f + fe + d + e);
+        std::fprintf(stderr, "============================================\n\n");
+        std::fflush(stderr);
+    }
+
+    struct StageTimer {
+        bool on;
+        std::chrono::steady_clock::time_point t;
+        explicit StageTimer(bool enabled) : on(enabled) {
+            if (on) t = std::chrono::steady_clock::now();
+        }
+        // Returns elapsed ns since construction/last lap and resets the clock.
+        uint64_t lap() {
+            if (!on) return 0;
+            auto now = std::chrono::steady_clock::now();
+            uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
+            t = now;
+            return ns;
+        }
+    };
 } // namespace
 // --------------------------------------------------------------------------
 
@@ -502,6 +575,9 @@ ChunkData Reader::read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
     if (impl_->closed) return out;
     if (slot < 0 || static_cast<size_t>(slot) >= impl_->readers.size()) return out;
 
+    const bool prof = profile_enabled();
+    StageTimer timer(prof);
+
     ::copc::Reader* reader = impl_->readers[static_cast<size_t>(slot)].get();
     try {
         ::copc::VoxelKey key(depth, x, y, z);
@@ -514,6 +590,7 @@ ChunkData Reader::read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
         const int8_t fmt = impl_->header.PointFormatId();
         const uint16_t eb = impl_->header.EbByteSize();
         const uint16_t point_size = ::copc::las::PointByteSize(fmt, eb);
+        if (prof) g_prof_find_ns.fetch_add(timer.lap(), std::memory_order_relaxed);
 
         // Consult this slot's prefetch cache first: a prior prefetch_nodes may
         // have already read this node's compressed block as part of a coalesced
@@ -526,12 +603,17 @@ ChunkData Reader::read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
         if (hit != cache.end()) {
             compressed = std::move(hit->second);
             cache.erase(hit);
+            if (prof) g_prof_fetch_hits.fetch_add(1, std::memory_order_relaxed);
         } else {
             compressed = reader->GetPointDataCompressed(node);
+            if (prof) g_prof_fetch_miss.fetch_add(1, std::memory_order_relaxed);
         }
+        if (prof) g_prof_fetch_ns.fetch_add(timer.lap(), std::memory_order_relaxed);
+
         impl_->pool[static_cast<size_t>(slot)].decode(
             compressed, node.point_count, fmt, eb, point_size,
             impl_->scratch[static_cast<size_t>(slot)]);
+        if (prof) g_prof_decode_ns.fetch_add(timer.lap(), std::memory_order_relaxed);
 
         // Fast path: no extra dims requested → read XYZ/RGB straight from the
         // decompressed records, skipping the per-point Point object model.
@@ -541,6 +623,13 @@ ChunkData Reader::read_node(int32_t depth, int32_t x, int32_t y, int32_t z,
             if (read_node_fast(impl_->scratch[static_cast<size_t>(slot)],
                                n, point_size, fmt, impl_->header, out)) {
                 record_node_size(static_cast<uint64_t>(n));
+                if (prof) {
+                    g_prof_extract_ns.fetch_add(timer.lap(), std::memory_order_relaxed);
+                    g_prof_points.fetch_add((uint64_t)n, std::memory_order_relaxed);
+                    g_prof_calls.fetch_add(1, std::memory_order_relaxed);
+                    bool ex = false;
+                    if (g_prof_atexit.compare_exchange_strong(ex, true)) std::atexit(dump_profile);
+                }
                 return out;
             }
         }
@@ -739,6 +828,10 @@ void Reader::close() noexcept {
 
 void dump_node_size_histogram() noexcept {
     dump_histogram();
+}
+
+void dump_decode_profile() noexcept {
+    dump_profile();
 }
 
 }} // namespace swiftpdal::copc

@@ -200,6 +200,11 @@ private:
 // atexit when SWIFTPDAL_NODE_HISTOGRAM=1). Safe to call any time.
 void dump_node_size_histogram() noexcept;
 
+// Optional explicit dump of the per-stage read_node decode profile (also
+// registered via atexit when SWIFTPDAL_DECODE_PROFILE=1). Safe to call any
+// time; prints per-chunk average µs for find/fetch/decode/extract.
+void dump_decode_profile() noexcept;
+
 }} // namespace swiftpdal::copc
 
 // Free functions implementing the SWIFT_SHARED_REFERENCE retain/release

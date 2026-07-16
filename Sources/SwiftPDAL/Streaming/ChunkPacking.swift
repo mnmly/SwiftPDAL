@@ -38,6 +38,47 @@ enum ChunkPacker {
         var extraScalars: [String: Data] = [:]
     }
 
+    /// Per-worker reusable scratch for ``pack(positionsXYZ:rgb16:count:hasRgb:originShift:extra:extraCount:extraNames:rgbShiftBits:pointsPerBatch:lodLevels:coarseVoxelDivisions:workspace:)``.
+    ///
+    /// The pack pipeline builds ~`count`-sized temporaries — Morton keys, the
+    /// LSD-radix ping-pong buffers, the reordered positions, the LOD
+    /// open-addressing table (the largest, `≥ 2·count` `UInt64`), and the
+    /// per-batch bucket-sort scratch. Allocating and zero-filling all of that
+    /// afresh on every chunk (~2.5 MB for a 24k-point node) was serializing the
+    /// decode workers on the allocator lock and saturating memory bandwidth
+    /// once several ran at once. A worker holds one `Workspace` and passes it to
+    /// every ``pack`` call, so the buffers are allocated once and only ever
+    /// grow — never freed between chunks. The buffers hold no state across
+    /// calls; each ``pack`` fully overwrites the prefix it uses.
+    ///
+    /// Not thread-safe: exactly one worker task may use a given instance at a
+    /// time (matching the one-slot-per-thread decode contract). Passing `nil`
+    /// (the default) makes ``pack`` allocate a throwaway `Workspace`, so the
+    /// output is identical whether or not one is supplied.
+    final class Workspace {
+        var positions:  [SIMD3<Float>] = []
+        var ordered:    [SIMD3<Float>] = []
+        var keys:       [UInt32] = []
+        var order:      [Int] = []
+        var radix:      [Int] = []
+        var offsets     = [Int](repeating: 0, count: 1024)
+        var levels:     [UInt8] = []
+        var table:      [UInt64] = []
+        var permOrder:  [Int] = []
+        var permPos:    [SIMD3<Float>] = []
+        var permLvl:    [UInt8] = []
+
+        public init() {}
+
+        /// Grow `array` to at least `n` elements (never shrinks). Only the
+        /// `[0..<n]` prefix is ever read/written by ``pack``, so a larger tail
+        /// left by a bigger prior chunk is harmless.
+        @inline(__always)
+        static func grow<T>(_ array: inout [T], to n: Int, fill: T) {
+            if array.count < n { array.append(contentsOf: repeatElement(fill, count: n - array.count)) }
+        }
+    }
+
     /// Pack a single COPC node's worth of points.
     /// - Parameters:
     ///   - positionsXYZ: count * 3 doubles, world-space
@@ -47,6 +88,9 @@ enum ChunkPacker {
     ///   - originShift: subtract from positions before quantizing (file-bounds-center)
     ///   - pointsPerBatch: renderer batch size; default 10240
     ///   - lodLevels: 1..8
+    ///   - workspace: optional per-worker reusable scratch (see ``Workspace``).
+    ///     Pass `nil` (default) to allocate throwaway scratch — output is
+    ///     identical either way.
     static func pack(
         positionsXYZ: UnsafePointer<Double>,
         rgb16: UnsafePointer<UInt16>,
@@ -59,26 +103,35 @@ enum ChunkPacker {
         rgbShiftBits: UInt32? = nil,
         pointsPerBatch: Int = defaultPointsPerBatch,
         lodLevels: Int = defaultLODLevels,
-        coarseVoxelDivisions: Int = defaultCoarseVoxelDivisions
+        coarseVoxelDivisions: Int = defaultCoarseVoxelDivisions,
+        workspace: Workspace? = nil
     ) -> Output {
         precondition(count > 0)
+        let ws = workspace ?? Workspace()
 
-        var positions = [SIMD3<Float>](repeating: .zero, count: count)
-        for i in 0..<count {
-            let dx = positionsXYZ[3*i+0] - originShift.x
-            let dy = positionsXYZ[3*i+1] - originShift.y
-            let dz = positionsXYZ[3*i+2] - originShift.z
-            positions[i] = SIMD3<Float>(Float(dx), Float(dy), Float(dz))
+        Workspace.grow(&ws.positions, to: count, fill: .zero)
+        ws.positions.withUnsafeMutableBufferPointer { p in
+            for i in 0..<count {
+                let dx = positionsXYZ[3*i+0] - originShift.x
+                let dy = positionsXYZ[3*i+1] - originShift.y
+                let dz = positionsXYZ[3*i+2] - originShift.z
+                p[i] = SIMD3<Float>(Float(dx), Float(dy), Float(dz))
+            }
         }
 
         var boundsMin = SIMD3<Float>(repeating:  .greatestFiniteMagnitude)
         var boundsMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
-        for p in positions {
-            boundsMin = simd_min(boundsMin, p)
-            boundsMax = simd_max(boundsMax, p)
+        ws.positions.withUnsafeBufferPointer { p in
+            for i in 0..<count {
+                boundsMin = simd_min(boundsMin, p[i])
+                boundsMax = simd_max(boundsMax, p[i])
+            }
         }
 
-        var order = mortonOrder(positions: positions, boundsMin: boundsMin, boundsMax: boundsMax)
+        // Morton order → `ws.order[0..<count]` (reuses ws.keys / ws.radix /
+        // ws.offsets).
+        mortonOrder(
+            into: ws, count: count, boundsMin: boundsMin, boundsMax: boundsMax)
 
         // Materialize the positions in Morton order exactly once. Both the LOD
         // pass (which greedily assigns levels while walking points in Morton
@@ -89,19 +142,19 @@ enum ChunkPacker {
         // with node size). This is the single reorder; the quantize/colors/extra
         // passes fuse their reorder into the write, so no other temporary is
         // built.
-        var orderedPositions = [SIMD3<Float>](repeating: .zero, count: count)
-        positions.withUnsafeBufferPointer { src in
-            order.withUnsafeBufferPointer { ord in
-                orderedPositions.withUnsafeMutableBufferPointer { dst in
+        Workspace.grow(&ws.ordered, to: count, fill: .zero)
+        ws.positions.withUnsafeBufferPointer { src in
+            ws.order.withUnsafeBufferPointer { ord in
+                ws.ordered.withUnsafeMutableBufferPointer { dst in
                     for i in 0..<count { dst[i] = src[ord[i]] }
                 }
             }
         }
 
-        var levels = computeLODLevels(
-            positions: orderedPositions,
-            boundsMin: boundsMin,
-            boundsMax: boundsMax,
+        // LOD levels → `ws.levels[0..<count]` (reuses ws.table).
+        computeLODLevels(
+            into: ws, count: count,
+            boundsMin: boundsMin, boundsMax: boundsMax,
             lodLevels: max(1, min(lodLevels, 8)),
             coarseVoxelDivisions: max(1, coarseVoxelDivisions)
         )
@@ -114,12 +167,7 @@ enum ChunkPacker {
         // its draw loops to the LOD prefix.
         let batchSize = max(pointsPerBatch, 1)
         precondition(batchSize <= 65535, "pointsPerBatch must fit the uint16 LOD prefix counts")
-        bucketSortBatchSlicesByLevel(
-            order: &order,
-            positions: &orderedPositions,
-            levels: &levels,
-            batchStride: batchSize
-        )
+        bucketSortBatchSlicesByLevel(into: ws, count: count, batchStride: batchSize)
 
         // Allocate the packed position buffers at their final size and quantize
         // straight into them — one traversal, no intermediate [UInt32] arrays or
@@ -133,7 +181,8 @@ enum ChunkPacker {
 
         let stepsMinusOne = Float(steps30Bit - 1)
 
-        orderedPositions.withUnsafeBufferPointer { pos in
+        ws.ordered.withUnsafeBufferPointer { pos in
+        ws.levels.withUnsafeBufferPointer { levels in
             xyzLow.withUnsafeMutableBytes { lowRaw in
                 xyzMed.withUnsafeMutableBytes { medRaw in
                     xyzHigh.withUnsafeMutableBytes { highRaw in
@@ -210,6 +259,7 @@ enum ChunkPacker {
                 }
             }
         }
+        }
 
         // Pack colors straight into the output `Data`. LAS RGB is 16-bit per
         // channel; rescale to 8-bit. No alpha channel in COPC, so set A = 255.
@@ -237,12 +287,14 @@ enum ChunkPacker {
                     }
                     shift = maxVal > 255 ? 8 : 0
                 }
-                for dstIndex in 0..<count {
-                    let srcIndex = order[dstIndex]
-                    let r = UInt32(rgb16[3*srcIndex+0]) >> shift
-                    let g = UInt32(rgb16[3*srcIndex+1]) >> shift
-                    let b = UInt32(rgb16[3*srcIndex+2]) >> shift
-                    dst[dstIndex] = (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16) | (UInt32(255) << 24)
+                ws.order.withUnsafeBufferPointer { order in
+                    for dstIndex in 0..<count {
+                        let srcIndex = order[dstIndex]
+                        let r = UInt32(rgb16[3*srcIndex+0]) >> shift
+                        let g = UInt32(rgb16[3*srcIndex+1]) >> shift
+                        let b = UInt32(rgb16[3*srcIndex+2]) >> shift
+                        dst[dstIndex] = (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16) | (UInt32(255) << 24)
+                    }
                 }
             } else {
                 for i in 0..<count { dst[i] = 0xFFFFFFFF }
@@ -255,18 +307,24 @@ enum ChunkPacker {
         // straight into its `Data`.
         var extraScalars: [String: Data] = [:]
         if let extra, extraCount > 0, extraCount == extraNames.count {
-            for (d, name) in extraNames.enumerated() {
-                let base = d * count
-                var colData = Data(count: count * MemoryLayout<Float>.stride)
-                colData.withUnsafeMutableBytes { raw in
-                    let col = raw.bindMemory(to: Float.self)
-                    for dstIndex in 0..<count {
-                        col[dstIndex] = extra[base + order[dstIndex]]
+            ws.order.withUnsafeBufferPointer { order in
+                for (d, name) in extraNames.enumerated() {
+                    let base = d * count
+                    var colData = Data(count: count * MemoryLayout<Float>.stride)
+                    colData.withUnsafeMutableBytes { raw in
+                        let col = raw.bindMemory(to: Float.self)
+                        for dstIndex in 0..<count {
+                            col[dstIndex] = extra[base + order[dstIndex]]
+                        }
                     }
+                    extraScalars[name] = colData
                 }
-                extraScalars[name] = colData
             }
         }
+
+        // The output `levels` blob is the level-sorted per-point levels; copy
+        // just the used prefix out of the (possibly larger) reusable buffer.
+        let levelsData = ws.levels.withUnsafeBufferPointer { Data(buffer: UnsafeBufferPointer(rebasing: $0[0..<count])) }
 
         return Output(
             batches: batches,
@@ -274,7 +332,7 @@ enum ChunkPacker {
             xyzMed:  xyzMed,
             xyzHigh: xyzHigh,
             colors:  colors,
-            levels:  Data(levels),
+            levels:  levelsData,
             extraScalars: extraScalars
         )
     }
@@ -286,138 +344,175 @@ enum ChunkPacker {
 // applied to `order` so every array derived from it stays consistent with the
 // permuted positions/levels. Mirrors `bucketSortBatchSlicesByLevel` in
 // Satin-ComputeRasteriser's PackedPointCloudFixtures.
+//
+// Operates in place on `ws.order` / `ws.ordered` / `ws.levels` (`[0..<count]`),
+// reusing `ws.permOrder` / `ws.permPos` / `ws.permLvl` for the per-slice
+// scratch.
 private func bucketSortBatchSlicesByLevel(
-    order: inout [Int],
-    positions: inout [SIMD3<Float>],
-    levels: inout [UInt8],
+    into ws: ChunkPacker.Workspace,
+    count: Int,
     batchStride: Int
 ) {
-    let count = positions.count
-    var first = 0
-    while first < count {
-        let end = min(first + batchStride, count)
+    ChunkPacker.Workspace.grow(&ws.permOrder, to: batchStride, fill: 0)
+    ChunkPacker.Workspace.grow(&ws.permPos, to: batchStride, fill: .zero)
+    ChunkPacker.Workspace.grow(&ws.permLvl, to: batchStride, fill: 0)
 
-        var cursors = [Int](repeating: 0, count: 9)
-        for i in first..<end {
-            cursors[(Int(levels[i]) & 7) + 1] += 1
-        }
-        for level in 1..<9 {
-            cursors[level] += cursors[level - 1]
-        }
+    // Bind every workspace buffer to a local unsafe pointer for the hot loops:
+    // subscripting a class-stored `Array` (`ws.order[i]`) in a loop pays ARC +
+    // exclusivity overhead per access that a raw pointer avoids.
+    ws.order.withUnsafeMutableBufferPointer { order in
+    ws.ordered.withUnsafeMutableBufferPointer { ordered in
+    ws.levels.withUnsafeMutableBufferPointer { levels in
+    ws.permOrder.withUnsafeMutableBufferPointer { permOrder in
+    ws.permPos.withUnsafeMutableBufferPointer { permPos in
+    ws.permLvl.withUnsafeMutableBufferPointer { permLvl in
+        var first = 0
+        while first < count {
+            let end = min(first + batchStride, count)
+            let sliceLen = end - first
 
-        // permutation[j] = source index (in the whole array) of the point
-        // that lands at slice-relative position j.
-        var permutation = [Int](repeating: 0, count: end - first)
-        for i in first..<end {
-            let level = Int(levels[i]) & 7
-            permutation[cursors[level]] = i
-            cursors[level] += 1
-        }
+            var cursors = [Int](repeating: 0, count: 9)
+            for i in first..<end {
+                cursors[(Int(levels[i]) & 7) + 1] += 1
+            }
+            for level in 1..<9 {
+                cursors[level] += cursors[level - 1]
+            }
 
-        let orderSlice = permutation.map { order[$0] }
-        let positionSlice = permutation.map { positions[$0] }
-        let levelSlice = permutation.map { levels[$0] }
-        for j in 0..<permutation.count {
-            order[first + j] = orderSlice[j]
-            positions[first + j] = positionSlice[j]
-            levels[first + j] = levelSlice[j]
-        }
+            // Build the level-ascending permutation of the slice into the
+            // reusable scratch, sourcing from the current order/positions/
+            // levels, then write it back over the slice.
+            for i in first..<end {
+                let level = Int(levels[i]) & 7
+                let j = cursors[level]
+                permOrder[j] = order[i]
+                permPos[j]   = ordered[i]
+                permLvl[j]   = levels[i]
+                cursors[level] += 1
+            }
+            for j in 0..<sliceLen {
+                order[first + j]   = permOrder[j]
+                ordered[first + j] = permPos[j]
+                levels[first + j]  = permLvl[j]
+            }
 
-        first = end
-    }
+            first = end
+        }
+    }}}}}}
 }
 
 // Morton-order so consecutive entries are spatially close — gives tight
 // per-batch AABBs and better cache coherency for threadgroup reads in the
-// rasterizer.
+// rasterizer. Writes the ascending index permutation into `ws.order[0..<count]`,
+// reusing `ws.keys` for the Morton keys and `ws.radix` / `ws.offsets` for the
+// LSD radix sort.
 private func mortonOrder(
-    positions: [SIMD3<Float>],
+    into ws: ChunkPacker.Workspace,
+    count: Int,
     boundsMin: SIMD3<Float>,
     boundsMax: SIMD3<Float>
-) -> [Int] {
-    let count = positions.count
+) {
     let extent = simd_max(boundsMax - boundsMin, SIMD3<Float>(repeating: 1e-6))
     let scale = SIMD3<Float>(repeating: 1023.0) / extent
 
-    var keys = [UInt32](repeating: 0, count: count)
-    for i in 0..<count {
-        let nrm = simd_clamp((positions[i] - boundsMin) * scale, .zero, SIMD3<Float>(repeating: 1023.0))
-        let qx = UInt32(nrm.x), qy = UInt32(nrm.y), qz = UInt32(nrm.z)
-        keys[i] = (mortonSpread10(qx) << 2) | (mortonSpread10(qy) << 1) | mortonSpread10(qz)
+    ChunkPacker.Workspace.grow(&ws.keys, to: count, fill: 0)
+    ws.positions.withUnsafeBufferPointer { pos in
+        ws.keys.withUnsafeMutableBufferPointer { keys in
+            for i in 0..<count {
+                let nrm = simd_clamp((pos[i] - boundsMin) * scale, .zero, SIMD3<Float>(repeating: 1023.0))
+                let qx = UInt32(nrm.x), qy = UInt32(nrm.y), qz = UInt32(nrm.z)
+                keys[i] = (mortonSpread10(qx) << 2) | (mortonSpread10(qy) << 1) | mortonSpread10(qz)
+            }
+        }
     }
-    return lsdRadixSortIndices(byKeys: keys, count: count)
+    lsdRadixSortIndices(into: ws, count: count)
 }
 
-// Stable LSD radix sort returning the index permutation that orders `keys`
-// ascending. Morton keys are 30-bit, so three 10-bit passes (a 1024-bucket
-// counting sort each, ping-ponging the index buffers) cover every bit and
-// yield exactly the ascending order the previous `indices.sort { keys[$0] <
-// keys[$1] }` produced. This replaces that O(P log P) comparison sort — the
-// dominant per-chunk pack cost on the decode workers — with O(P) work.
+// Stable LSD radix sort writing the ascending index permutation of
+// `ws.keys[0..<count]` into `ws.order[0..<count]`. Morton keys are 30-bit, so
+// three 10-bit passes (a 1024-bucket counting sort each, ping-ponging the index
+// buffers `ws.order` / `ws.radix`) cover every bit and yield exactly the
+// ascending order the previous `indices.sort { keys[$0] < keys[$1] }` produced.
+// This replaces that O(P log P) comparison sort — the dominant per-chunk pack
+// cost on the decode workers — with O(P) work.
 //
 // Radix is stable: points sharing a Morton key (i.e. the same coarse voxel)
 // keep their input order, whereas the old introsort left them in an arbitrary
 // order. That tie ordering is not semantically meaningful, so the packed
 // output is unchanged apart from how equal-key points are interleaved.
-private func lsdRadixSortIndices(byKeys keys: [UInt32], count: Int) -> [Int] {
-    guard count > 1 else { return Array(0..<count) }
+private func lsdRadixSortIndices(into ws: ChunkPacker.Workspace, count: Int) {
+    ChunkPacker.Workspace.grow(&ws.order, to: count, fill: 0)
+    ChunkPacker.Workspace.grow(&ws.radix, to: count, fill: 0)
 
-    var src = Array(0..<count)                       // current index order
-    var dst = [Int](repeating: 0, count: count)      // scatter target (swapped in)
-    var offsets = [Int](repeating: 0, count: 1024)   // bucket offsets, reused per pass
-
-    keys.withUnsafeBufferPointer { key in
-        offsets.withUnsafeMutableBufferPointer { off in
-            for pass in 0..<3 {
-                let shift = UInt32(pass * 10)
-
-                // Count how many indices fall in each 10-bit bucket.
-                for j in 0..<1024 { off[j] = 0 }
-                src.withUnsafeBufferPointer { s in
-                    for i in 0..<count {
-                        off[Int((key[s[i]] >> shift) & 1023)] += 1
-                    }
-                }
-
-                // Exclusive prefix sum → each bucket's starting write offset.
-                var running = 0
-                for j in 0..<1024 {
-                    let c = off[j]
-                    off[j] = running
-                    running += c
-                }
-
-                // Stable scatter: walking `src` in order keeps equal keys in
-                // their current relative order.
-                src.withUnsafeBufferPointer { s in
-                    dst.withUnsafeMutableBufferPointer { d in
-                        for i in 0..<count {
-                            let idx = s[i]
-                            let bucket = Int((key[idx] >> shift) & 1023)
-                            d[off[bucket]] = idx
-                            off[bucket] += 1
-                        }
-                    }
-                }
-                swap(&src, &dst)
-            }
-        }
+    // Identity into ws.order first — this is the result for the count<=1 early
+    // return, and is overwritten by the sort otherwise.
+    ws.order.withUnsafeMutableBufferPointer { a in
+        for i in 0..<count { a[i] = i }
     }
-    // Three passes = three swaps, so the sorted order is back in `src`.
-    return src
+    guard count > 1 else { return }
+
+    // The sort ping-pongs between ws.radix (initial `src`, seeded identity) and
+    // ws.order (initial `dst`). With three passes (odd), the final scatter
+    // writes into ws.order, so the sorted permutation lands there — exactly
+    // where the rest of `pack` reads it — with no extra copy.
+    ws.radix.withUnsafeMutableBufferPointer { r in
+        for i in 0..<count { r[i] = i }
+    }
+    ws.keys.withUnsafeBufferPointer { key in
+    ws.offsets.withUnsafeMutableBufferPointer { off in
+    ws.radix.withUnsafeMutableBufferPointer { bufSrc in
+    ws.order.withUnsafeMutableBufferPointer { bufDst in
+        var src = bufSrc.baseAddress!
+        var dst = bufDst.baseAddress!
+        for pass in 0..<3 {
+            let shift = UInt32(pass * 10)
+
+            // Count how many indices fall in each 10-bit bucket.
+            for j in 0..<1024 { off[j] = 0 }
+            for i in 0..<count {
+                off[Int((key[src[i]] >> shift) & 1023)] += 1
+            }
+
+            // Exclusive prefix sum → each bucket's starting write offset.
+            var running = 0
+            for j in 0..<1024 {
+                let c = off[j]
+                off[j] = running
+                running += c
+            }
+
+            // Stable scatter: walking `src` in order keeps equal keys in their
+            // current relative order.
+            for i in 0..<count {
+                let idx = src[i]
+                let bucket = Int((key[idx] >> shift) & 1023)
+                dst[off[bucket]] = idx
+                off[bucket] += 1
+            }
+            swap(&src, &dst)
+        }
+        // Three swaps: pass 0/2 write ws.order, pass 1 writes ws.radix, so the
+        // final result is in ws.order.
+    }}}}
 }
 
+// Assigns per-point LOD levels into `ws.levels[0..<count]` (from the
+// Morton-ordered `ws.ordered`), reusing `ws.table` as the open-addressing
+// occupancy set.
 private func computeLODLevels(
-    positions: [SIMD3<Float>],
+    into ws: ChunkPacker.Workspace,
+    count: Int,
     boundsMin: SIMD3<Float>,
     boundsMax: SIMD3<Float>,
     lodLevels: Int,
     coarseVoxelDivisions: Int
-) -> [UInt8] {
-    let count = positions.count
+) {
     let maxLevel = UInt8(lodLevels - 1)
-    var levels = [UInt8](repeating: maxLevel, count: count)
-    guard lodLevels > 1 else { return levels }
+    ChunkPacker.Workspace.grow(&ws.levels, to: count, fill: 0)
+    ws.levels.withUnsafeMutableBufferPointer { lv in
+        for i in 0..<count { lv[i] = maxLevel }
+    }
+    guard lodLevels > 1 else { return }
 
     let extent = simd_max(boundsMax - boundsMin, SIMD3<Float>(repeating: 1e-6))
     let longestAxis = max(extent.x, max(extent.y, extent.z))
@@ -454,29 +549,26 @@ private func computeLODLevels(
     // total count — not by per-level unclaimed counts — is deliberate: the
     // eligible set shrinks with depth but the number of distinct occupied
     // voxels (the actual live entries) grows, and `count` bounds both at every
-    // level, so one allocation stays under 0.5 load throughout. Per-level
-    // resizing would only shave the O(capacity) reset, which is already
-    // dominated by the O(count) scan — not worth the extra bookkeeping.
+    // level, so one allocation stays under 0.5 load throughout. The table is
+    // reused across chunks via the workspace; only the `[0..<capacity]` prefix
+    // is touched, so a larger tail from a bigger prior chunk is inert.
     let sentinel = UInt64.max
     var capacity = 1
     while capacity < count * 2 { capacity <<= 1 }
     let mask = capacity - 1
     let shift = UInt64(64 - capacity.trailingZeroBitCount)
 
-    var table = [UInt64](repeating: sentinel, count: capacity)
-    levels.withUnsafeMutableBufferPointer { lv in
-        positions.withUnsafeBufferPointer { pos in
-            table.withUnsafeMutableBufferPointer { t in
+    ChunkPacker.Workspace.grow(&ws.table, to: capacity, fill: sentinel)
+    ws.levels.withUnsafeMutableBufferPointer { lv in
+        ws.ordered.withUnsafeBufferPointer { pos in
+            ws.table.withUnsafeMutableBufferPointer { t in
                 for level in 0..<(lodLevels - 1) {
                     let voxelSize = baseVoxel * powf(0.5, Float(level))
                     let invVoxel = 1.0 / max(voxelSize, 1e-6)
-                    // Level 0 uses the freshly sentinel-filled table; refill for
-                    // each subsequent level. No "skip refill when no inserts"
-                    // guard: the first eligible point always inserts, so at
-                    // these coarse levels the guard would never fire.
-                    if level != 0 {
-                        for j in 0..<capacity { t[j] = sentinel }
-                    }
+                    // Refill the sentinel over the used prefix at the start of
+                    // every level (level 0 included, because the table is
+                    // reused across chunks and may carry a prior chunk's keys).
+                    for j in 0..<capacity { t[j] = sentinel }
                     for i in 0..<count {
                         if lv[i] != maxLevel { continue }
                         let local = (pos[i] - boundsMin) * invVoxel
@@ -497,7 +589,6 @@ private func computeLODLevels(
             }
         }
     }
-    return levels
 }
 
 private func mortonSpread10(_ value: UInt32) -> UInt32 {

@@ -58,8 +58,16 @@ public final class StreamingDecodeGate: @unchecked Sendable {
         return nil
     }
 
-    /// Default limit: leave two cores free for the rest of the process,
-    /// but never drop below two concurrent decodes.
+    /// Default *floor* limit: leave two cores free for the rest of the
+    /// process, but never drop below two concurrent decodes.
+    ///
+    /// This is only a starting floor. A source opened with a higher
+    /// ``StreamingOptions/decodeConcurrency`` raises the gate to accommodate
+    /// its own workers on open (see
+    /// ``StreamingOptions/decodeGateLimit`` and ``ensureLimitAtLeast(_:)``),
+    /// so `decodeConcurrency` is never silently capped below the value the
+    /// caller requested — the historical failure mode where an 18-worker
+    /// source pegged at `activeProcessorCount - 2 = 16` concurrent decodes.
     private static var defaultLimit: Int {
         max(2, ProcessInfo.processInfo.activeProcessorCount - 2)
     }
@@ -97,6 +105,35 @@ public final class StreamingDecodeGate: @unchecked Sendable {
         let clamped = max(1, newLimit)
         let toResume: [CheckedContinuation<Void, Never>] = lock.withLock {
             limit = clamped
+            var resumed: [CheckedContinuation<Void, Never>] = []
+            while inFlight < limit, let c = dequeueNextWaiter() {
+                inFlight += 1
+                resumed.append(c)
+            }
+            return resumed
+        }
+        for c in toResume { c.resume() }
+    }
+
+    /// Raise the concurrency cap to at least `n`, never lowering it.
+    ///
+    /// This is the additive, multi-source-safe way for a newly-opened source
+    /// to guarantee its own decode workers are never throttled below the
+    /// concurrency it was configured with: a source opened with
+    /// ``StreamingOptions/decodeConcurrency`` `= N` calls
+    /// `ensureLimitAtLeast(N)` so the shared gate — whose default floor of
+    /// `activeProcessorCount - 2` can sit *below* a requested `N` — is lifted
+    /// to accommodate it. Because it only ever raises, two sources opening
+    /// concurrently compose: the gate ends at the max of their requests, and
+    /// neither clobbers the other's headroom. To *lower* the aggregate cap
+    /// (e.g. while a latency-sensitive UI is focused), use ``setLimit(_:)``.
+    ///
+    /// - Parameter n: The minimum cap to guarantee; values `<= currentLimit`
+    ///   are no-ops.
+    public func ensureLimitAtLeast(_ n: Int) {
+        let toResume: [CheckedContinuation<Void, Never>] = lock.withLock {
+            guard n > limit else { return [] }
+            limit = n
             var resumed: [CheckedContinuation<Void, Never>] = []
             while inFlight < limit, let c = dequeueNextWaiter() {
                 inFlight += 1

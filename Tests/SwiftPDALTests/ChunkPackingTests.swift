@@ -136,3 +136,78 @@ private struct LCG {
 
     #expect(seenSources.count == count, "the pack must be a permutation of the input points")
 }
+
+// Build a deterministic synthetic node and return its raw input arrays.
+private func makeSyntheticNode(count: Int, seed: UInt64)
+-> (xyz: [Double], rgb: [UInt16], extra: [Float]) {
+    var rng = LCG(state: seed)
+    var xyz = [Double](repeating: 0, count: count * 3)
+    var rgb = [UInt16](repeating: 0, count: count * 3)
+    for i in 0..<count {
+        xyz[3*i+0] = rng.unitDouble() * 12.0 + 500.0
+        xyz[3*i+1] = rng.unitDouble() * 12.0 - 200.0
+        xyz[3*i+2] = rng.unitDouble() * 12.0 + 33.0
+        rgb[3*i+0] = UInt16(rng.unitDouble() * 65535)
+        rgb[3*i+1] = UInt16(rng.unitDouble() * 65535)
+        rgb[3*i+2] = UInt16(rng.unitDouble() * 65535)
+    }
+    return (xyz, rgb, (0..<count).map { Float($0) })
+}
+
+private func packNode(
+    _ node: (xyz: [Double], rgb: [UInt16], extra: [Float]),
+    count: Int, workspace: ChunkPacker.Workspace?
+) -> ChunkPacker.Output {
+    node.xyz.withUnsafeBufferPointer { p in
+        node.rgb.withUnsafeBufferPointer { c in
+            node.extra.withUnsafeBufferPointer { e in
+                ChunkPacker.pack(
+                    positionsXYZ: p.baseAddress!, rgb16: c.baseAddress!, count: count,
+                    hasRgb: true, originShift: SIMD3<Double>(500, -200, 33),
+                    extra: e.baseAddress!, extraCount: 1, extraNames: ["SourceIndex"],
+                    rgbShiftBits: 8, coarseVoxelDivisions: 4, workspace: workspace)
+            }
+        }
+    }
+}
+
+private func assertSameOutput(_ a: ChunkPacker.Output, _ b: ChunkPacker.Output, _ ctx: String) {
+    #expect(a.xyzLow == b.xyzLow, "\(ctx): xyzLow differs")
+    #expect(a.xyzMed == b.xyzMed, "\(ctx): xyzMed differs")
+    #expect(a.xyzHigh == b.xyzHigh, "\(ctx): xyzHigh differs")
+    #expect(a.colors == b.colors, "\(ctx): colors differs")
+    #expect(a.levels == b.levels, "\(ctx): levels differs")
+    #expect(a.extraScalars["SourceIndex"] == b.extraScalars["SourceIndex"], "\(ctx): extra differs")
+    #expect(a.batches.count == b.batches.count, "\(ctx): batch count differs")
+    for i in 0..<min(a.batches.count, b.batches.count) {
+        let x = a.batches[i], y = b.batches[i]
+        #expect(x.numPoints == y.numPoints && x.firstPoint == y.firstPoint
+                && x.padding3 == y.padding3 && x.padding4 == y.padding4
+                && x.padding5 == y.padding5 && x.padding6 == y.padding6
+                && x.minX == y.minX && x.maxZ == y.maxZ, "\(ctx): batch \(i) differs")
+    }
+}
+
+// A reused Workspace must yield byte-identical output to fresh allocation, and
+// must not carry state across chunks of different sizes (exercises the LOD
+// table refill + buffer-grow prefixes).
+@Test func chunkPacker_workspaceReuse_matchesFreshAllocation() {
+    let big = makeSyntheticNode(count: 5000, seed: 0xABCD_1234)
+    let small = makeSyntheticNode(count: 700, seed: 0x1111_2222)
+
+    // Fresh (workspace: nil) reference outputs.
+    let bigFresh = packNode(big, count: 5000, workspace: nil)
+    let smallFresh = packNode(small, count: 700, workspace: nil)
+
+    // Same workspace, adversarial size order: big → small → big again. If any
+    // buffer (esp. the LOD occupancy table) leaked state across chunks, the
+    // second `big` or the `small` in the middle would diverge.
+    let ws = ChunkPacker.Workspace()
+    let big1 = packNode(big, count: 5000, workspace: ws)
+    let smallReuse = packNode(small, count: 700, workspace: ws)
+    let big2 = packNode(big, count: 5000, workspace: ws)
+
+    assertSameOutput(bigFresh, big1, "big first-use vs fresh")
+    assertSameOutput(smallFresh, smallReuse, "small after big (shrink) vs fresh")
+    assertSameOutput(bigFresh, big2, "big after small (regrow) vs fresh")
+}
