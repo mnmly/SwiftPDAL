@@ -61,6 +61,42 @@ import CxxPDAL
 
 }
 
+// MARK: - Headerless ASCII column inference
+
+/// The direct-read path (`createConfiguredStage`) must infer the column
+/// map of a headerless `.xyz` from its first data line, not assume a fixed
+/// 6-column X/Y/Z/RGB schema. A 6-column file keeps its colour; a 3-column
+/// file reads all its rows instead of dropping them with a field-count
+/// mismatch. Regression for the hardcoded `.xyz` reader options.
+@Test func xyzColumnInferenceDirectRead() async throws {
+    setenv("SWIFTPDAL_TESTING", "1", 1)
+
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("xyz-infer-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let rows6 = (0..<8).map { "0.1\($0) 0.2\($0) 0.3\($0) 10 20 30" }.joined(separator: "\n") + "\n"
+    let rows3 = (0..<8).map { "0.1\($0) 0.2\($0) 0.3\($0)" }.joined(separator: "\n") + "\n"
+    let six = dir.appendingPathComponent("rgb.xyz")
+    let three = dir.appendingPathComponent("plain.xyz")
+    try rows6.write(to: six, atomically: true, encoding: .utf8)
+    try rows3.write(to: three, atomically: true, encoding: .utf8)
+
+    let sixCloud = try PointCloud.read(from: six.path)
+    #expect(sixCloud.pointCount == 8)
+    let sixDims = Set(sixCloud.dimensions.map(\.name))
+    #expect(sixDims.isSuperset(of: ["X", "Y", "Z", "Red", "Green", "Blue"]))
+
+    // 3-column: every row must survive (the old hardcode expected 6 fields
+    // and would drop these), and no colour dimensions get invented.
+    let threeCloud = try PointCloud.read(from: three.path)
+    #expect(threeCloud.pointCount == 8)
+    let threeDims = Set(threeCloud.dimensions.map(\.name))
+    #expect(threeDims.isSuperset(of: ["X", "Y", "Z"]))
+    #expect(threeDims.isDisjoint(with: ["Red", "Green", "Blue"]))
+}
+
 // MARK: - Streaming Tests
 
 @Test func streamingReadBasic() async throws {

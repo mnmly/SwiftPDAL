@@ -11,6 +11,8 @@
 
 #include <cstdlib>
 #include <unistd.h>
+#include <fstream>
+#include <string>
 
 // Platform-specific includes
 #if defined(PDAL_IOS)
@@ -132,6 +134,104 @@ static std::string resolveDimension(const DimensionMap& mappings, const std::str
     return standardName;
 }
 
+// Column-map inference for headerless ASCII point clouds. Mirrors the
+// Swift pipeline path's PDALConvert.inferReaderStage
+// (Sources/SwiftPDAL/Convert.swift): identical column→dimension table and
+// tab>comma>space separator rule. The two are separate code paths — the
+// pipeline builds JSON, this configures a Stage directly — so keep them in
+// sync by hand when the table changes.
+namespace {
+
+struct AsciiTextOptions {
+    std::string header;     // e.g. "X Y Z Red Green Blue"
+    std::string separator;  // single delimiter char, matches the header join
+    int skip = 0;
+};
+
+// First non-blank, non-comment line of a text file (~8 KiB peek). Trims
+// surrounding whitespace and a trailing CR so CRLF files parse. Empty
+// string if the file can't be opened or the peek holds no usable line.
+static std::string firstNonEmptyAsciiLine(const std::string& filename) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) return "";
+    char buf[8192];
+    in.read(buf, sizeof(buf));
+    std::string chunk(buf, static_cast<size_t>(in.gcount()));
+    size_t pos = 0;
+    while (pos <= chunk.size()) {
+        size_t eol = chunk.find_first_of("\r\n", pos);
+        size_t len = (eol == std::string::npos) ? std::string::npos : eol - pos;
+        std::string line = chunk.substr(pos, len);
+        size_t a = line.find_first_not_of(" \t");
+        size_t b = line.find_last_not_of(" \t\r");
+        if (a != std::string::npos && b != std::string::npos && a <= b) {
+            std::string trimmed = line.substr(a, b - a + 1);
+            if (trimmed[0] != '#') return trimmed;
+        }
+        if (eol == std::string::npos) break;
+        pos = eol + 1;
+    }
+    return "";
+}
+
+// Infer header/separator/skip from the first data line. Returns false —
+// leaving PDAL's default reader behaviour untouched — when the file can't
+// be peeked or its first usable line isn't numeric (i.e. it likely carries
+// a real text header row we shouldn't override).
+static bool detectAsciiTextOptions(const std::string& filename, AsciiTextOptions& out) {
+    std::string line = firstNonEmptyAsciiLine(filename);
+    if (line.empty()) return false;
+
+    // Split on any of space/tab/comma, collapsing empties — matches
+    // inferReaderStage's whereSeparator rule for counting columns.
+    std::vector<std::string> tokens;
+    size_t i = 0;
+    while (i < line.size()) {
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t' || line[i] == ',')) i++;
+        if (i >= line.size()) break;
+        size_t start = i;
+        while (i < line.size() && !(line[i] == ' ' || line[i] == '\t' || line[i] == ',')) i++;
+        tokens.push_back(line.substr(start, i - start));
+    }
+    if (tokens.empty()) return false;
+
+    // Only synthesise a header when the row is numeric data. A non-numeric
+    // first token means the line is a header PDAL should read itself.
+    const char* c = tokens[0].c_str();
+    char* end = nullptr;
+    std::strtod(c, &end);
+    if (end == c) return false;
+
+    std::vector<std::string> names;
+    switch (tokens.size()) {
+        case 3:  names = {"X", "Y", "Z"}; break;
+        case 4:  names = {"X", "Y", "Z", "Intensity"}; break;
+        case 6:  names = {"X", "Y", "Z", "Red", "Green", "Blue"}; break;
+        case 7:  names = {"X", "Y", "Z", "Intensity", "Red", "Green", "Blue"}; break;
+        case 9:  names = {"X", "Y", "Z", "Intensity", "ReturnNumber",
+                          "NumberOfReturns", "Red", "Green", "Blue"}; break;
+        default: names = {"X", "Y", "Z"}; break;
+    }
+
+    // Separator: tab > comma > space. PDAL splits both the header string and
+    // each data line by this one char, so the header join must use it too.
+    std::string sep = (line.find('\t') != std::string::npos) ? "\t"
+                    : (line.find(',')  != std::string::npos) ? ","
+                    :                                          " ";
+    std::string header;
+    for (size_t k = 0; k < names.size(); ++k) {
+        if (k) header += sep;
+        header += names[k];
+    }
+
+    out.header = header;
+    out.separator = sep;
+    out.skip = 0;
+    return true;
+}
+
+} // namespace
+
 static Stage* createConfiguredStage(
     const std::string& reader_name_backup,
     const std::string& filename,
@@ -167,10 +267,18 @@ static Stage* createConfiguredStage(
     if (wantCopcResolution) {
         options.add("resolution", resolution);
     }
-    if (filename.ends_with(".xyz")) {
-        options.add("skip", 0);
-        options.add("separator", " ");
-        options.add("header", "X Y Z Red Green Blue");
+    if (filename.ends_with(".xyz") || filename.ends_with(".txt")) {
+        // Infer the column map from the first data line rather than assuming
+        // a fixed 6-column X/Y/Z/RGB schema. A 3-column file stays X Y Z, a
+        // 6-column file becomes X Y Z Red Green Blue, etc. — matching the
+        // Swift pipeline path. If detection can't run (unreadable, or a real
+        // header row), leave PDAL's defaults in place.
+        AsciiTextOptions ascii;
+        if (detectAsciiTextOptions(filename, ascii)) {
+            options.add("skip", ascii.skip);
+            options.add("separator", ascii.separator);
+            options.add("header", ascii.header);
+        }
     } else if (filename.ends_with(".pts")) {
         options.add("skip", 1);
         options.add("separator", " ");
