@@ -180,3 +180,32 @@ import Foundation
     // Surface whether writers.copc is in this build (used for .copc.laz).
     print("writers.copc available: \(PDALConvert.isDriverRegistered("writers.copc"))")
 }
+
+/// `inferReaderStage` must count columns correctly regardless of line
+/// ending. Swift stores `\r\n` as a single grapheme cluster equal to
+/// neither `"\n"` nor `"\r"`, so a naive newline split collapses a CRLF
+/// file into one giant line and the column heuristic falls through to the
+/// 3-column default — which then rejects every real 6-field row. Regression
+/// for headerless RGB `.xyz` exports (FARO/Cyclone) that use CRLF.
+@Test func inferReaderStageHandlesCRLF() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("crlf-infer-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    func header(_ contents: String, _ name: String) throws -> String? {
+        let url = dir.appendingPathComponent(name)
+        try contents.write(to: url, atomically: true, encoding: .utf8)
+        let stage = try PDALConvert.inferReaderStage(for: url)
+        if case .string(let h)? = stage.options["header"] { return h }
+        return nil
+    }
+
+    let rows6crlf = (0..<4).map { "0.1\($0) 0.2\($0) 0.3\($0) 10 20 30" }.joined(separator: "\r\n") + "\r\n"
+    let rows6lf   = rows6crlf.replacingOccurrences(of: "\r\n", with: "\n")
+    let rows3crlf = (0..<4).map { "0.1\($0) 0.2\($0) 0.3\($0)" }.joined(separator: "\r\n") + "\r\n"
+
+    #expect(try header(rows6crlf, "rgb_crlf.xyz") == "X Y Z Red Green Blue")
+    #expect(try header(rows6lf,   "rgb_lf.xyz")   == "X Y Z Red Green Blue")
+    #expect(try header(rows3crlf, "plain_crlf.xyz") == "X Y Z")
+}

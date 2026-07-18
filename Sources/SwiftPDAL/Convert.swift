@@ -575,7 +575,11 @@ public enum PDALConvert {
         guard let text = String(data: data, encoding: .utf8)
                 ?? String(data: data, encoding: .ascii)
         else { return nil }
-        for raw in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+        // `isNewline` matches LF, CR, and the CRLF grapheme cluster. A plain
+        // `$0 == "\n" || $0 == "\r"` misses `\r\n`, which Swift stores as one
+        // Character equal to neither — that collapses a CRLF file into a single
+        // "line" and derails the column/point-count inference below.
+        for raw in text.split(whereSeparator: { $0.isNewline }) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty || line.hasPrefix("#") { continue }
             return line
@@ -655,7 +659,7 @@ public enum PDALConvert {
         else { return nil }
         // Cyclone PTS: first non-blank line is the integer count.
         if ext == "pts" {
-            for raw in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+            for raw in text.split(whereSeparator: { $0.isNewline }) {
                 let line = raw.trimmingCharacters(in: .whitespaces)
                 if line.isEmpty || line.hasPrefix("#") { continue }
                 if let n = UInt64(line) { return n }
@@ -665,7 +669,7 @@ public enum PDALConvert {
         // Average bytes per data line over the sample.
         var lines = 0
         var bytes = 0
-        for raw in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+        for raw in text.split(whereSeparator: { $0.isNewline }) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty || line.hasPrefix("#") { continue }
             lines += 1
