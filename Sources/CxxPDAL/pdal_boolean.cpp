@@ -14,7 +14,6 @@
 
 #include "include/pdal_boolean.h"
 
-#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
@@ -34,7 +33,6 @@ struct FilterContext {
     double scale[3]  = {0, 0, 0};
     double offset[3] = {0, 0, 0};
     bool   haveScaleOffset = false;
-    bool   hasRGB    = false;   // source carried Red/Green/Blue
 };
 
 // Add the source LAS scale/offset (if captured) plus the caller's
@@ -149,9 +147,6 @@ OpenResult fw_open(const std::string& input_path,
         ctx->table  = table;
         ctx->view   = view;
         ctx->srsWkt = view->spatialReference().getWKT();
-        ctx->hasRGB = view->layout()->hasDim(pdal::Dimension::Id::Red) &&
-                      view->layout()->hasDim(pdal::Dimension::Id::Green) &&
-                      view->layout()->hasDim(pdal::Dimension::Id::Blue);
         captureScaleOffset(*reader, *ctx);
 
         const pdal::point_count_t n = view->size();
@@ -211,80 +206,31 @@ WriteResult fw_write_masked(void*              handle,
 
         std::string writerType = writer_type.empty() ? "writers.copc" : writer_type;
 
-        // Direct BufferReader → writer works for LAS/LAZ, but writers.copc
-        // can't be told a point format and forwards nothing from a
-        // BufferReader (no source header), so it defaults to format 6 and
-        // drops RGB. For COPC we therefore stage through a real LAS 1.4 file
-        // — which carries a proper header — then convert that to COPC, where
-        // CopcWriter forwards the format (7 with colour) correctly.
         pdal::StageFactory factory;
-
-        if (writerType == "writers.copc") {
-            const std::string stagePath = output_path + ".stage.laz";
-
-            // Stage 1: kept points → LAS 1.4, format 7 (GPS + RGB) or 6.
-            pdal::Stage* lasWriter = factory.createStage("writers.las");
-            if (!lasWriter) {
-                r.status = kPdalErrPdal;
-                r.error_message = "writers.las not registered in this pdalcpp build.";
-                return r;
-            }
-            pdal::Options lasOpts;
-            buildWriterOptions(lasOpts, *ctx, stagePath, writer_options_kv);
-            lasOpts.add("minor_version", 4);
-            lasOpts.add("dataformat_id", ctx->hasRGB ? 7 : 6);
-            lasOpts.add("extra_dims", std::string("all"));
-            lasWriter->setOptions(lasOpts);
-
-            pdal::BufferReader bufReader;
-            bufReader.addView(out);
-            lasWriter->setInput(bufReader);
-            pdal::PointTable t1;
-            lasWriter->prepare(t1);
-            lasWriter->execute(t1);
-
-            // Stage 2: LAS → COPC, forwarding the header (keeps format 7).
-            pdal::Stage* lasReader = factory.createStage("readers.las");
-            pdal::Stage* copcWriter = factory.createStage("writers.copc");
-            if (!lasReader || !copcWriter) {
-                std::remove(stagePath.c_str());
-                r.status = kPdalErrPdal;
-                r.error_message = "readers.las / writers.copc not registered.";
-                return r;
-            }
-            pdal::Options rOpts; rOpts.add("filename", stagePath);
-            lasReader->setOptions(rOpts);
-            pdal::Options cOpts;
-            cOpts.add("filename", output_path);
-            cOpts.add("forward", std::string("all"));
-            cOpts.add("extra_dims", std::string("all"));
-            copcWriter->setOptions(cOpts);
-            copcWriter->setInput(*lasReader);
-            pdal::PointTable t2;
-            copcWriter->prepare(t2);
-            copcWriter->execute(t2);
-
-            std::remove(stagePath.c_str());
-        } else {
-            // LAS/LAZ (or any other) writer: BufferReader is fine.
-            pdal::Stage* writer = factory.createStage(writerType);
-            if (!writer) {
-                r.status = kPdalErrPdal;
-                r.error_message = "Could not create writer stage '" + writerType +
-                    "' — driver not registered in this pdalcpp build.";
-                return r;
-            }
-            pdal::Options opts;
-            buildWriterOptions(opts, *ctx, output_path, writer_options_kv);
-            opts.add("extra_dims", std::string("all"));
-            writer->setOptions(opts);
-            pdal::BufferReader bufReader;
-            bufReader.addView(out);
-            writer->setInput(bufReader);
-            pdal::PointTable wtable;
-            writer->prepare(wtable);
-            writer->execute(wtable);
+        pdal::Stage* writer = factory.createStage(writerType);
+        if (!writer) {
+            r.status = kPdalErrPdal;
+            r.error_message = "Could not create writer stage '" + writerType +
+                "' — driver not registered in this pdalcpp build.";
+            return r;
         }
+        pdal::Options opts;
+        buildWriterOptions(opts, *ctx, output_path, writer_options_kv);
+        opts.add("extra_dims", std::string("all"));
+        writer->setOptions(opts);
+
+        pdal::BufferReader bufReader;
+        bufReader.addView(out);
+        writer->setInput(bufReader);
+
+        // Prepare against the SAME table the output view lives on. Its layout
+        // carries the full source dimension set, so CopcWriter::prepared() sees
+        // Red/Green/Blue and selects point format 7 (RGB) — writing a fresh
+        // empty table here would leave the layout dimensionless and silently
+        // drop colour (format 6). A BufferReader forwards no LAS header, so the
+        // scale/offset/SRS come from buildWriterOptions above.
+        writer->prepare(*ctx->table);
+        writer->execute(*ctx->table);
 
         r.point_count = out->size();
         r.status = kPdalOk;
