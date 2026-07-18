@@ -1,12 +1,14 @@
 // BooleanCloud — regenerate mesh-carved point clouds from a boolean spec.
 //
-//   swift run -c release BooleanCloud <spec.json> [output-dir]
+//   swift run -c release BooleanCloud <spec.json> [output-dir] [--suffix NAME]
 //
 // The spec is exported by the bl_copc_renderer Blender addon. For each
 // cloud it names the original source file, the decode origin, and the
 // cutter meshes (in CRS coordinates) with per-mesh subtract/intersect ops.
 // This tool reads each source at full resolution, keeps the points that
-// survive the boolean rule, and writes `<source>.boolean.copc.laz`.
+// survive the boolean rule, and writes `<source-stem>.<suffix>.copc.laz`.
+// `--suffix` defaults to the spec file's own name (e.g. carve.json -> carve),
+// so each spec's outputs are self-labeling.
 #if os(macOS)
 
 import Foundation
@@ -16,14 +18,44 @@ import CxxStdlib
 
 @main
 struct BooleanCloud {
+    static let usage =
+        "usage: BooleanCloud <spec.json> [output-dir] [--suffix NAME]\n" +
+        "  output name: <source-stem>.<suffix>.copc.laz\n" +
+        "  --suffix     label inserted before .copc.laz (default: the spec's\n" +
+        "               filename, e.g. carve.json -> carve). Empty for none.\n"
+
     static func main() {
+        // Parse: positionals [spec, output-dir] plus an optional --suffix flag
+        // (both --suffix NAME and --suffix=NAME forms).
+        var positionals: [String] = []
+        var suffix: String? = nil
         let args = Array(CommandLine.arguments.dropFirst())
-        guard let specPath = args.first else {
-            FileHandle.standardError.write(Data(
-                "usage: BooleanCloud <spec.json> [output-dir]\n".utf8))
-            exit(2)
+        var i = 0
+        while i < args.count {
+            let arg = args[i]
+            if arg == "--suffix" {
+                i += 1
+                guard i < args.count else {
+                    err("--suffix needs a value\n" + usage); exit(2)
+                }
+                suffix = args[i]
+            } else if arg.hasPrefix("--suffix=") {
+                suffix = String(arg.dropFirst("--suffix=".count))
+            } else if arg == "-h" || arg == "--help" {
+                print(usage); exit(0)
+            } else {
+                positionals.append(arg)
+            }
+            i += 1
         }
-        let outputDir: String? = args.count > 1 ? args[1] : nil
+        guard let specPath = positionals.first else {
+            err(usage); exit(2)
+        }
+        let outputDir: String? = positionals.count > 1 ? positionals[1] : nil
+        // Default suffix = the spec file's own stem, so a run's outputs carry
+        // the spec's name; an explicit --suffix (including "") overrides it.
+        let suffixValue = suffix ?? URL(fileURLWithPath: specPath)
+            .deletingPathExtension().lastPathComponent
 
         // Our bridge calls PDAL's StageFactory directly, bypassing SwiftPDAL's
         // public entry points, so seed the runtime (PROJ_DATA / driver path)
@@ -42,13 +74,13 @@ struct BooleanCloud {
         print("spec v\(spec.version): \(spec.clouds.count) cloud(s)")
         var failures = 0
         for cloud in spec.clouds {
-            if !process(cloud, outputDir: outputDir) { failures += 1 }
+            if !process(cloud, outputDir: outputDir, suffix: suffixValue) { failures += 1 }
         }
         if failures > 0 { exit(1) }
     }
 
     /// Returns true on success (including a legitimately skipped cloud).
-    static func process(_ cloud: CloudSpec, outputDir: String?) -> Bool {
+    static func process(_ cloud: CloudSpec, outputDir: String?, suffix: String) -> Bool {
         let cutters = cloud.meshes.compactMap { Cutter($0) }
         guard !cutters.isEmpty else {
             print("• \(cloud.name): no cutter meshes; skipping")
@@ -60,7 +92,7 @@ struct BooleanCloud {
             return false
         }
 
-        let outPath = outputPath(source: cloud.source, dir: outputDir)
+        let outPath = outputPath(source: cloud.source, dir: outputDir, suffix: suffix)
         let subN = cutters.filter { $0.op == .subtract }.count
         let intN = cutters.filter { $0.op == .intersect }.count
         print("• \(cloud.name)  [\(subN) subtract, \(intN) intersect]")
@@ -104,14 +136,16 @@ struct BooleanCloud {
         return true
     }
 
-    /// `<source-stem>.boolean.copc.laz`, in `dir` if given else beside the source.
-    static func outputPath(source: String, dir: String?) -> String {
+    /// `<source-stem>.<suffix>.copc.laz` (or `<source-stem>.copc.laz` when
+    /// suffix is empty), in `dir` if given else beside the source.
+    static func outputPath(source: String, dir: String?, suffix: String) -> String {
         let src = URL(fileURLWithPath: source)
         var stem = src.deletingPathExtension()            // strip .laz
         if stem.pathExtension.lowercased() == "copc" {
             stem = stem.deletingPathExtension()           // strip .copc
         }
-        let name = stem.lastPathComponent + ".boolean.copc.laz"
+        let label = suffix.isEmpty ? "" : ".\(suffix)"
+        let name = stem.lastPathComponent + label + ".copc.laz"
         let folder = dir.map { URL(fileURLWithPath: $0) } ?? src.deletingLastPathComponent()
         return folder.appendingPathComponent(name).path
     }
