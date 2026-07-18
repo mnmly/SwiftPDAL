@@ -28,7 +28,7 @@ import Foundation
 /// once under a thread-safe guarantee: the env vars are written a single
 /// time and the registry is seeded single-threaded, before any concurrent
 /// reader/writer/convert call can touch it.
-enum PDALRuntime {
+public enum PDALRuntime {
     private static let shared: Void = {
         let isTesting = ProcessInfo.processInfo.environment["SWIFTPDAL_TESTING"] != nil
         let paths = PointCloud.getPaths(isTesting: isTesting)
@@ -42,5 +42,5 @@ enum PDALRuntime {
 
     /// Ensure the one-time setup has run. Cheap to call on every entry;
     /// the work happens only on the first call.
-    static func ensureBootstrapped() { _ = shared }
+    public static func ensureBootstrapped() { _ = shared }
 }

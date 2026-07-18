@@ -235,6 +235,19 @@ let package = Package(
             ]
         ),
 
+        // CLI: carve point clouds with mesh volumes from a boolean spec
+        // (as exported by the bl_copc_renderer Blender addon) and write the
+        // filtered full-resolution clouds. Run with:
+        //   swift run -c release BooleanCloud <spec.json> [output-dir]
+        .executableTarget(
+            name: "BooleanCloud",
+            dependencies: ["SwiftPDAL"],
+            path: "Sources/BooleanCloud",
+            swiftSettings: [
+                .interoperabilityMode(.Cxx)
+            ]
+        ),
+
         .testTarget(
             name: "SwiftPDALTests",
             dependencies: ["SwiftPDAL"],
