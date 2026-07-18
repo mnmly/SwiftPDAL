@@ -16,12 +16,18 @@
 // -----
 // 1) libE57Format read loop:
 //      For each Data3D scan:
-//        Allocate per-chunk buffers (XYZ + optional RGB / intensity /
-//        invalidState). SetUpData3DPointsData → CompressedVectorReader.
-//        Loop reading kChunkSize points at a time; transform XYZ by the
-//        scan's pose (translation + quaternion); push into the long-
-//        lived sink PointView via setField. Fire user-supplied progress
-//        per chunk. Skip points flagged `cartesianInvalidState != 0`.
+//        Detect whether the scan stores geometry as cartesian XYZ or
+//        spherical range/azimuth/elevation (terrestrial scanners export
+//        spherical; that representation carries no cartesian prototype
+//        fields, so it must be read as spherical and converted — reading
+//        it as cartesian yields all-zero points). Allocate per-chunk
+//        buffers (geometry + optional RGB / intensity / invalidState).
+//        SetUpData3DPointsData → CompressedVectorReader. Loop reading
+//        kChunkSize points at a time; for spherical scans convert to
+//        cartesian first; transform XYZ by the scan's pose (translation +
+//        quaternion); push into the long-lived sink PointView via
+//        setField. Fire user-supplied progress per chunk. Skip points
+//        flagged invalid (`cartesian`/`sphericalInvalidState != 0`).
 // 2) Writer pipeline:
 //      Build `{"pipeline":[<reader-placeholder>, writer]}` JSON,
 //      strip the placeholder, attach a BufferReader feeding the
@@ -233,6 +239,14 @@ E57Result execute_e57_to_copc(const std::string& input_path,
         uint64_t pointsSoFar = 0;
         std::vector<float>    x(cap), y(cap), z(cap);
         std::vector<int8_t>   validXYZ(cap);
+        // Spherical-coordinate scans (range/azimuth/elevation) — the
+        // native representation for most terrestrial scanners (FARO,
+        // Leica, Z+F). Such files carry *no* cartesian prototype fields,
+        // so we read the spherical triples here and convert to cartesian
+        // ourselves (see the read loop below). `validSph` mirrors
+        // `sphericalInvalidState`.
+        std::vector<float>    sr(cap), sa(cap), se(cap);
+        std::vector<int8_t>   validSph(cap);
         // RGB and intensity are optional. libE57Format's
         // Data3DPointsFloat exposes color channels as `uint16_t*` and
         // intensity as `double*` (regardless of the cartesian-float
@@ -259,6 +273,30 @@ E57Result execute_e57_to_copc(const std::string& input_path,
                                 hdr.pointFields.colorBlueField;
             const bool hasI   = hdr.pointFields.intensityField;
 
+            // A scan stores its geometry in *either* cartesian XYZ *or*
+            // spherical range/azimuth/elevation — never both. Which one
+            // decides how we set up buffers and whether we convert below.
+            // libE57Format only fills a buffer when the matching field is
+            // present in the scan's prototype, so requesting cartesian
+            // buffers on a spherical scan silently yields zeros — the
+            // original bug this path had (every scan collapsed onto its
+            // pose translation, exploding the bounding box).
+            const bool hasCartesian = hdr.pointFields.cartesianXField &&
+                                      hdr.pointFields.cartesianYField &&
+                                      hdr.pointFields.cartesianZField;
+            const bool hasSpherical = hdr.pointFields.sphericalRangeField &&
+                                      hdr.pointFields.sphericalAzimuthField &&
+                                      hdr.pointFields.sphericalElevationField;
+            if (!hasCartesian && !hasSpherical) {
+                std::ostringstream w;
+                w << "scan " << i << " ('" << hdr.name << "', "
+                  << hdr.pointCount << " pts) skipped: no cartesian or "
+                     "spherical point fields in prototype";
+                scan_warnings.push_back(w.str());
+                std::fprintf(stderr, "[swiftpdal::e57] %s\n", w.str().c_str());
+                continue;
+            }
+
             // E57's quaternion is (w, x, y, z); translation is x, y, z.
             const double tx = hdr.pose.translation.x;
             const double ty = hdr.pose.translation.y;
@@ -269,10 +307,17 @@ E57Result execute_e57_to_copc(const std::string& input_path,
             const double qz = hdr.pose.rotation.z;
 
             e57::Data3DPointsFloat buffers;
-            buffers.cartesianX = x.data();
-            buffers.cartesianY = y.data();
-            buffers.cartesianZ = z.data();
-            buffers.cartesianInvalidState = validXYZ.data();
+            if (hasCartesian) {
+                buffers.cartesianX = x.data();
+                buffers.cartesianY = y.data();
+                buffers.cartesianZ = z.data();
+                buffers.cartesianInvalidState = validXYZ.data();
+            } else { // hasSpherical
+                buffers.sphericalRange     = sr.data();
+                buffers.sphericalAzimuth   = sa.data();
+                buffers.sphericalElevation = se.data();
+                buffers.sphericalInvalidState = validSph.data();
+            }
             if (hasRGB) {
                 buffers.colorRed       = r16.data();
                 buffers.colorGreen     = g16.data();
@@ -289,14 +334,30 @@ E57Result execute_e57_to_copc(const std::string& input_path,
             // move on to the next scan.
             try {
             auto vr = reader.SetUpData3DPointsData((int)i, cap, buffers);
+            // Which invalid-state array the read filled depends on the
+            // representation; 0 == valid in E57 for both.
+            const int8_t* invalid = hasCartesian ? validXYZ.data()
+                                                  : validSph.data();
             size_t got = 0;
             while ((got = vr.read()) > 0) {
+                // Spherical → cartesian (E57 / ASTM E2807 convention),
+                // matching PDAL's readers.e57 so both paths agree. Angles
+                // are radians; result lands in x/y/z for the pose step.
+                if (hasSpherical) {
+                    for (size_t p = 0; p < got; ++p) {
+                        const double range = sr[p], az = sa[p], el = se[p];
+                        const double ce = std::cos(el);
+                        x[p] = static_cast<float>(range * ce * std::cos(az));
+                        y[p] = static_cast<float>(range * ce * std::sin(az));
+                        z[p] = static_cast<float>(range * std::sin(el));
+                    }
+                }
                 applyScanPose(x.data(), y.data(), z.data(), got,
                               tx, ty, tz, qw, qx, qy, qz);
                 pdal::PointId baseId = sink->size();
                 pdal::PointId outIdx = baseId;
                 for (size_t p = 0; p < got; ++p) {
-                    if (validXYZ[p]) continue; // 0 == valid in E57
+                    if (invalid[p]) continue; // 0 == valid in E57
                     sink->setField(pdal::Dimension::Id::X, outIdx, (double)x[p]);
                     sink->setField(pdal::Dimension::Id::Y, outIdx, (double)y[p]);
                     sink->setField(pdal::Dimension::Id::Z, outIdx, (double)z[p]);
