@@ -15,7 +15,9 @@ Import-SwiftPDALEnv
 $repoRoot    = (Resolve-Path "$PSScriptRoot\..\..").Path
 $paths       = Get-SwiftPDALPaths
 $COPC_TAG    = if ($env:COPC_TAG)    { $env:COPC_TAG }    else { "v2.6.3" }
-$LAZPERF_TAG = if ($env:LAZPERF_TAG) { $env:LAZPERF_TAG } else { "master" }
+# laz-perf has no release tags; pin the exact commit the reset() patch applies
+# to (its master branch drifts and the patch stops applying otherwise).
+$LAZPERF_REF = if ($env:LAZPERF_REF) { $env:LAZPERF_REF } else { "14522addcb01125499119990cc8fbc6b1e43b148" }
 $work        = if ($env:COPC_WORK_DIR) { $env:COPC_WORK_DIR } else { "C:\src\copc-build" }
 $src         = "$work\copc-lib"
 $build       = "$work\build"
@@ -29,19 +31,32 @@ if (-not (Test-Path $src)) {
     git clone --depth 1 --branch $COPC_TAG https://github.com/RockRobotic/copc-lib.git $src
 }
 if (-not (Test-Path "$src\libs\laz-perf\.git")) {
-    git clone --depth 1 --branch $LAZPERF_TAG https://github.com/hobuinc/laz-perf.git "$src\libs\laz-perf"
+    # Shallow-fetch the pinned commit (can't --branch a bare SHA).
+    $lpdir = "$src\libs\laz-perf"
+    New-Item -ItemType Directory -Force -Path $lpdir | Out-Null
+    Push-Location $lpdir
+    git init -q
+    git remote add origin https://github.com/hobuinc/laz-perf.git
+    git fetch --depth 1 origin $LAZPERF_REF
+    git checkout -q FETCH_HEAD
+    Pop-Location
 }
 
 # --- apply the lazperf reset() patch (idempotent) ---
+# git writes to stderr on the --check probes, which trips ErrorActionPreference=
+# Stop, so relax it here and drive off $LASTEXITCODE. Forward-apply first (fresh
+# checkout); the reverse-check only detects an already-applied tree.
 Push-Location "$src\libs\laz-perf"
-git apply --reverse --check $patch 2>$null
+$prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+& git apply --check $patch 2>$null
 if ($LASTEXITCODE -eq 0) {
-    Write-Host "lazperf reset() patch already applied"
+    & git apply $patch; Write-Host "lazperf reset() patch applied"
 } else {
-    git apply --check $patch 2>$null
-    if ($LASTEXITCODE -eq 0) { git apply $patch; Write-Host "lazperf reset() patch applied" }
-    else { Pop-Location; throw "lazperf patch does not apply cleanly: $patch" }
+    & git apply --reverse --check $patch 2>$null
+    if ($LASTEXITCODE -eq 0) { Write-Host "lazperf reset() patch already applied" }
+    else { $ErrorActionPreference = $prevEAP; Pop-Location; throw "lazperf patch does not apply: $patch" }
 }
+$ErrorActionPreference = $prevEAP
 Pop-Location
 
 # --- configure + build (Ninja + MSVC, static, dynamic CRT /MD) ---
