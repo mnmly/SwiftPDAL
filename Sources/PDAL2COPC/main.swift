@@ -12,7 +12,7 @@
 // Per-dimension statistics are computed in the same streaming pass (via
 // `filters.stats`, no extra read of the source) and written as a STAC
 // pointcloud-extension sidecar unless `--no-sidecar` is given.
-#if os(macOS)
+#if os(macOS) || os(Windows)
 
 import Foundation
 import SwiftPDAL

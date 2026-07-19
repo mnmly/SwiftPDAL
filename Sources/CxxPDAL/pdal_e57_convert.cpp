@@ -60,9 +60,11 @@
 #include <sstream>
 #include <vector>
 #include <cmath>
+#if !defined(_WIN32)
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#endif
 
 namespace {
 constexpr int32_t kPdalOk            = 0;
@@ -109,6 +111,9 @@ inline void applyScanPose(float* x, float* y, float* z, size_t n,
 // during the writer phase. Copied verbatim from pdal_convert.cpp; we'd
 // share if there was a clean place for the type. Kept small enough that
 // duplication is cheaper than refactoring.
+//
+// POSIX self-pipe; stubbed on Windows (active()==false) — see pdal_convert.cpp.
+#if !defined(_WIN32)
 class WriterProgressPump {
 public:
     WriterProgressPump(swiftpdal::convert::ProgressFn cb, void* ctx, uint64_t known_points)
@@ -182,6 +187,15 @@ private:
     std::atomic<bool> running_{false};
     std::thread reader_;
 };
+#else
+// Windows stub: progress fd disabled (see pdal_convert.cpp).
+class WriterProgressPump {
+public:
+    WriterProgressPump(swiftpdal::convert::ProgressFn, void*, uint64_t) {}
+    int  writeFd() const noexcept { return -1; }
+    bool active()  const noexcept { return false; }
+};
+#endif // !_WIN32
 
 } // anonymous namespace
 

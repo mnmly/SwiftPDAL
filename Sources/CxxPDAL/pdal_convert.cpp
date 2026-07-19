@@ -26,9 +26,11 @@
 #include <atomic>
 #include <thread>
 #include <string>
+#if !defined(_WIN32)
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#endif
 
 #include "include/pdal_convert.h"
 
@@ -193,6 +195,12 @@ private:
 // the reader thread sees EOF, exits, and gets joined. SIGPIPE is
 // suppressed via F_SETNOSIGPIPE so PDAL writes don't kill the process
 // if the reader thread is somehow slow to drain.
+//
+// The pump is a POSIX self-pipe (F_SETNOSIGPIPE is in fact macOS-only). On
+// Windows it is stubbed out below with active()==false, so the caller skips
+// setProgressFd — conversion still runs, only the writer-phase progress ticks
+// are suppressed. See scripts/windows/README.md.
+#if !defined(_WIN32)
 class WriterProgressPump {
 public:
     WriterProgressPump(ProgressFn cb, void* ctx, uint64_t known_points)
@@ -305,6 +313,16 @@ private:
     std::atomic<bool> running_{false};
     std::thread reader_;
 };
+#else
+// Windows stub: no POSIX self-pipe. active()==false disables the writer-phase
+// progress fd; the caller still fires the final 100% tick.
+class WriterProgressPump {
+public:
+    WriterProgressPump(ProgressFn, void*, uint64_t) {}
+    int  writeFd() const noexcept { return -1; }
+    bool active()  const noexcept { return false; }
+};
+#endif // !_WIN32
 
 // Serialize a finalized point layout to a JSON array of
 // `{"name","size","type"}` objects, with `type` in the STAC

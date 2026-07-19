@@ -12,6 +12,17 @@
 #include <stddef.h> // For size_t
 #include <stdint.h>
 #include <stdbool.h> // For bool type
+
+// The binary-read / streaming / SoA API below exposes heavy PDAL + C++ STL
+// types (pdal::PointView, std::map, ...) through the Swift-imported module
+// surface. On Windows the Swift clang importer compiles those against the
+// modularized MSVC STL and hits an unresolvable coroutine_handle<>
+// cross-submodule specialization error. This API is Metal/Apple-only on the
+// Swift side anyway (its sole consumer, SwiftPDAL.swift, builds MTLBuffers), so
+// it is compiled out on Windows; the convert path (pdal_convert.h) — which
+// PDAL2COPC uses — stays fully available. See scripts/windows/README.md.
+#if !defined(_WIN32)
+
 #include <map>
 #include <memory>
 #include <string>
@@ -188,5 +199,7 @@ enum PDALError {
 
 // Helper function to get error message from error code
 const char* pdal_error_message(int error_code);
+
+#endif // !_WIN32
 
 #endif // PDAL_WRAPPER_H

@@ -1,0 +1,12 @@
+{
+  "name": "libaec",
+  "version": "1.1.7",
+  "port-version": 100,
+  "description": "Adaptive Entropy Coding library (overlay: GitHub mirror source to avoid gitlab.dkrz.de HTTP 429)",
+  "homepage": "https://github.com/MathisRosenhauer/libaec",
+  "license": "BSD-2-Clause",
+  "dependencies": [
+    { "name": "vcpkg-cmake", "host": true },
+    { "name": "vcpkg-cmake-config", "host": true }
+  ]
+}

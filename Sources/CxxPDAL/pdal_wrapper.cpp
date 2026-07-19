@@ -10,7 +10,12 @@
 #include "include/e57_init_guard.h"
 
 #include <cstdlib>
+#if !defined(_WIN32)
 #include <unistd.h>
+#else
+#include <string.h>
+#define strcasecmp _stricmp  // POSIX case-insensitive compare → MSVC CRT
+#endif
 #include <fstream>
 #include <string>
 
@@ -471,8 +476,17 @@ int pdal_read_binary(const char* reader_name_backup, const char* filename, const
         size_t pointCount = view->size();
         size_t totalSize = pointCount * stride;
 
+        // Page-aligned on POSIX (zero-copy upload / mmap friendliness). On
+        // Windows plain malloc keeps the buffer free()-compatible with
+        // pdal_free_data (which uses free(), not _aligned_free); the alignment
+        // is only a consumer optimization, not required for correctness.
         void* alignedPtr = nullptr;
+#if defined(_WIN32)
+        alignedPtr = std::malloc(totalSize);
+        int alignResult = alignedPtr ? 0 : -1;
+#else
         int alignResult = posix_memalign(&alignedPtr, sysconf(_SC_PAGESIZE), totalSize);
+#endif
         if (alignResult != 0 || !alignedPtr) {
             return PDAL_ERR_ALLOC_FAILED;
         }
