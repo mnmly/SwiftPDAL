@@ -48,6 +48,10 @@ struct BooleanCloud {
             }
             i += 1
         }
+        // Unbuffered stdout so per-cloud progress streams to a parent process
+        // (e.g. the Blender add-on) instead of arriving only at exit.
+        setvbuf(stdout, nil, _IONBF, 0)
+
         guard let specPath = positionals.first else {
             err(usage); exit(2)
         }
