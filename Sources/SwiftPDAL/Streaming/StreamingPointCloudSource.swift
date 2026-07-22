@@ -852,6 +852,27 @@ public protocol StreamingPointCloudSource: AnyObject, Sendable {
     /// - Parameter enabled: New enforcement flag.
     func setEnforceHierarchyResidency(_ enabled: Bool)
 
+    /// Retarget the QoS of the LAZ decode worker pool on a live source — no
+    /// restart or re-open.
+    ///
+    /// Decode workers default to ``TaskPriority/utility`` so the OS parks them
+    /// on E-cores and they never contend with the render loop for P-cores
+    /// during interactive playback. That trade is wrong for an **offline**
+    /// export: there's no live render loop to protect, and the per-frame
+    /// residency pre-roll waits on the decode backlog draining — on E-cores it
+    /// drains far too slowly (a multi-thousand-node backlog can miss a 20 s
+    /// pre-roll budget every frame). Hosts raise this to
+    /// ``TaskPriority/high``/``userInitiated`` for the duration of an export so
+    /// decode runs on P-cores, then restore ``TaskPriority/utility``. It's kept
+    /// export-*gated* rather than always-P-cores precisely because live
+    /// playback must not steal P-cores from rendering.
+    ///
+    /// A default no-op implementation is provided so existing conformers stay
+    /// source-compatible; ``CopcStreamingPointCloudSource`` overrides it.
+    ///
+    /// - Parameter priority: New base ``TaskPriority`` for the decode workers.
+    func setDecodeWorkerPriority(_ priority: TaskPriority)
+
     /// A thread-safe, non-blocking snapshot of the decode pipeline.
     ///
     /// Poll this alongside ``pollLatest()`` to drive progress UI or diagnose
@@ -899,6 +920,10 @@ public extension StreamingPointCloudSource {
 
     /// Default no-op. See ``setEnforceHierarchyResidency(_:)``.
     func setEnforceHierarchyResidency(_ enabled: Bool) {}
+
+    /// Default no-op: a source without a decode worker pool ignores the QoS
+    /// change. See ``setDecodeWorkerPriority(_:)``.
+    func setDecodeWorkerPriority(_ priority: TaskPriority) {}
 
     /// Default: an empty snapshot for sources without a decode pipeline
     /// (e.g. test mocks). See ``decodeStats()``.
@@ -1185,10 +1210,25 @@ final class ResidencySettleBox: @unchecked Sendable {
 /// The queue is non-actor so the driver can enqueue without an extra
 /// actor hop; concurrency control is a single `NSLock`.
 final class JobQueue: @unchecked Sendable {
+    /// A parked ``pop()`` caller. Identified so ``onCancel`` can find and remove
+    /// exactly this waiter. The continuation is *claimed* (set to `nil` under
+    /// ``lock``) by whichever of {enqueue-handoff, cancel, close} reaches it
+    /// first; the loser sees `nil` and does nothing — this is how the
+    /// resume-exactly-once invariant is upheld across the cancel race.
+    private final class Waiter {
+        let id: UInt64
+        var continuation: CheckedContinuation<[ChunkID]?, Never>?
+        init(id: UInt64, continuation: CheckedContinuation<[ChunkID]?, Never>) {
+            self.id = id
+            self.continuation = continuation
+        }
+    }
+
     private let lock = NSLock()
     private var pending: [[ChunkID]] = []
-    private var waiters: [CheckedContinuation<[ChunkID]?, Never>] = []
+    private var waiters: [Waiter] = []
     private var closed = false
+    private var nextWaiterID: UInt64 = 0
 
     func enqueue<S: Sequence>(_ clusters: S) where S.Element == [ChunkID] {
         var handoffs: [(CheckedContinuation<[ChunkID]?, Never>, [ChunkID])] = []
@@ -1197,34 +1237,79 @@ final class JobQueue: @unchecked Sendable {
             var leftover: [[ChunkID]] = []
             for cluster in clusters {
                 if cluster.isEmpty { continue }
-                if !waiters.isEmpty {
-                    handoffs.append((waiters.removeFirst(), cluster))
+                // Waiters still in the array have NOT been cancelled (`onCancel`
+                // removes a cancelled waiter under this same lock before enqueue
+                // can pick it), so handing off here never targets a cancelled
+                // worker at decision time. Claim the continuation so a cancel
+                // racing *after* this point finds nothing to resume.
+                if let w = waiters.first, let c = w.continuation {
+                    waiters.removeFirst()
+                    w.continuation = nil
+                    handoffs.append((c, cluster))
                 } else {
                     leftover.append(cluster)
                 }
             }
             if !leftover.isEmpty { pending.append(contentsOf: leftover) }
         }
-        for (w, cluster) in handoffs { w.resume(returning: cluster) }
+        for (c, cluster) in handoffs { c.resume(returning: cluster) }
     }
 
     func pop() async -> [ChunkID]? {
-        return await withCheckedContinuation { (c: CheckedContinuation<[ChunkID]?, Never>) in
-            // Resolve immediately if we have a cluster (or are closed);
-            // otherwise park the continuation in `waiters` and let
-            // enqueue/close resume it later. Either way, no await
-            // happens while holding the lock.
-            enum Action { case resume([ChunkID]?), wait }
-            let action: Action = lock.withLock {
-                if closed { return .resume(nil) }
-                if !pending.isEmpty { return .resume(pending.removeFirst()) }
-                waiters.append(c)
-                return .wait
+        let id = lock.withLock { () -> UInt64 in
+            nextWaiterID &+= 1
+            return nextWaiterID
+        }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (c: CheckedContinuation<[ChunkID]?, Never>) in
+                // Resolve immediately if closed, already-cancelled, or a cluster
+                // is ready; otherwise park the continuation in `waiters`. The
+                // `Task.isCancelled` check closes the race where `onCancel` fired
+                // before this continuation was installed: it runs under the same
+                // lock as `onCancel`'s removal, so the two are serialized and the
+                // continuation is resumed exactly once. No await under the lock.
+                enum Action { case resume([ChunkID]?), wait }
+                let action: Action = lock.withLock {
+                    if closed { return .resume(nil) }
+                    if Task.isCancelled { return .resume(nil) }
+                    if !pending.isEmpty { return .resume(pending.removeFirst()) }
+                    waiters.append(Waiter(id: id, continuation: c))
+                    return .wait
+                }
+                switch action {
+                case .resume(let v): c.resume(returning: v)
+                case .wait: break
+                }
             }
-            switch action {
-            case .resume(let v): c.resume(returning: v)
-            case .wait: break
+        } onCancel: {
+            // Cancelled while parked: claim and remove our own waiter, then
+            // resume it with `nil` so the worker exits promptly. If enqueue/close
+            // already claimed it (removed from `waiters`), we find nothing and do
+            // nothing — resume-exactly-once holds.
+            let cont: CheckedContinuation<[ChunkID]?, Never>? = lock.withLock {
+                guard let idx = waiters.firstIndex(where: { $0.id == id }) else { return nil }
+                let w = waiters.remove(at: idx)
+                let c = w.continuation
+                w.continuation = nil
+                return c
             }
+            cont?.resume(returning: nil)
+        }
+    }
+
+    /// Return a cluster to the head of the queue. Used by a worker that popped a
+    /// cluster but then observed its own cancellation (it raced an enqueue
+    /// hand-off) — rather than decode on a slot the incoming pool is about to
+    /// reuse, it hands the cluster back so no queued work is lost. Prepends to
+    /// `pending` (never to a waiter): cancellation is always pool-wide, so any
+    /// other current waiter is a cancelled sibling that would only bounce it
+    /// back; the fresh pool drains `pending`. Dropped if the queue is closed
+    /// (teardown).
+    func requeue(_ cluster: [ChunkID]) {
+        if cluster.isEmpty { return }
+        lock.withLock {
+            if closed { return }
+            pending.insert(cluster, at: 0)
         }
     }
 
@@ -1244,10 +1329,14 @@ final class JobQueue: @unchecked Sendable {
     func close() {
         let toResume: [CheckedContinuation<[ChunkID]?, Never>] = lock.withLock {
             closed = true
-            let w = waiters
+            let conts = waiters.compactMap { w -> CheckedContinuation<[ChunkID]?, Never>? in
+                let c = w.continuation
+                w.continuation = nil
+                return c
+            }
             waiters.removeAll()
             pending.removeAll()
-            return w
+            return conts
         }
         for w in toResume { w.resume(returning: nil) }
     }
@@ -1308,7 +1397,32 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
     /// `nil` when the file has no RGB.
     private let rgbShiftBits: UInt32?
     private var driverTask: Task<Void, Never>?
+    /// Serializes decode-worker-pool lifecycle (initial spawn, cancel-and-
+    /// respawn on a QoS switch, teardown) and guards the mutable handles below.
+    /// The class is `@unchecked Sendable`, so — as with ``JobQueue`` /
+    /// ``DecodeStatsBox`` — mutable cross-thread state needs an explicit lock;
+    /// ``setDecodeWorkerPriority(_:)`` can race ``close()`` otherwise.
+    private let workerLock = NSLock()
+    /// Live decode-worker task handles. Guarded by ``workerLock``.
     private var workerTasks: [Task<Void, Never>] = []
+    /// Current *applied* base QoS of the live decode workers. Guarded by
+    /// ``workerLock``.
+    private var decodeWorkerPriority: TaskPriority = .utility
+    /// Latest *requested* QoS awaiting the switch coordinator, or `nil` when no
+    /// switch is outstanding. Latest-wins: a request that arrives mid-switch just
+    /// overwrites this and the running coordinator picks it up on its next lap.
+    /// Guarded by ``workerLock``.
+    private var pendingWorkerPriority: TaskPriority?
+    /// `true` while a switch coordinator Task is draining-and-respawning the
+    /// pool. Ensures only one coordinator runs at a time (no overlapping pools).
+    /// Guarded by ``workerLock``.
+    private var switchInProgress = false
+    /// `true` once ``startDriver()`` has spawned the pool; a QoS switch before
+    /// start is a no-op. Guarded by ``workerLock``.
+    private var driverStarted = false
+    /// `true` once ``close()`` has begun teardown; a QoS switch after close is a
+    /// no-op and the coordinator will not respawn. Guarded by ``workerLock``.
+    private var isClosed = false
 
     private init(
         info: StreamingSourceInfo,
@@ -1591,21 +1705,40 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         // reaction time only grows to `idleInterval` when the system was
         // genuinely idle.
         let idleInterval = max(tickInterval, .milliseconds(100))
-        driverTask = Task.detached(priority: .utility) {
+        // Driver tick task keeps its own `.utility` QoS — only the decode
+        // workers are switched by ``setDecodeWorkerPriority(_:)``.
+        let driverTask = Task.detached(priority: .utility) {
             while !Task.isCancelled {
                 let didWork = await driver.runOneTick()
                 try? await Task.sleep(for: didWork ? tickInterval : idleInterval)
             }
         }
 
+        let workers = spawnDecodeWorkers(priority: .utility)
+        workerLock.withLock {
+            self.driverTask = driverTask
+            self.workerTasks = workers
+            self.decodeWorkerPriority = .utility
+            self.driverStarted = true
+        }
+    }
+
+    /// Spawn `workerCount` detached LAZ decode workers at `priority` and return
+    /// their handles. Shared by ``startDriver()`` (initial pool at
+    /// ``TaskPriority/utility``) and ``setDecodeWorkerPriority(_:)`` (respawn at
+    /// a new QoS). Pure factory: it only creates tasks — the caller stores the
+    /// handles under ``workerLock``. Each worker owns a reusable pack scratch
+    /// and drains ``jobs`` until cancelled or the queue closes.
+    private func spawnDecodeWorkers(priority: TaskPriority) -> [Task<Void, Never>] {
         let jobs = self.jobs
         let handleBox = self.handleBox
         let originShift = self.originShift
         let extraDescs = self.extraDescs
         let extraNames = self.extraNames
         let rgbShiftBits = self.rgbShiftBits
-        let workers = (0..<workerCount).map { slot in
-            Task.detached(priority: .utility) {
+        let driver = self.driver
+        return (0..<workerCount).map { slot in
+            Task.detached(priority: priority) {
                 let slotIndex = Int32(slot)
                 // One reusable pack scratch per worker: the ~2.5 MB of per-chunk
                 // temporaries (morton/radix/LOD-table/bucket buffers) are
@@ -1615,6 +1748,19 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                 let packWorkspace = ChunkPacker.Workspace()
                 while !Task.isCancelled {
                     guard let cluster = await jobs.pop() else { break }
+                    // Handed a cluster while (or just after) being cancelled — a
+                    // rare race with a concurrent `enqueue`. The switch
+                    // coordinator is about to reuse this worker's `slotIndex` for
+                    // a fresh-pool worker, and this slot maps to per-slot C++
+                    // reader state that is NOT safe to touch from two tasks at
+                    // once. So do not prefetch/decode: hand the cluster back
+                    // (never dropped) and exit. `close()` cancels via
+                    // `jobs.close()` → `pop()` returns `nil` above, so this path
+                    // is only ever a QoS-switch cancellation.
+                    if Task.isCancelled {
+                        jobs.requeue(cluster)
+                        break
+                    }
                     if cluster.isEmpty { continue }
                     // Coalesced prefetch of the whole cluster's compressed
                     // blocks in one (or a few) span reads — pure I/O (seek+read
@@ -1665,7 +1811,102 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                 }
             }
         }
-        workerTasks = workers
+    }
+
+    /// Live-switch the decode worker pool's QoS (see the protocol doc on
+    /// ``StreamingPointCloudSource/setDecodeWorkerPriority(_:)`` for the
+    /// export-gating rationale). No-op before ``startDriver()``, after
+    /// ``close()``, or when the requested priority is already applied and no
+    /// switch is pending.
+    ///
+    /// **The swap is a full drain barrier: the old pool and the new pool never
+    /// run concurrently.** This is mandatory, not an optimisation — each worker's
+    /// `slotIndex` maps to a distinct per-slot C++ COPC `Reader` (an `fstream`
+    /// that is not safe to touch from two tasks at once). A fresh pool reuses
+    /// slots `0..<workerCount`, so it may not start until every old worker has
+    /// stopped touching its reader. The actual work runs on a detached
+    /// coordinator Task (``runDecodeWorkerSwitch()``); this method only records
+    /// the request and starts the coordinator if one isn't already running.
+    ///
+    /// The swap deliberately does **not** touch ``jobs``: all queued clusters
+    /// live in ``JobQueue``'s `pending` array (its own lock), so a pool swap
+    /// can't lose them — the new pool drains the exact same queue, plus anything
+    /// an old worker handed back via ``JobQueue/requeue(_:)``.
+    public func setDecodeWorkerPriority(_ priority: TaskPriority) {
+        let startCoordinator: Bool = workerLock.withLock {
+            guard driverStarted, !isClosed else { return false }
+            // Record the latest wish (latest-wins). A coordinator already draining
+            // will pick this up on its next lap, so never start a second one.
+            if switchInProgress {
+                pendingWorkerPriority = priority
+                return false
+            }
+            // Idle: nothing to do if we're already at the requested QoS.
+            guard priority != decodeWorkerPriority else { return false }
+            pendingWorkerPriority = priority
+            switchInProgress = true
+            return true
+        }
+        guard startCoordinator else { return }
+        Task.detached { [self] in await runDecodeWorkerSwitch() }
+    }
+
+    /// Drain-and-respawn coordinator for ``setDecodeWorkerPriority(_:)``. Exactly
+    /// one instance runs at a time (gated by ``switchInProgress``). Each lap:
+    /// cancels the current pool, `await`s **every** old worker's completion (the
+    /// barrier — `pop()` returns `nil` on cancel, and a worker that raced a
+    /// hand-off requeues and exits, so every task terminates), then spawns the
+    /// new pool. Re-checks ``pendingWorkerPriority`` after each lap so a request
+    /// that arrived mid-drain is honoured (latest-wins). Never spawns once
+    /// ``isClosed`` is observed — ``close()`` owns teardown of whatever pool
+    /// exists.
+    private func runDecodeWorkerSwitch() async {
+        while true {
+            let step: (old: [Task<Void, Never>], target: TaskPriority)? = workerLock.withLock {
+                // Closed mid-switch: stop. `close()` drains the live pool.
+                guard !isClosed else {
+                    pendingWorkerPriority = nil
+                    switchInProgress = false
+                    return nil
+                }
+                // No outstanding request, or it collapsed to the applied value
+                // (e.g. utility→userInitiated→utility while draining): finish.
+                guard let target = pendingWorkerPriority, target != decodeWorkerPriority else {
+                    pendingWorkerPriority = nil
+                    switchInProgress = false
+                    return nil
+                }
+                // Consume the request and snapshot the pool to drain this lap.
+                pendingWorkerPriority = nil
+                return (workerTasks, target)
+            }
+            guard let step else { return }
+
+            // Barrier: cancel the old pool and wait for ALL of it to finish
+            // before any new worker (which reuses the same slot indices, hence
+            // the same C++ readers) can start.
+            for w in step.old { w.cancel() }
+            for w in step.old { await w.value }
+
+            let finished: Bool = workerLock.withLock {
+                // Closed while draining: do not respawn; close() handles the rest.
+                guard !isClosed else {
+                    pendingWorkerPriority = nil
+                    switchInProgress = false
+                    return true
+                }
+                workerTasks = spawnDecodeWorkers(priority: step.target)
+                decodeWorkerPriority = step.target
+                // Another request arrived mid-drain → loop; else we're done.
+                if let next = pendingWorkerPriority, next != decodeWorkerPriority {
+                    return false
+                }
+                pendingWorkerPriority = nil
+                switchInProgress = false
+                return true
+            }
+            if finished { return }
+        }
     }
 
     public func submit(view: StreamingCameraView) {
@@ -1737,9 +1978,15 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
     }
 
     public func close() {
+        // Snapshot handles + latch `isClosed` under the lock so a concurrent
+        // `setDecodeWorkerPriority(_:)` either wins (its fresh pool is the one we
+        // then tear down) or no-ops — never leaves an un-awaited pool behind.
+        let (driverTask, workers): (Task<Void, Never>?, [Task<Void, Never>]) = workerLock.withLock {
+            isClosed = true
+            return (self.driverTask, self.workerTasks)
+        }
         driverTask?.cancel()
         let jobs = self.jobs
-        let workers = self.workerTasks
         let driver = self.driver
         // Order: stop accepting new tick work, close the job queue (which
         // wakes any idle workers with `nil`), wait for in-flight workers
