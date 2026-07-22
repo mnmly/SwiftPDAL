@@ -478,7 +478,7 @@ public enum LODMode: Sendable {
 /// chunks. Independent of the budget fill: regardless of mode, the
 /// wanted set is capped by the running budget and the eviction
 /// hysteresis still applies.
-public enum ResidencyPolicy: Sendable {
+public enum ResidencyPolicy: Equatable, Sendable {
     /// Two-pass fill (default). First admit chunks intersecting the
     /// camera frustum, scored by distance, until the budget is full.
     /// If headroom remains, do a second pass over the rejected
@@ -738,6 +738,20 @@ public protocol StreamingPointCloudSource: AnyObject, Sendable {
     /// - Parameter view: Current camera state.
     func submit(view: StreamingCameraView)
 
+    /// Submit several camera views at once; the residency wanted-set becomes
+    /// the **union** across all views — a node is wanted if *any* view sees it,
+    /// scored by its best on-screen match across the set. Use this to cover a
+    /// multi-projection frame (CAVE walls + floor, stereo eyes) or to preload a
+    /// known camera path (sample poses ahead and submit them together) from one
+    /// streamed cloud. Latest-wins and non-blocking, exactly like
+    /// ``submit(view:)`` — an empty array is ignored.
+    ///
+    /// The budget still caps the union, so size it to hold every view's working
+    /// set; ``residencyBudgetLimited`` reports when it didn't.
+    ///
+    /// - Parameter views: The camera views to union.
+    func submit(views: [StreamingCameraView])
+
     /// Update the byte budget for resident payloads (positions + colors
     /// + levels). Takes effect on the next driver tick.
     ///
@@ -793,6 +807,22 @@ public protocol StreamingPointCloudSource: AnyObject, Sendable {
     ///   longest AABB axis.
     func setTargetChunkScreenSize(_ pixels: Float)
 
+    /// Swap the wanted-set construction strategy on a live source — no restart
+    /// or re-open. Takes effect on the next residency tick's re-score.
+    /// A default no-op is provided; ``CopcStreamingPointCloudSource`` overrides.
+    /// See ``StreamingOptions/residencyPolicy``.
+    ///
+    /// - Parameter policy: New ``ResidencyPolicy``.
+    func setResidencyPolicy(_ policy: ResidencyPolicy)
+
+    /// Toggle the parent-closed residency invariant on a live source. Takes
+    /// effect on the next tick. A default no-op is provided;
+    /// ``CopcStreamingPointCloudSource`` overrides. See
+    /// ``StreamingOptions/enforceHierarchyResidency``.
+    ///
+    /// - Parameter enabled: New enforcement flag.
+    func setEnforceHierarchyResidency(_ enabled: Bool)
+
     /// A thread-safe, non-blocking snapshot of the decode pipeline.
     ///
     /// Poll this alongside ``pollLatest()`` to drive progress UI or diagnose
@@ -805,6 +835,24 @@ public protocol StreamingPointCloudSource: AnyObject, Sendable {
     ///
     /// - Returns: The current ``StreamingDecodeStats``.
     func decodeStats() -> StreamingDecodeStats
+
+    /// Synchronous, non-blocking: `true` once every wanted chunk (for the most
+    /// recently submitted view set at the current budget) is resident and no
+    /// decode is in flight — i.e. the frame is fully streamed in. Submitting a
+    /// new view (or view set) drops this to `false` until the driver has caught
+    /// up. Poll it to drive a "pump until resident" loop (see the offline
+    /// pre-roll) without an actor hop or an `await`.
+    ///
+    /// A default of `true` is provided so non-streaming conformers (test mocks)
+    /// never stall such a loop; ``CopcStreamingPointCloudSource`` overrides it.
+    var isResidencySettled: Bool { get }
+
+    /// Whether the wanted set was clamped by the byte budget while
+    /// frustum-visible candidates were left out. Read alongside
+    /// ``isResidencySettled``: settled **and** budget-limited means "everything
+    /// the budget allows is resident, but more is visible" — raise the budget to
+    /// cover the rest. Default `false`.
+    var residencyBudgetLimited: Bool { get }
 }
 
 public extension StreamingPointCloudSource {
@@ -813,9 +861,29 @@ public extension StreamingPointCloudSource {
     /// ``setTargetChunkScreenSize(_:)``.
     func setTargetChunkScreenSize(_ pixels: Float) {}
 
+    /// Default no-op. See ``setResidencyPolicy(_:)``.
+    func setResidencyPolicy(_ policy: ResidencyPolicy) {}
+
+    /// Default no-op. See ``setEnforceHierarchyResidency(_:)``.
+    func setEnforceHierarchyResidency(_ enabled: Bool) {}
+
     /// Default: an empty snapshot for sources without a decode pipeline
     /// (e.g. test mocks). See ``decodeStats()``.
     func decodeStats() -> StreamingDecodeStats { StreamingDecodeStats() }
+
+    /// Default: forward the last view so non-overriding sources still stream
+    /// (single-view). ``CopcStreamingPointCloudSource`` overrides it to union.
+    func submit(views: [StreamingCameraView]) {
+        if let v = views.last { submit(view: v) }
+    }
+
+    /// Default: non-streaming sources are always "settled". See
+    /// ``isResidencySettled``.
+    var isResidencySettled: Bool { true }
+
+    /// Default: non-streaming sources are never budget-limited. See
+    /// ``residencyBudgetLimited``.
+    var residencyBudgetLimited: Bool { false }
 }
 
 // MARK: - Node metadata snapshot
@@ -1031,6 +1099,44 @@ final class DecodeStatsBox: @unchecked Sendable {
     }
 }
 
+// MARK: - Residency settle box
+
+/// Sync, lock-guarded snapshot of "is the frame fully streamed", mirroring
+/// ``DecodeStatsBox``. The driver actor writes it at the end of every tick;
+/// ``CopcStreamingPointCloudSource/isResidencySettled`` reads it without an
+/// actor hop so a render-thread pre-roll can pump until residency catches up.
+///
+/// ``markUnsettled()`` is called the instant a new view set is submitted, so a
+/// consumer that submitted this frame never mistakes the *previous* frame's
+/// settled state for its own before the driver has re-evaluated.
+final class ResidencySettleBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var settled = false
+    private var budgetLimited = false
+    private var wanted = 0
+    private var resident = 0
+
+    /// Called on `submit(view/views:)` so the next `isSettled` read reflects the
+    /// new target, not the stale one, until a tick re-publishes.
+    func markUnsettled() { lock.withLock { settled = false } }
+
+    /// Published by the driver at the end of each tick.
+    func update(settled: Bool, budgetLimited: Bool, wanted: Int, resident: Int) {
+        lock.withLock {
+            self.settled = settled
+            self.budgetLimited = budgetLimited
+            self.wanted = wanted
+            self.resident = resident
+        }
+    }
+
+    var isSettled: Bool { lock.withLock { settled } }
+    var isBudgetLimited: Bool { lock.withLock { budgetLimited } }
+    func snapshot() -> (settled: Bool, budgetLimited: Bool, wanted: Int, resident: Int) {
+        lock.withLock { (settled, budgetLimited, wanted, resident) }
+    }
+}
+
 // MARK: - Job queue
 
 /// Lock-protected FIFO of pending decode jobs.
@@ -1151,6 +1257,9 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
     /// Lock-protected decode-pipeline counters, written by the driver/workers
     /// and read synchronously by ``decodeStats()``.
     private let statsBox: DecodeStatsBox
+    /// Lock-protected residency-settle snapshot, written by the driver each tick
+    /// and read synchronously by ``isResidencySettled`` / ``residencyBudgetLimited``.
+    private let settleBox: ResidencySettleBox
     private let handleBox: SendableCopcReader
     private let originShift: SIMD3<Double>
     private let workerCount: Int
@@ -1174,6 +1283,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         queue: UpdateQueue,
         jobs: JobQueue,
         statsBox: DecodeStatsBox,
+        settleBox: ResidencySettleBox,
         handle: SendableCopcReader,
         originShift: SIMD3<Double>,
         workerCount: Int,
@@ -1186,6 +1296,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         self.queue = queue
         self.jobs = jobs
         self.statsBox = statsBox
+        self.settleBox = settleBox
         self.handleBox = handle
         self.originShift = originShift
         self.workerCount = workerCount
@@ -1365,6 +1476,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         let queue = UpdateQueue()
         let jobs = JobQueue()
         let statsBox = DecodeStatsBox()
+        let settleBox = ResidencySettleBox()
         let handleBox = SendableCopcReader(reader: reader)
         let driver = StreamingDriver(
             handle: handleBox,
@@ -1374,6 +1486,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             queue: queue,
             jobs: jobs,
             statsBox: statsBox,
+            settleBox: settleBox,
             budgetBytesPerPoint: 17 + 4 * extraNames.count,
             isRemote: isRemote
         )
@@ -1401,6 +1514,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             queue: queue,
             jobs: jobs,
             statsBox: statsBox,
+            settleBox: settleBox,
             handle: handleBox,
             originShift: originShift,
             workerCount: workerCount,
@@ -1521,15 +1635,40 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
     }
 
     public func submit(view: StreamingCameraView) {
-        Task { await driver.setView(view) }
+        settleBox.markUnsettled()
+        Task { await driver.setViews([view]) }
     }
 
+    public func submit(views: [StreamingCameraView]) {
+        guard !views.isEmpty else { return }
+        settleBox.markUnsettled()
+        Task { await driver.setViews(views) }
+    }
+
+    public var isResidencySettled: Bool { settleBox.isSettled }
+    public var residencyBudgetLimited: Bool { settleBox.isBudgetLimited }
+
     public func setBudget(_ bytes: Int) {
+        // A budget change can grow the wanted set, so treat it like a resubmit:
+        // don't let a pre-roll read the pre-change "settled" as done.
+        settleBox.markUnsettled()
         Task { await driver.setBudget(bytes) }
     }
 
     public func setTargetChunkScreenSize(_ pixels: Float) {
         Task { await driver.setTargetScreenSize(pixels) }
+    }
+
+    public func setResidencyPolicy(_ policy: ResidencyPolicy) {
+        // A policy change can grow the wanted set (e.g. distanceOnly admits
+        // off-frustum chunks), so treat it like a resubmit for pre-roll loops.
+        settleBox.markUnsettled()
+        Task { await driver.setResidencyPolicy(policy) }
+    }
+
+    public func setEnforceHierarchyResidency(_ enabled: Bool) {
+        settleBox.markUnsettled()
+        Task { await driver.setEnforceHierarchyResidency(enabled) }
     }
 
     public func decodeStats() -> StreamingDecodeStats {
@@ -1667,13 +1806,24 @@ actor StreamingDriver {
     private let budgetBytesPerPoint: Int
     private let maxNodeDepth: Int
     private let originShift: SIMD3<Double>
-    private let options: StreamingOptions
+    /// `var` (not `let`) so the two cheap-to-retune scoring inputs
+    /// (``StreamingOptions/residencyPolicy`` and
+    /// ``StreamingOptions/enforceHierarchyResidency``) can be swapped live via
+    /// ``setResidencyPolicy(_:)`` / ``setEnforceHierarchyResidency(_:)``. The
+    /// scoring pass reads `options.residencyPolicy` / `.enforceHierarchyResidency`
+    /// each tick, so a mutation takes effect on the next re-score. All other
+    /// fields are open-time-only and never mutated here.
+    private var options: StreamingOptions
     private let queue: UpdateQueue
     private let jobs: JobQueue
     /// Decode-pipeline telemetry shared with the owning source (read via
     /// ``CopcStreamingPointCloudSource/decodeStats()``). Written only from
     /// this actor's serialized transitions.
     private let statsBox: DecodeStatsBox
+    /// Residency-settle snapshot shared with the owning source (read via
+    /// ``CopcStreamingPointCloudSource/isResidencySettled``). Published at the
+    /// end of every ``runOneTick()``.
+    private let settleBox: ResidencySettleBox
     /// `true` when the source is HTTP-backed. Selects the prefetch coalescing
     /// gap threshold (an HTTP round-trip justifies a wider gap than a local
     /// seek). See ``NodePrefetch/gapBytes(isRemote:)``.
@@ -1702,7 +1852,10 @@ actor StreamingDriver {
     /// cancellations against ``DecodeStatsBox/pending``.
     private var decoding: Set<ChunkID> = []
 
-    private var latestView: StreamingCameraView?
+    /// Current target view set (union). A single-camera frame is `[view]`;
+    /// multi-projection / look-ahead frames carry several. Empty until the first
+    /// submit.
+    private var latestViews: [StreamingCameraView] = []
     private var budgetBytes: Int = .max
 
     /// Residency bookkeeping only — deliberately does NOT retain the decoded
@@ -1734,8 +1887,12 @@ actor StreamingDriver {
     // residency state don't change it. Caching avoids the O(nodes)
     // frustum scan + sort on every tick when the camera and budget are
     // unchanged (static frames, idle periods).
-    private var cachedView: StreamingCameraView?
+    private var cachedViews: [StreamingCameraView] = []
     private var cachedBudget: Int = .min
+    /// Whether the cached wanted set was clamped by the budget with
+    /// frustum-visible candidates excluded (see ``computeWantedSet(views:budget:)``).
+    /// Republished to the settle box each tick.
+    private var cachedBudgetLimited = false
     private var cachedWanted: Set<ChunkID> = []
     /// Wanted IDs in *load-priority order* (best to load first). Under
     /// the SSE scorer this is admission order from the budget-fill pass
@@ -1754,6 +1911,7 @@ actor StreamingDriver {
         queue: UpdateQueue,
         jobs: JobQueue,
         statsBox: DecodeStatsBox = DecodeStatsBox(),
+        settleBox: ResidencySettleBox = ResidencySettleBox(),
         budgetBytesPerPoint: Int = 17,
         isRemote: Bool = false
     ) {
@@ -1769,6 +1927,7 @@ actor StreamingDriver {
         self.queue = queue
         self.jobs = jobs
         self.statsBox = statsBox
+        self.settleBox = settleBox
         self.isRemote = isRemote
         self.tickInterval = options.driverTickInterval
         self.currentTargetScreenSize = max(options.targetChunkScreenSize, 1)
@@ -1787,7 +1946,9 @@ actor StreamingDriver {
         }
     }
 
-    func setView(_ v: StreamingCameraView) { latestView = v }
+    func setViews(_ vs: [StreamingCameraView]) { latestViews = vs }
+    /// Single-view convenience (used by tests and the single-camera path).
+    func setView(_ v: StreamingCameraView) { latestViews = [v] }
     func setBudget(_ b: Int) { budgetBytes = b }
 
     /// Retarget the screen-space-error scorer at runtime. Invalidates the
@@ -1798,7 +1959,24 @@ actor StreamingDriver {
         let clamped = max(v, 1)
         guard clamped != currentTargetScreenSize else { return }
         currentTargetScreenSize = clamped
-        cachedView = nil   // force a wanted-set recompute next tick
+        cachedViews = []   // force a wanted-set recompute next tick
+    }
+
+    /// Swap the wanted-set construction strategy at runtime. Re-scores next
+    /// tick; resident chunks are untouched until they fall out of the new
+    /// wanted set. See ``StreamingOptions/residencyPolicy``.
+    func setResidencyPolicy(_ p: ResidencyPolicy) {
+        guard options.residencyPolicy != p else { return }
+        options.residencyPolicy = p
+        cachedViews = []   // force a wanted-set recompute next tick
+    }
+
+    /// Toggle the parent-closed residency invariant at runtime. Re-scores next
+    /// tick. See ``StreamingOptions/enforceHierarchyResidency``.
+    func setEnforceHierarchyResidency(_ on: Bool) {
+        guard options.enforceHierarchyResidency != on else { return }
+        options.enforceHierarchyResidency = on
+        cachedViews = []   // force a wanted-set recompute next tick
     }
 
     /// Worker hook: a node moved from the pending queue into active decode.
@@ -1952,7 +2130,14 @@ actor StreamingDriver {
     // `runOneTick`, `setView`, and `setBudget` are already internal.
     func _wantedSetForTest(view: StreamingCameraView, budget: Int)
     -> (set: Set<ChunkID>, ordered: [ChunkID]) {
-        computeWantedSet(view: view, budget: budget)
+        let r = computeWantedSet(views: [view], budget: budget)
+        return (r.set, r.ordered)
+    }
+
+    /// Multi-view variant of ``_wantedSetForTest(view:budget:)``.
+    func _wantedSetForTest(views: [StreamingCameraView], budget: Int)
+    -> (set: Set<ChunkID>, ordered: [ChunkID], budgetLimited: Bool) {
+        computeWantedSet(views: views, budget: budget)
     }
     var _residentIDsForTest: Set<ChunkID> { Set(resident.keys) }
     var _inFlightIDsForTest: Set<ChunkID> { inFlight }
@@ -1967,27 +2152,37 @@ actor StreamingDriver {
     @discardableResult
     func runOneTick() -> Bool {
         if closed { return false }
-        guard let view = latestView else { return false }
+        guard !latestViews.isEmpty else {
+            // No target submitted → nothing wanted → trivially settled, so a
+            // pre-roll that (defensively) submitted no views never spins.
+            settleBox.update(settled: true, budgetLimited: false, wanted: 0, resident: resident.count)
+            return false
+        }
+        let views = latestViews
 
-        // 1. Score nodes against the camera + budget — cached when the
-        //    (view, budget) pair is unchanged from the previous tick.
+        // 1. Score nodes against the camera(s) + budget — cached when the
+        //    (view set, budget) pair is unchanged from the previous tick.
         let wanted: Set<ChunkID>
         let wantedOrdered: [ChunkID]
+        let budgetLimited: Bool
         let wasCacheMiss: Bool
-        if let cv = cachedView, cv == view, cachedBudget == budgetBytes {
+        if cachedViews == views, cachedBudget == budgetBytes {
             wanted = cachedWanted
             wantedOrdered = cachedWantedSorted
+            budgetLimited = cachedBudgetLimited
             lastTickCandidates = cachedCandidates
             wantedCacheHits &+= 1
             wasCacheMiss = false
         } else {
-            let computed = computeWantedSet(view: view, budget: budgetBytes)
+            let computed = computeWantedSet(views: views, budget: budgetBytes)
             wanted = computed.set
             wantedOrdered = computed.ordered
-            cachedView = view
+            budgetLimited = computed.budgetLimited
+            cachedViews = views
             cachedBudget = budgetBytes
             cachedWanted = wanted
             cachedWantedSorted = wantedOrdered
+            cachedBudgetLimited = budgetLimited
             cachedCandidates = lastTickCandidates
             wantedCacheMisses &+= 1
             wasCacheMiss = true
@@ -1995,6 +2190,17 @@ actor StreamingDriver {
         lastTickWanted = wanted.count
         lastTickResident = resident.count
         lastTickInFlight = inFlight.count
+
+        // Publish the settle state for this tick's target. `settled` = every
+        // wanted chunk is resident and nothing is mid-decode; `budgetLimited`
+        // qualifies it (settled+limited = "all the budget allows is in, but more
+        // is visible"). Deferred to a closure so every early return still
+        // publishes a consistent snapshot after this tick's evict/schedule work.
+        func publishSettle() {
+            let settled = inFlight.isEmpty && !wanted.contains { resident[$0] == nil }
+            settleBox.update(settled: settled, budgetLimited: budgetLimited,
+                             wanted: wanted.count, resident: resident.count)
+        }
 
         var tickRemoved: [ChunkID] = []
 
@@ -2078,7 +2284,7 @@ actor StreamingDriver {
         // promptly once the queue drains, rather than backing off while
         // genuinely busy.
         let backlogCap = min(max(64 << 20, budgetBytes / 4), 512 << 20)
-        if queue.pendingAddedBytes >= backlogCap { return true }
+        if queue.pendingAddedBytes >= backlogCap { publishSettle(); return true }
 
         var toLoad: [ChunkID] = []
         toLoad.reserveCapacity(options.maxInFlightLoads)
@@ -2094,6 +2300,7 @@ actor StreamingDriver {
             // remain non-resident (queued behind the maxInFlightLoads cap
             // or still decoding). Only a pure no-op tick backs off.
             let pendingWantedWork = wanted.contains { resident[$0] == nil }
+            publishSettle()
             return wasCacheMiss || !tickRemoved.isEmpty || pendingWantedWork
         }
         for id in toLoad { inFlight.insert(id) }
@@ -2112,11 +2319,14 @@ actor StreamingDriver {
             gapBytes: NodePrefetch.gapBytes(isRemote: isRemote)
         )
         jobs.enqueue(clusters)
+        // Just scheduled loads → wanted chunks are still non-resident / in flight,
+        // so this publishes settled == false.
+        publishSettle()
         return true
     }
 
-    private func computeWantedSet(view: StreamingCameraView, budget: Int)
-    -> (set: Set<ChunkID>, ordered: [ChunkID]) {
+    private func computeWantedSet(views: [StreamingCameraView], budget: Int)
+    -> (set: Set<ChunkID>, ordered: [ChunkID], budgetLimited: Bool) {
         // Whole-file shortcut: if every node fits in the budget, every
         // node is wanted. Skip the frustum scan and sort entirely, but
         // produce a depth-ASC load order so coarse coverage arrives
@@ -2125,7 +2335,7 @@ actor StreamingDriver {
             lastTickCandidates = nodes.count
             lastTickFrustumVisible = 0
             let ordered = nodes.sorted { $0.id.depth < $1.id.depth }.map(\.id)
-            return (allNodeIDs, ordered)
+            return (allNodeIDs, ordered, false)
         }
 
         struct Scored { let id: ChunkID; let score: Float; let bytes: Int }
@@ -2152,31 +2362,46 @@ actor StreamingDriver {
         // it both hit `err ≈ 0` at their natural depth; the chunks
         // that win the budget race are the ones at the *right* level
         // for their distance, not just the closest ones.
+        //
+        // Multi-view: the wanted set is the UNION over all submitted views.
+        // A node is a candidate if it is frustum-visible in *any* view, and
+        // its score is the BEST (max) it achieves across the views that see
+        // it — so a chunk seen edge-on by one screen but head-on by another
+        // is admitted at the detail the head-on screen needs. Per-view
+        // pixelScale / ortho-ness / frustum planes are precomputed once.
         let target = currentTargetScreenSize
-        let pixelScale = max(view.pixelScale, 1e-6)
 
-        // Ortho detection: for projection·view built from a rigid view
-        // matrix and an orthographic projection, the w-row collapses to
-        // (0,0,0,1) — there's no perspective divide. Apparent on-screen
-        // size under ortho is therefore distance-independent (no
-        // foreshortening), so dividing by distance would skew the wanted
-        // set toward whichever chunks happen to sit near the camera
-        // position rather than the ones matching the true projected
-        // footprint. `pixelScale` is already pixels-per-world-unit in
-        // that case (see its doc comment), so the ortho branch below
-        // uses it directly.
-        let m = view.viewProjection
-        let isOrthographic =
-            abs(m.columns.0.w) < 1e-6 && abs(m.columns.1.w) < 1e-6 &&
-            abs(m.columns.2.w) < 1e-6 && abs(m.columns.3.w - 1) < 1e-3
+        struct ViewEval {
+            let position: SIMD3<Float>
+            let pixelScale: Float
+            let isOrthographic: Bool
+            let planes: FrustumPlanes
+        }
+        let evals: [ViewEval] = views.map { view in
+            // Ortho detection: for projection·view built from a rigid view
+            // matrix and an orthographic projection, the w-row collapses to
+            // (0,0,0,1) — there's no perspective divide. Apparent on-screen
+            // size under ortho is therefore distance-independent (no
+            // foreshortening), so dividing by distance would skew the wanted
+            // set toward whichever chunks sit near the camera. `pixelScale`
+            // is already pixels-per-world-unit there (see its doc comment).
+            let m = view.viewProjection
+            let isOrtho =
+                abs(m.columns.0.w) < 1e-6 && abs(m.columns.1.w) < 1e-6 &&
+                abs(m.columns.2.w) < 1e-6 && abs(m.columns.3.w - 1) < 1e-3
+            return ViewEval(position: view.position,
+                            pixelScale: max(view.pixelScale, 1e-6),
+                            isOrthographic: isOrtho,
+                            planes: FrustumPlanes(viewProjection: m))
+        }
 
-        func score(for node: NodeMeta) -> Float {
+        func score(_ node: NodeMeta, in eval: ViewEval) -> Float {
             let screenPx: Float
-            if isOrthographic {
-                screenPx = max(node.extent * pixelScale, 1e-6)
+            if eval.isOrthographic {
+                screenPx = max(node.extent * eval.pixelScale, 1e-6)
             } else {
-                let distance = simd_length(node.center - view.position) + 1e-3
-                screenPx = max(node.extent * pixelScale / distance, 1e-6)
+                let distance = simd_length(node.center - eval.position) + 1e-3
+                screenPx = max(node.extent * eval.pixelScale / distance, 1e-6)
             }
             let err = abs(log2(screenPx / target))
             return 1 / (1 + err)
@@ -2184,18 +2409,33 @@ actor StreamingDriver {
 
         switch options.residencyPolicy {
         case .distanceOnly:
-            // No frustum gate — everything is a candidate.
+            // No frustum gate — everything is a candidate; score = best over views.
             for node in nodes {
-                visible.append(Scored(id: node.id, score: score(for: node), bytes: node.pointCount * budgetBytesPerPoint))
+                var best: Float = 0
+                for e in evals { best = max(best, score(node, in: e)) }
+                visible.append(Scored(id: node.id, score: best, bytes: node.pointCount * budgetBytesPerPoint))
             }
         case .frustumFirstThenHalo:
-            let planes = FrustumPlanes(viewProjection: view.viewProjection)
+            // Candidate if visible in ANY view; score = best over the views
+            // that actually see it (fall back to best overall if none — only
+            // possible for a node placed in `hidden`, where score is unused
+            // for admission ordering until the halo pass).
             for node in nodes {
-                let s = Scored(id: node.id, score: score(for: node), bytes: node.pointCount * budgetBytesPerPoint)
-                if planes.intersects(min: node.minXYZ, max: node.maxXYZ) {
-                    visible.append(s)
+                var best: Float = 0
+                var seen = false
+                for e in evals where e.planes.intersects(min: node.minXYZ, max: node.maxXYZ) {
+                    seen = true
+                    best = max(best, score(node, in: e))
+                }
+                let bytes = node.pointCount * budgetBytesPerPoint
+                if seen {
+                    visible.append(Scored(id: node.id, score: best, bytes: bytes))
                 } else {
-                    hidden.append(s)
+                    // Not in any frustum: halo candidate, scored by its best
+                    // over all views (proximity, for filling leftover budget).
+                    var haloBest: Float = 0
+                    for e in evals { haloBest = max(haloBest, score(node, in: e)) }
+                    hidden.append(Scored(id: node.id, score: haloBest, bytes: bytes))
                 }
             }
         }
@@ -2270,6 +2510,12 @@ actor StreamingDriver {
 
         for c in visible { admit(c.id) }
 
+        // Budget-limited iff a frustum-visible candidate didn't make the wanted
+        // set — i.e. the budget clamped coverage the camera(s) can actually see.
+        // Computed before the halo pass (halo nodes are off-screen fill, not a
+        // coverage shortfall). Drives the offline pre-roll's budget auto-raise.
+        let budgetLimited = visible.contains { !wanted.contains($0.id) }
+
         // Pass 2 (halo): fill remaining headroom from nearest non-visible
         // chunks. Only reachable under .frustumFirstThenHalo; under
         // .distanceOnly the hidden array is empty.
@@ -2278,7 +2524,7 @@ actor StreamingDriver {
             for c in hidden { admit(c.id) }
         }
 
-        return (wanted, ordered)
+        return (wanted, ordered, budgetLimited)
     }
 
     /// GPU byte cost of a single node's payload, or `0` if the node is not
