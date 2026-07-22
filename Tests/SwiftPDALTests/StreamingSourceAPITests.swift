@@ -95,8 +95,13 @@ private func api_options(
     )
 }
 
+/// `pointsPerBatch` defaults to the synthetic node point count (100) so each
+/// node costs exactly one GPU slot — slot budgets below therefore read
+/// directly in "nodes", the way the old byte budgets read as multiples of a
+/// node's 1700-byte footprint (8 nodes → 13600 bytes → 8 slots; the pinned
+/// depth<=1 prefix of 3 nodes → 5100 bytes → 3 slots).
 private func api_makeDriver(
-    nodes: [NodeMeta], options: StreamingOptions
+    nodes: [NodeMeta], options: StreamingOptions, pointsPerBatch: Int = 100
 ) -> (StreamingDriver, UpdateQueue)? {
     guard let handle = api_openReader() else { return nil }
     let queue = UpdateQueue()
@@ -104,7 +109,7 @@ private func api_makeDriver(
     let driver = StreamingDriver(
         handle: handle, nodes: nodes, originShift: .zero,
         options: options, queue: queue, jobs: jobs,
-        budgetBytesPerPoint: 17, isRemote: false
+        budgetBytesPerPoint: 17, pointsPerBatch: pointsPerBatch, isRemote: false
     )
     return (driver, queue)
 }
@@ -121,10 +126,10 @@ private func api_makeDriver(
     #expect(pinned == Set([a_d0, a_d1, a_d1s]),
             "alwaysResidentDepth=1 should pin exactly the depth<=1 nodes (got \(pinned))")
 
-    // Budget below the whole-file total (8×1700=13600) but comfortably above
-    // the pinned set (3×1700=5100): the scorer runs, and every pinned node is
-    // wanted regardless of what the scorer picks.
-    let w = await driver._wantedSetForTest(view: api_view(), budget: 8000)
+    // Budget below the whole-file total (8 slots) but comfortably above the
+    // pinned set (3 slots): the scorer runs, and every pinned node is wanted
+    // regardless of what the scorer picks. 6 slots leaves 3 for scored fill.
+    let w = await driver._wantedSetForTest(view: api_view(), budget: 6)
     #expect(pinned.isSubset(of: w.set), "pinned nodes must always be wanted")
     // Pinned nodes are scheduled coarse-first (before any scored node).
     let firstThree = Set(w.ordered.prefix(3))
@@ -135,16 +140,16 @@ private func api_makeDriver(
     guard let (driver, _) = api_makeDriver(
         nodes: api_chainNodes(), options: api_options(alwaysResidentDepth: 1)
     ) else { Issue.record("fixture reader unavailable"); return }
-    let pinned = await driver._pinnedIDsForTest   // 3 nodes × 1700 = 5100 bytes
+    let pinned = await driver._pinnedIDsForTest   // 3 nodes → 3 slots
 
-    // Budget smaller than the pinned footprint: pins are still all wanted
-    // (honored regardless of budget), and no scored node is admitted.
-    let tiny = await driver._wantedSetForTest(view: api_view(), budget: 1000)
+    // Budget smaller than the pinned footprint (2 < 3 slots): pins are still
+    // all wanted (honored regardless of budget), and no scored node is admitted.
+    let tiny = await driver._wantedSetForTest(view: api_view(), budget: 2)
     #expect(tiny.set == pinned,
             "with pinned > budget, wanted must be exactly the pinned set (got \(tiny.set))")
 
-    // Budget exactly the pinned footprint: same result (no headroom left).
-    let exact = await driver._wantedSetForTest(view: api_view(), budget: 5100)
+    // Budget exactly the pinned footprint (3 slots): same result (no headroom).
+    let exact = await driver._wantedSetForTest(view: api_view(), budget: 3)
     #expect(exact.set == pinned,
             "with pinned == budget, scored residency clamps to zero (got \(exact.set))")
 }
@@ -158,7 +163,7 @@ private func api_makeDriver(
 
     // Make the chain resident: schedule, then complete loads root-first.
     await driver.setView(api_view())
-    await driver.setBudget(8000)
+    await driver.setBudget(slots: 6)   // pinned (3) + scored fill, under the 8-slot file
     _ = await driver.runOneTick()
     let scheduled = await driver._inFlightIDsForTest
     for id in scheduled.sorted(by: { $0.depth < $1.depth }) {
@@ -170,7 +175,7 @@ private func api_makeDriver(
 
     // Drop the budget to zero and tick until non-pinned drains. Pinned nodes
     // must never be evicted or re-scheduled.
-    await driver.setBudget(0)
+    await driver.setBudget(slots: 0)
     for _ in 0..<12 {
         _ = await driver.runOneTick()
         if let u = queue.drain() {
@@ -232,7 +237,7 @@ private func api_makeDriver(
     ) else { Issue.record("fixture reader unavailable"); return }
 
     await driver.setView(api_view())
-    await driver.setBudget(8000)
+    await driver.setBudget(slots: 6)   // scorer runs (under the 8-slot file); root is dragged in
     _ = await driver.runOneTick()   // schedules the wanted chain into inFlight
 
     let scheduledCount = await driver._inFlightIDsForTest.count
@@ -270,9 +275,9 @@ private func api_makeDriver(
 
     #expect(await driver._targetScreenSizeForTest == 1)
 
-    // Budget fits a single 100-pt node (1700 bytes). At target=1 the extent-1
-    // leaf is the unique best match.
-    let small = await driver._wantedSetForTest(view: api_view(), budget: 1700)
+    // Budget fits a single node (1 slot). At target=1 the extent-1 leaf is the
+    // unique best match.
+    let small = await driver._wantedSetForTest(view: api_view(), budget: 1)
     #expect(small.set.contains(a_leaf) && !small.set.contains(a_d0),
             "target=1 should prefer the fine leaf (got \(small.set))")
 
@@ -280,7 +285,7 @@ private func api_makeDriver(
     // pass reflects it — no restart, no re-open.
     await driver.setTargetScreenSize(8)
     #expect(await driver._targetScreenSizeForTest == 8)
-    let big = await driver._wantedSetForTest(view: api_view(), budget: 1700)
+    let big = await driver._wantedSetForTest(view: api_view(), budget: 1)
     #expect(big.set.contains(a_d0) && !big.set.contains(a_leaf),
             "target=8 should prefer the coarse root after retarget (got \(big.set))")
 
@@ -295,7 +300,7 @@ private func api_makeDriver(
     ) else { Issue.record("fixture reader unavailable"); return }
 
     await driver.setView(api_view())
-    await driver.setBudget(1700)
+    await driver.setBudget(slots: 1)
     _ = await driver.runOneTick()                 // populates the wanted cache (miss)
     _ = await driver.runOneTick()                 // cache hit (same view+budget)
     let hitsBefore = await driver.snapshot().cacheHits

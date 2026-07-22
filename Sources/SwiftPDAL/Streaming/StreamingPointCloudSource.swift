@@ -553,7 +553,7 @@ public struct StreamingOptions: Sendable {
     /// density at any point is the *union* of a node and all its ancestors.
     /// With this on (the default), the residency scorer still prioritizes
     /// by screen-space error, but the wanted set is expanded to include
-    /// each admitted node's missing ancestor chain (charged to the byte
+    /// each admitted node's missing ancestor chain (charged to the slot
     /// budget, ancestors first), eviction proceeds leaf-first, and every
     /// published ``StreamingUpdate`` lists parents before descendants in
     /// ``StreamingUpdate/added`` and descendants before parents in
@@ -581,9 +581,11 @@ public struct StreamingOptions: Sendable {
     ///
     /// ## Budget accounting
     ///
-    /// Pinned nodes **are** charged against the byte/point budget set via
-    /// ``StreamingPointCloudSource/setBudget(_:)`` — they occupy the same GPU
-    /// residency the scorer draws from. Their cost is charged first; the
+    /// Pinned nodes **are** charged against the slot budget set via
+    /// ``StreamingPointCloudSource/setBudget(slots:)`` (or the byte-denominated
+    /// ``StreamingPointCloudSource/setBudget(_:)``) — they occupy the same GPU
+    /// slots the scorer draws from, at `ceil(pointCount / pointsPerBatch)` slots
+    /// each. Their cost is charged first; the
     /// screen-space-error scorer then fills whatever headroom remains. If the
     /// pinned set alone meets or exceeds the budget, scored residency clamps
     /// to zero rather than evicting any pinned node — the pins are honored
@@ -700,7 +702,7 @@ public enum StreamingSourceError: Error {
 /// Out-of-core point cloud source for the Satin-ComputeRasteriser pipeline.
 ///
 /// Owns a COPC file's octree, decides per-tick residency against a camera
-/// and byte budget, and returns ready-to-upload chunks. The protocol is
+/// and residency budget, and returns ready-to-upload chunks. The protocol is
 /// deliberately small so the renderer package stays free of PDAL /
 /// LASzip / copc-lib dependencies.
 ///
@@ -708,7 +710,9 @@ public enum StreamingSourceError: Error {
 ///
 /// ```swift
 /// let source = try await CopcStreamingPointCloudSource.open(url)
-/// source.setBudget(2 << 30)              // 2 GB
+/// source.setBudget(slots: slotPoolCapacity)  // size to the renderer's slot pool
+/// // or, byte-denominated (converted to whole slots internally):
+/// source.setBudget(2 << 30)                  // 2 GB
 ///
 /// // every frame (cheap, non-async):
 /// source.submit(view: camera)
@@ -752,12 +756,37 @@ public protocol StreamingPointCloudSource: AnyObject, Sendable {
     /// - Parameter views: The camera views to union.
     func submit(views: [StreamingCameraView])
 
-    /// Update the byte budget for resident payloads (positions + colors
-    /// + levels). Takes effect on the next driver tick.
+    /// Update the budget for resident payloads (positions + colors + levels),
+    /// expressed in bytes. Takes effect on the next driver tick.
+    ///
+    /// Residency is admitted in whole GPU **slots** (see ``setBudget(slots:)``),
+    /// so the byte figure is converted conservatively to a slot count
+    /// (`bytes / (pointsPerBatch × bytesPerPoint)`): the equivalent number of
+    /// *full* slots, charging the partial-batch waste that a pure byte budget
+    /// would ignore. Prefer ``setBudget(slots:)`` when sizing directly against a
+    /// renderer slot pool.
     ///
     /// - Parameter bytes: Maximum total payload bytes. Resident chunks
     ///   will not exceed this budget.
     func setBudget(_ bytes: Int)
+
+    /// Update the residency budget in whole GPU **slots**. Takes effect on the
+    /// next driver tick.
+    ///
+    /// The renderer stores each decoded node in fixed-size slots of
+    /// ``StreamingSourceInfo/pointsPerBatch`` points; a node with `N` points
+    /// occupies `ceil(N / pointsPerBatch)` whole slots, so a partial final batch
+    /// still burns a full slot. Budgeting in slots (rather than bytes) makes
+    /// "the wanted set physically fits the slot pool" hold by construction — the
+    /// byte budget was systematically optimistic because it ignored that
+    /// partial-batch rounding. Size this to your renderer's slot-pool capacity.
+    ///
+    /// A default no-op implementation is provided so existing conformers stay
+    /// source-compatible; ``CopcStreamingPointCloudSource`` overrides it.
+    ///
+    /// - Parameter slots: Maximum number of GPU slots the resident set may
+    ///   occupy.
+    func setBudget(slots: Int)
 
     /// Synchronously drain pending residency changes.
     ///
@@ -847,7 +876,7 @@ public protocol StreamingPointCloudSource: AnyObject, Sendable {
     /// never stall such a loop; ``CopcStreamingPointCloudSource`` overrides it.
     var isResidencySettled: Bool { get }
 
-    /// Whether the wanted set was clamped by the byte budget while
+    /// Whether the wanted set was clamped by the slot budget while
     /// frustum-visible candidates were left out. Read alongside
     /// ``isResidencySettled``: settled **and** budget-limited means "everything
     /// the budget allows is resident, but more is visible" — raise the budget to
@@ -860,6 +889,10 @@ public extension StreamingPointCloudSource {
     /// simply ignores the new value. See
     /// ``setTargetChunkScreenSize(_:)``.
     func setTargetChunkScreenSize(_ pixels: Float) {}
+
+    /// Default no-op: a source that doesn't distinguish a slot budget simply
+    /// ignores it. See ``setBudget(slots:)``.
+    func setBudget(slots: Int) {}
 
     /// Default no-op. See ``setResidencyPolicy(_:)``.
     func setResidencyPolicy(_ policy: ResidencyPolicy) {}
@@ -1488,6 +1521,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             statsBox: statsBox,
             settleBox: settleBox,
             budgetBytesPerPoint: 17 + 4 * extraNames.count,
+            pointsPerBatch: info.pointsPerBatch,
             isRemote: isRemote
         )
 
@@ -1652,7 +1686,22 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         // A budget change can grow the wanted set, so treat it like a resubmit:
         // don't let a pre-roll read the pre-change "settled" as done.
         settleBox.markUnsettled()
-        Task { await driver.setBudget(bytes) }
+        // Convert the byte budget to whole GPU slots. Conservative: a slot
+        // holds `pointsPerBatch` points at `bytesPerPoint (+ extraBytesPerPoint)`
+        // bytes each, so `bytes / bytesPerSlot` is the number of *full* slots the
+        // byte figure buys — partial-batch waste is now charged, where byte
+        // accounting used to ignore it. Floored at 1 so a non-zero budget never
+        // rounds down to "nothing resident".
+        let bytesPerSlot = info.pointsPerBatch * (info.bytesPerPoint + info.extraBytesPerPoint)
+        let slots = max(1, bytes / bytesPerSlot)
+        Task { await driver.setBudget(slots: slots) }
+    }
+
+    public func setBudget(slots: Int) {
+        // Resubmit-like, exactly as `setBudget(_:)`: a budget change can grow the
+        // wanted set, so drop the stale "settled" flag until the next tick.
+        settleBox.markUnsettled()
+        Task { await driver.setBudget(slots: slots) }
     }
 
     public func setTargetChunkScreenSize(_ pixels: Float) {
@@ -1798,11 +1847,22 @@ actor StreamingDriver {
     private let nodes: [NodeMeta]
     private let nodeIndexByID: [ChunkID: Int]
     private let allNodeIDs: Set<ChunkID>
-    private let totalNodeBytes: Int
-    /// Estimated bytes per point for budget accounting: 17 (positions +
-    /// colors + levels) plus 4 per requested extra dimension. Extra dims
-    /// were previously invisible to the budget, so a schema-heavy file
-    /// could exceed it by `4 × dims / 17` without ever tripping admission.
+    /// Total slot cost of every node in the file (Σ ``slotCost(_:)``). When
+    /// this fits the slot budget the whole-file shortcut engages. Slot- (not
+    /// byte-) denominated so it compares apples-to-apples with the GPU slot
+    /// pool the wanted set must physically fit.
+    private let totalNodeSlots: Int
+    /// Renderer batch granularity (points per fixed-size GPU slot). A node
+    /// costs `ceil(pointCount / pointsPerBatch)` whole slots — a partial final
+    /// batch still burns a full slot — so making residency admission
+    /// slot-denominated guarantees "wanted set fits the pool" by construction.
+    /// See ``slotCost(_:)``.
+    private let pointsPerBatch: Int
+    /// Estimated bytes per point: 17 (positions + colors + levels) plus 4 per
+    /// requested extra dimension. No longer part of residency admission (that
+    /// is slot-denominated now); retained only to convert the slot budget back
+    /// to an approximate host-memory figure for the publish-queue backlog cap
+    /// in ``runOneTick()``.
     private let budgetBytesPerPoint: Int
     private let maxNodeDepth: Int
     private let originShift: SIMD3<Double>
@@ -1835,8 +1895,8 @@ actor StreamingDriver {
     /// Always closed under parent (a depth prefix of a connected COPC tree),
     /// so it composes cleanly with the hierarchy-residency invariant.
     private let pinnedIDs: Set<ChunkID>
-    /// Total budget cost of ``pinnedIDs`` (charged before scored residency).
-    private let pinnedBytes: Int
+    /// Total slot cost of ``pinnedIDs`` (charged before scored residency).
+    private let pinnedSlots: Int
     /// Pinned IDs sorted coarse-first (depth ascending), used to seed the
     /// wanted-set load order so coarse coverage is scheduled before detail.
     private let pinnedOrdered: [ChunkID]
@@ -1856,7 +1916,10 @@ actor StreamingDriver {
     /// multi-projection / look-ahead frames carry several. Empty until the first
     /// submit.
     private var latestViews: [StreamingCameraView] = []
-    private var budgetBytes: Int = .max
+    /// Slot budget: the maximum number of fixed-size GPU slots the resident
+    /// wanted set may occupy. `.max` = unbounded (whole-file mode). Set via
+    /// ``setBudget(slots:)``.
+    private var budgetSlots: Int = .max
 
     /// Residency bookkeeping only — deliberately does NOT retain the decoded
     /// ``ResidentChunk`` payload. The payload is handed to the consumer via
@@ -1888,7 +1951,7 @@ actor StreamingDriver {
     // frustum scan + sort on every tick when the camera and budget are
     // unchanged (static frames, idle periods).
     private var cachedViews: [StreamingCameraView] = []
-    private var cachedBudget: Int = .min
+    private var cachedBudgetSlots: Int = .min
     /// Whether the cached wanted set was clamped by the budget with
     /// frustum-visible candidates excluded (see ``computeWantedSet(views:budget:)``).
     /// Republished to the settle box each tick.
@@ -1913,6 +1976,7 @@ actor StreamingDriver {
         statsBox: DecodeStatsBox = DecodeStatsBox(),
         settleBox: ResidencySettleBox = ResidencySettleBox(),
         budgetBytesPerPoint: Int = 17,
+        pointsPerBatch: Int = ChunkPacker.defaultPointsPerBatch,
         isRemote: Bool = false
     ) {
         self.handleBox = handle
@@ -1920,7 +1984,11 @@ actor StreamingDriver {
         self.nodeIndexByID = Dictionary(uniqueKeysWithValues: nodes.enumerated().map { ($1.id, $0) })
         self.allNodeIDs = Set(nodes.lazy.map(\.id))
         self.budgetBytesPerPoint = budgetBytesPerPoint
-        self.totalNodeBytes = nodes.reduce(0) { $0 + $1.pointCount * budgetBytesPerPoint }
+        // Slot cost = ceil(pointCount / pointsPerBatch); clamp granularity to
+        // >= 1 so the ceil-division is well-defined.
+        let ppb = max(1, pointsPerBatch)
+        self.pointsPerBatch = ppb
+        self.totalNodeSlots = nodes.reduce(0) { $0 + ($1.pointCount + ppb - 1) / ppb }
         self.maxNodeDepth = nodes.reduce(0) { max($0, $1.id.depth) }
         self.originShift = originShift
         self.options = options
@@ -1937,11 +2005,11 @@ actor StreamingDriver {
         if let d = options.alwaysResidentDepth, d >= 0 {
             let pinned = nodes.filter { $0.id.depth <= d }
             self.pinnedIDs = Set(pinned.map(\.id))
-            self.pinnedBytes = pinned.reduce(0) { $0 + $1.pointCount * budgetBytesPerPoint }
+            self.pinnedSlots = pinned.reduce(0) { $0 + ($1.pointCount + ppb - 1) / ppb }
             self.pinnedOrdered = pinned.sorted { $0.id.depth < $1.id.depth }.map(\.id)
         } else {
             self.pinnedIDs = []
-            self.pinnedBytes = 0
+            self.pinnedSlots = 0
             self.pinnedOrdered = []
         }
     }
@@ -1949,7 +2017,10 @@ actor StreamingDriver {
     func setViews(_ vs: [StreamingCameraView]) { latestViews = vs }
     /// Single-view convenience (used by tests and the single-camera path).
     func setView(_ v: StreamingCameraView) { latestViews = [v] }
-    func setBudget(_ b: Int) { budgetBytes = b }
+    /// Set the residency slot budget (max GPU slots the wanted set may occupy).
+    /// Slot-denominated so the wanted set physically fits the renderer's slot
+    /// pool. See ``budgetSlots`` / ``slotCost(_:)``.
+    func setBudget(slots: Int) { budgetSlots = slots }
 
     /// Retarget the screen-space-error scorer at runtime. Invalidates the
     /// wanted-set cache so the next tick re-scores against the new target;
@@ -2166,7 +2237,7 @@ actor StreamingDriver {
         let wantedOrdered: [ChunkID]
         let budgetLimited: Bool
         let wasCacheMiss: Bool
-        if cachedViews == views, cachedBudget == budgetBytes {
+        if cachedViews == views, cachedBudgetSlots == budgetSlots {
             wanted = cachedWanted
             wantedOrdered = cachedWantedSorted
             budgetLimited = cachedBudgetLimited
@@ -2174,12 +2245,12 @@ actor StreamingDriver {
             wantedCacheHits &+= 1
             wasCacheMiss = false
         } else {
-            let computed = computeWantedSet(views: views, budget: budgetBytes)
+            let computed = computeWantedSet(views: views, budget: budgetSlots)
             wanted = computed.set
             wantedOrdered = computed.ordered
             budgetLimited = computed.budgetLimited
             cachedViews = views
-            cachedBudget = budgetBytes
+            cachedBudgetSlots = budgetSlots
             cachedWanted = wanted
             cachedWantedSorted = wantedOrdered
             cachedBudgetLimited = budgetLimited
@@ -2283,7 +2354,14 @@ actor StreamingDriver {
         // drain, so we want to retry at the fast cadence and resume
         // promptly once the queue drains, rather than backing off while
         // genuinely busy.
-        let backlogCap = min(max(64 << 20, budgetBytes / 4), 512 << 20)
+        // Convert the slot budget back to an approximate host-memory figure to
+        // size the backlog cap (clamped to [64 MB, 512 MB]). Saturate to
+        // Int.max instead of trapping when the budget is effectively unbounded
+        // (`.max` slots): the clamp collapses it to 512 MB either way.
+        let budgetBytesApprox = budgetSlots
+            .multipliedReportingOverflow(by: pointsPerBatch * budgetBytesPerPoint)
+        let budgetBytesEquiv = budgetBytesApprox.overflow ? Int.max : budgetBytesApprox.partialValue
+        let backlogCap = min(max(64 << 20, budgetBytesEquiv / 4), 512 << 20)
         if queue.pendingAddedBytes >= backlogCap { publishSettle(); return true }
 
         var toLoad: [ChunkID] = []
@@ -2346,18 +2424,18 @@ actor StreamingDriver {
 
     private func computeWantedSet(views: [StreamingCameraView], budget: Int)
     -> (set: Set<ChunkID>, ordered: [ChunkID], budgetLimited: Bool) {
-        // Whole-file shortcut: if every node fits in the budget, every
+        // Whole-file shortcut: if every node's slots fit in the budget, every
         // node is wanted. Skip the frustum scan and sort entirely, but
         // produce a depth-ASC load order so coarse coverage arrives
         // before any leaf-depth detail during streaming-in.
-        if totalNodeBytes <= budget {
+        if totalNodeSlots <= budget {
             lastTickCandidates = nodes.count
             lastTickFrustumVisible = 0
             let ordered = nodes.sorted { $0.id.depth < $1.id.depth }.map(\.id)
             return (allNodeIDs, ordered, false)
         }
 
-        struct Scored { let id: ChunkID; let score: Float; let bytes: Int }
+        struct Scored { let id: ChunkID; let score: Float; let slots: Int }
         var visible: [Scored] = []
         var hidden: [Scored] = []
         visible.reserveCapacity(nodes.count)
@@ -2432,7 +2510,7 @@ actor StreamingDriver {
             for node in nodes {
                 var best: Float = 0
                 for e in evals { best = max(best, score(node, in: e)) }
-                visible.append(Scored(id: node.id, score: best, bytes: node.pointCount * budgetBytesPerPoint))
+                visible.append(Scored(id: node.id, score: best, slots: slotCost(node.pointCount)))
             }
         case .frustumFirstThenHalo:
             // Candidate if visible in ANY view; score = best over the views
@@ -2446,15 +2524,15 @@ actor StreamingDriver {
                     seen = true
                     best = max(best, score(node, in: e))
                 }
-                let bytes = node.pointCount * budgetBytesPerPoint
+                let slots = slotCost(node.pointCount)
                 if seen {
-                    visible.append(Scored(id: node.id, score: best, bytes: bytes))
+                    visible.append(Scored(id: node.id, score: best, slots: slots))
                 } else {
                     // Not in any frustum: halo candidate, scored by its best
                     // over all views (proximity, for filling leftover budget).
                     var haloBest: Float = 0
                     for e in evals { haloBest = max(haloBest, score(node, in: e)) }
-                    hidden.append(Scored(id: node.id, score: haloBest, bytes: bytes))
+                    hidden.append(Scored(id: node.id, score: haloBest, slots: slots))
                 }
             }
         }
@@ -2484,14 +2562,14 @@ actor StreamingDriver {
         if !pinnedIDs.isEmpty {
             wanted.formUnion(pinnedIDs)
             ordered.append(contentsOf: pinnedOrdered)
-            used += pinnedBytes
+            used += pinnedSlots
         }
 
         // Admit a candidate, keeping the wanted set closed under parent.
         //
         // With the invariant on, a candidate drags in its missing ancestor
-        // chain (root-first). Ancestors are charged to the budget first —
-        // they cover more area per byte — and the candidate's own level is
+        // chain (root-first). Ancestors are charged to the slot budget first —
+        // they cover more area per slot — and the candidate's own level is
         // only admitted if it still fits after them. When the full chain
         // won't fit, the longest root-anchored prefix that does fit is
         // admitted and the deeper tail is deferred (never admitted orphaned,
@@ -2501,9 +2579,9 @@ actor StreamingDriver {
         func admit(_ id: ChunkID) {
             if wanted.contains(id) { return }
             guard enforce else {
-                let b = nodeBytes(id)
-                if used + b <= budget {
-                    wanted.insert(id); ordered.append(id); used += b
+                let s = nodeSlots(id)
+                if used + s <= budget {
+                    wanted.insert(id); ordered.append(id); used += s
                 }
                 return
             }
@@ -2521,9 +2599,9 @@ actor StreamingDriver {
                 cur = c.parent
             }
             for node in chain.reversed() {   // root-first
-                let b = nodeBytes(node)
-                if used + b > budget { break }
-                wanted.insert(node); ordered.append(node); used += b
+                let s = nodeSlots(node)
+                if used + s > budget { break }
+                wanted.insert(node); ordered.append(node); used += s
             }
         }
 
@@ -2546,11 +2624,24 @@ actor StreamingDriver {
         return (wanted, ordered, budgetLimited)
     }
 
-    /// GPU byte cost of a single node's payload, or `0` if the node is not
-    /// in the hierarchy. Mirrors the `Scored.bytes` accounting.
-    private func nodeBytes(_ id: ChunkID) -> Int {
+    /// GPU slot cost of a single node's payload, or `0` if the node is not in
+    /// the hierarchy. Mirrors the `Scored.slots` accounting.
+    private func nodeSlots(_ id: ChunkID) -> Int {
         guard let idx = nodeIndexByID[id] else { return 0 }
-        return nodes[idx].pointCount * budgetBytesPerPoint
+        return slotCost(nodes[idx].pointCount)
+    }
+
+    /// Slots a node of `pointCount` points occupies in the renderer's GPU pool.
+    ///
+    /// The pool allocates whole `pointsPerBatch`-sized slots, so a node costs
+    /// `ceil(pointCount / pointsPerBatch)` slots — a partial final batch still
+    /// burns a full slot. Charging slots (rather than bytes) is what makes
+    /// "wanted set fits the pool" hold by construction: byte accounting was
+    /// systematically optimistic vs the pool because it ignored partial-batch
+    /// waste. A **0-point node costs 0 slots** (`ceil(0) == 0`), which keeps the
+    /// 0-point auto-resolve path in ``runOneTick()`` free of budget pressure.
+    private func slotCost(_ pointCount: Int) -> Int {
+        (pointCount + pointsPerBatch - 1) / pointsPerBatch
     }
 
     /// Decode + pack a single COPC node into a render-ready chunk.

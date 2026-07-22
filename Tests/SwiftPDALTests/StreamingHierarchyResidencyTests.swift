@@ -58,8 +58,13 @@ private func openFixtureReader() -> SendableCopcReader? {
     return SendableCopcReader(reader: reader)
 }
 
+/// `pointsPerBatch` defaults to the synthetic node point count (100) so each
+/// chain node costs exactly one GPU slot — this lets the slot budgets below
+/// read directly in "nodes", the way the old byte budgets read as multiples
+/// of a node's 1700-byte footprint. Override it to exercise partial-batch
+/// (`pointCount < pointsPerBatch`) slot rounding.
 private func makeDriver(
-    nodes: [NodeMeta], options: StreamingOptions
+    nodes: [NodeMeta], options: StreamingOptions, pointsPerBatch: Int = 100
 ) -> (StreamingDriver, UpdateQueue)? {
     guard let handle = openFixtureReader() else { return nil }
     let queue = UpdateQueue()
@@ -67,7 +72,7 @@ private func makeDriver(
     let driver = StreamingDriver(
         handle: handle, nodes: nodes, originShift: .zero,
         options: options, queue: queue, jobs: jobs,
-        budgetBytesPerPoint: 17, isRemote: false
+        budgetBytesPerPoint: 17, pointsPerBatch: pointsPerBatch, isRemote: false
     )
     return (driver, queue)
 }
@@ -128,22 +133,21 @@ private func chainOptions(
 // MARK: - Wanted-set admission (closure + budget deferral)
 
 @Test func hierarchy_wantedSet_closedUnderParent_andFitsBudget() async throws {
-    let bytesByID = Dictionary(uniqueKeysWithValues:
-        chainNodes().map { ($0.id, $0.pointCount * 17) })
+    // 100-pt nodes @ pointsPerBatch 100 → every node costs exactly 1 slot, so
+    // the root→leaf chain is 4 slots and the whole file (9 nodes) is 9 slots.
     guard let (driver, _) = makeDriver(nodes: chainNodes(), options: chainOptions())
     else { Issue.record("fixture reader unavailable"); return }
 
-    // Budget fits the full root→leaf chain (4 × 1700 = 6800) but not the
-    // whole file (9 × 1700 = 15300), so the scorer runs and the top-scored
-    // leaf drags in its ancestors.
-    let big = await driver._wantedSetForTest(view: chainView(), budget: 8000)
+    // Budget fits the full root→leaf chain (4 slots) but not the whole file
+    // (9 slots), so the scorer runs and the top-scored leaf drags in its
+    // ancestors. Sits exactly at the chain cost: a 5th node would overflow.
+    let big = await driver._wantedSetForTest(view: chainView(), budget: 4)
     #expect(big.set.contains(leaf),
             "the uniquely top-scored leaf should be admitted when its chain fits")
     #expect(big.set.contains(d0), "ancestors of an admitted leaf must be admitted too")
     #expect(firstUnclosed(big.set) == nil,
             "wanted set must be closed under parent (violation at \(String(describing: firstUnclosed(big.set)))")
-    let bigBytes = big.set.reduce(0) { $0 + (bytesByID[$1] ?? 0) }
-    #expect(bigBytes <= 8000, "admitted bytes (\(bigBytes)) must not exceed budget")
+    #expect(big.set.count <= 4, "admitted slots (\(big.set.count)) must not exceed the 4-slot budget")
     // `ordered` must list ancestors before descendants (load priority).
     var seen = Set<ChunkID>()
     for id in big.ordered {
@@ -155,23 +159,22 @@ private func chainOptions(
 }
 
 @Test func hierarchy_wantedSet_defersFineNodeWhenChainDoesNotFit() async throws {
-    let bytesByID = Dictionary(uniqueKeysWithValues:
-        chainNodes().map { ($0.id, $0.pointCount * 17) })
+    // 1 slot per node (see the fits-budget test).
     guard let (driver, _) = makeDriver(nodes: chainNodes(), options: chainOptions())
     else { Issue.record("fixture reader unavailable"); return }
 
-    // Budget fits only the root→depth-1 prefix (2 × 1700 = 3400), not the
-    // full chain to the leaf. The leaf must be deferred, never admitted
-    // orphaned, while the coarse ancestors it needs are admitted.
-    let small = await driver._wantedSetForTest(view: chainView(), budget: 5000)
+    // Budget fits only the root→depth-1 prefix (d0+d1 = 2 slots), not the full
+    // 4-slot chain to the leaf. Admission climbs root-first and stops when d2
+    // would push to 3 slots, so the leaf is deferred (never admitted orphaned)
+    // while the coarse ancestors it needs are admitted.
+    let small = await driver._wantedSetForTest(view: chainView(), budget: 2)
     #expect(!small.set.contains(leaf),
             "a leaf whose full ancestor chain doesn't fit must be deferred, not admitted")
     #expect(small.set.contains(d0),
             "the affordable coarse prefix should still be admitted (coverage first)")
     #expect(firstUnclosed(small.set) == nil,
             "deferring the leaf must keep the wanted set closed under parent")
-    let smallBytes = small.set.reduce(0) { $0 + (bytesByID[$1] ?? 0) }
-    #expect(smallBytes <= 5000, "admitted bytes (\(smallBytes)) must not exceed budget")
+    #expect(small.set.count <= 2, "admitted slots (\(small.set.count)) must not exceed the 2-slot budget")
 }
 
 // MARK: - Admission ordering (adversarial completeLoad, deepest-first)
@@ -181,7 +184,7 @@ private func chainOptions(
     else { Issue.record("fixture reader unavailable"); return }
 
     await driver.setView(chainView())
-    await driver.setBudget(8000)
+    await driver.setBudget(slots: 4)   // fits exactly the 4-slot chain, excludes siblings
     _ = await driver.runOneTick()   // schedules the chain into `inFlight`
 
     let scheduled = await driver._inFlightIDsForTest
@@ -223,7 +226,7 @@ private func chainOptions(
 
     // Phase 1: make the whole chain resident (feed root-first, cleanly).
     await driver.setView(chainView())
-    await driver.setBudget(8000)
+    await driver.setBudget(slots: 4)   // fits exactly the 4-slot chain
     _ = await driver.runOneTick()
     var believed = Set<ChunkID>()
     for id in [d0, d1, d2, leaf] {
@@ -235,7 +238,7 @@ private func chainOptions(
     // Phase 2: drop the budget to 0 so nothing is wanted, then tick until
     // the chain drains. Every published `removed` must list descendants
     // before ancestors and never free a node while a child is still resident.
-    await driver.setBudget(0)
+    await driver.setBudget(slots: 0)
     var sawRemoval = false
     for _ in 0..<12 {
         _ = await driver.runOneTick()
@@ -261,13 +264,51 @@ private func chainOptions(
         nodes: chainNodes(), options: chainOptions(enforce: false)
     ) else { Issue.record("fixture reader unavailable"); return }
 
-    // With enforcement off and a budget that fits only one node, the
+    // With enforcement off and a 1-slot budget (fits only one node), the
     // top-scored leaf is admitted alone — its ancestors are NOT dragged in,
     // so the set is not closed under parent (the pre-invariant behavior).
-    let w = await driver._wantedSetForTest(view: chainView(), budget: 2000)
+    let w = await driver._wantedSetForTest(view: chainView(), budget: 1)
     #expect(w.set.contains(leaf), "score-only admit should still take the top-scored leaf")
     #expect(!w.set.contains(d0),
             "with enforcement off, admitting the leaf must not pull in its ancestors")
+}
+
+// MARK: - Slot rounding (the migration this test suite was re-authored for)
+
+/// Pins the semantic the byte→slot migration exists for: residency is admitted
+/// in whole GPU slots, so a node holding FEWER points than `pointsPerBatch`
+/// occupies a partial final batch that still burns one whole slot. Under the
+/// old byte budget these small nodes were nearly free and the same budget
+/// admitted more of them; under slots each costs 1, so the budget clamps by
+/// node count, not by bytes.
+@Test func hierarchy_slotBudget_partialBatchNodeCostsFullSlot() async throws {
+    // pointsPerBatch (1000) >> the 100-pt nodes → every node is a *partial*
+    // batch, yet ceil(100/1000) == 1 slot each. The chain is still 4 slots.
+    let ppb = 1000
+    guard let (driver, _) = makeDriver(
+        nodes: chainNodes(), options: chainOptions(), pointsPerBatch: ppb
+    ) else { Issue.record("fixture reader unavailable"); return }
+
+    // 2-slot budget → only the root→depth-1 prefix (2 partial-batch nodes)
+    // fits; the leaf's chain (4 slots) is clamped out.
+    let w = await driver._wantedSetForTest(view: chainView(), budget: 2)
+
+    // Each admitted node cost a full slot despite being a partial batch:
+    // ceil(100/1000) == 1, so slot cost == node count.
+    let perNodeSlots = (100 + ppb - 1) / ppb
+    #expect(perNodeSlots == 1, "a 100-pt node in a 1000-pt batch must round up to one whole slot")
+    let slotsUsed = w.set.count * perNodeSlots
+    #expect(slotsUsed <= 2, "wanted set (\(slotsUsed) slots) must fit the 2-slot budget")
+    #expect(w.set.contains(d0), "coarse coverage is still admitted within budget")
+    #expect(!w.set.contains(leaf), "the leaf is clamped out — its chain needs 4 slots")
+
+    // The point: measured in bytes these nodes are tiny. All 9 nodes together
+    // are 9 × 100 × 17 = 15300 bytes; even the affordable prefix is only 3400.
+    // A byte budget sized to "2 batches" (2 × 1000 × 17 = 34000 bytes) would
+    // have admitted the whole chain and then some. Slots — not bytes — clamp.
+    let admittedBytes = w.set.count * 100 * 17
+    #expect(admittedBytes < 2 * ppb * 17,
+            "the admitted nodes' bytes (\(admittedBytes)) fit a 2-batch byte budget; slots still clamped them")
 }
 
 // MARK: - Env-gated real-file test
