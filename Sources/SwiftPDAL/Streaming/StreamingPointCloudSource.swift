@@ -2287,13 +2287,32 @@ actor StreamingDriver {
         if queue.pendingAddedBytes >= backlogCap { publishSettle(); return true }
 
         var toLoad: [ChunkID] = []
+        var markedEmpty = false
         toLoad.reserveCapacity(options.maxInFlightLoads)
         for id in wantedOrdered {
-            if toLoad.count == options.maxInFlightLoads { break }
             if resident[id] != nil { continue }
             if inFlight.contains(id) { continue }
+            // A 0-point node carries no geometry: `read_node` returns 0 points, so
+            // `decodeAndPack` yields nil and the node can never become resident via
+            // the normal decode path. Left alone it blocks the "all wanted
+            // resident" settle check forever AND orphans its real children in
+            // `pendingResident` (they wait for this parent to land). Resolve it up
+            // front instead of scheduling a decode that returns nil every tick:
+            // mark it resident with an empty entry (publishes no queue delta, so
+            // the consumer has nothing to upload) so the settle check passes and
+            // `flushPending` releases its held children. Done regardless of the
+            // `maxInFlightLoads` cap since it schedules no decode work.
+            if let idx = nodeIndexByID[id], nodes[idx].pointCount == 0 {
+                markResident(id)
+                markedEmpty = true
+                continue
+            }
+            if toLoad.count == options.maxInFlightLoads { continue }
             toLoad.append(id)
         }
+        // Newly-resident empties may have unblocked children queued in
+        // `pendingResident` — release them before publishing this tick's settle.
+        if markedEmpty { flushPending() }
         if toLoad.isEmpty {
             // Nothing new to schedule this tick — still "active" if the
             // wanted set changed, something was evicted, or wanted chunks
@@ -2301,7 +2320,7 @@ actor StreamingDriver {
             // or still decoding). Only a pure no-op tick backs off.
             let pendingWantedWork = wanted.contains { resident[$0] == nil }
             publishSettle()
-            return wasCacheMiss || !tickRemoved.isEmpty || pendingWantedWork
+            return wasCacheMiss || !tickRemoved.isEmpty || markedEmpty || pendingWantedWork
         }
         for id in toLoad { inFlight.insert(id) }
         statsBox.scheduled(toLoad.count)
