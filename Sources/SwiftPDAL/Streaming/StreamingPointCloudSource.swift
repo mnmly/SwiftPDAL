@@ -903,6 +903,28 @@ public protocol StreamingPointCloudSource: AnyObject, Sendable {
     /// the budget allows is resident, but more is visible" — raise the budget to
     /// cover the rest. Default `false`.
     var residencyBudgetLimited: Bool { get }
+
+    /// Pre-clamp residency **demand** in GPU slots: the total slot cost of the
+    /// current view set's candidate nodes, measured each score pass *before* the
+    /// slot budget clamps the wanted set. This is the source's unclamped appetite
+    /// for the current camera(s) — what the wanted set would cost if the budget
+    /// were unbounded — expressed in the same whole-slot unit as
+    /// ``setBudget(slots:)`` (a node costs `ceil(pointCount / pointsPerBatch)`).
+    ///
+    /// A node counts toward demand when it is a frustum-visible candidate (every
+    /// node under ``ResidencyPolicy/distanceOnly`` and the whole-file shortcut,
+    /// where all nodes are candidates). A source whose clouds are entirely out of
+    /// every submitted frustum reports `0`; a source in view reports its full
+    /// on-screen appetite. Because demand is measured *before* the budget clamp,
+    /// it does **not** move when the budget changes — granting a source more
+    /// budget changes its resident/wanted set but never its reported demand.
+    ///
+    /// This makes it the stable weight for a host budget governor that divides a
+    /// global streaming budget across several sources *proportionally to demand*:
+    /// the four huge in-view clouds report large demand and win most of the
+    /// budget, while the many small/out-of-frustum clouds report little and cede
+    /// their share. `0` until the first score pass completes. Default `0`.
+    var residencyDemandSlots: Int { get }
 }
 
 public extension StreamingPointCloudSource {
@@ -942,6 +964,10 @@ public extension StreamingPointCloudSource {
     /// Default: non-streaming sources are never budget-limited. See
     /// ``residencyBudgetLimited``.
     var residencyBudgetLimited: Bool { false }
+
+    /// Default: non-streaming sources report no demand (nothing to govern). See
+    /// ``residencyDemandSlots``.
+    var residencyDemandSlots: Int { 0 }
 }
 
 // MARK: - Node metadata snapshot
@@ -1173,25 +1199,33 @@ final class ResidencySettleBox: @unchecked Sendable {
     private var budgetLimited = false
     private var wanted = 0
     private var resident = 0
+    /// Pre-clamp residency *demand* in GPU slots: the total slot cost of the
+    /// current view set's candidate nodes, computed each score pass BEFORE the
+    /// slot budget clamps the wanted set. Published here (mirroring the settle
+    /// snapshot) so a host budget governor can read it synchronously off the
+    /// render/main thread. See ``CopcStreamingPointCloudSource/residencyDemandSlots``.
+    private var demandSlots = 0
 
     /// Called on `submit(view/views:)` so the next `isSettled` read reflects the
     /// new target, not the stale one, until a tick re-publishes.
     func markUnsettled() { lock.withLock { settled = false } }
 
     /// Published by the driver at the end of each tick.
-    func update(settled: Bool, budgetLimited: Bool, wanted: Int, resident: Int) {
+    func update(settled: Bool, budgetLimited: Bool, wanted: Int, resident: Int, demandSlots: Int) {
         lock.withLock {
             self.settled = settled
             self.budgetLimited = budgetLimited
             self.wanted = wanted
             self.resident = resident
+            self.demandSlots = demandSlots
         }
     }
 
     var isSettled: Bool { lock.withLock { settled } }
     var isBudgetLimited: Bool { lock.withLock { budgetLimited } }
-    func snapshot() -> (settled: Bool, budgetLimited: Bool, wanted: Int, resident: Int) {
-        lock.withLock { (settled, budgetLimited, wanted, resident) }
+    var demand: Int { lock.withLock { demandSlots } }
+    func snapshot() -> (settled: Bool, budgetLimited: Bool, wanted: Int, resident: Int, demand: Int) {
+        lock.withLock { (settled, budgetLimited, wanted, resident, demandSlots) }
     }
 }
 
@@ -1922,6 +1956,7 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
 
     public var isResidencySettled: Bool { settleBox.isSettled }
     public var residencyBudgetLimited: Bool { settleBox.isBudgetLimited }
+    public var residencyDemandSlots: Int { settleBox.demand }
 
     public func setBudget(_ bytes: Int) {
         // A budget change can grow the wanted set, so treat it like a resubmit:
@@ -2212,6 +2247,11 @@ actor StreamingDriver {
     /// phase sees patchy leaves before the root arrives.
     private var cachedWantedSorted: [ChunkID] = []
     private var cachedCandidates: Int = 0
+    /// Pre-clamp demand (total candidate slot cost) from the last score pass.
+    /// Cached alongside the wanted set so a cache-hit tick republishes the same
+    /// demand to the settle box without re-scoring. See
+    /// ``CopcStreamingPointCloudSource/residencyDemandSlots``.
+    private var cachedDemandSlots: Int = 0
 
     init(
         handle: SendableCopcReader,
@@ -2452,9 +2492,11 @@ actor StreamingDriver {
         return (r.set, r.ordered)
     }
 
-    /// Multi-view variant of ``_wantedSetForTest(view:budget:)``.
+    /// Multi-view variant of ``_wantedSetForTest(view:budget:)``. Also surfaces
+    /// the pre-clamp ``demand`` so a governance test can assert demand-vs-budget
+    /// behaviour without a live driver tick.
     func _wantedSetForTest(views: [StreamingCameraView], budget: Int)
-    -> (set: Set<ChunkID>, ordered: [ChunkID], budgetLimited: Bool) {
+    -> (set: Set<ChunkID>, ordered: [ChunkID], budgetLimited: Bool, demand: Int) {
         computeWantedSet(views: views, budget: budget)
     }
     var _residentIDsForTest: Set<ChunkID> { Set(resident.keys) }
@@ -2472,8 +2514,10 @@ actor StreamingDriver {
         if closed { return false }
         guard !latestViews.isEmpty else {
             // No target submitted → nothing wanted → trivially settled, so a
-            // pre-roll that (defensively) submitted no views never spins.
-            settleBox.update(settled: true, budgetLimited: false, wanted: 0, resident: resident.count)
+            // pre-roll that (defensively) submitted no views never spins. No
+            // views → no candidates → zero demand.
+            settleBox.update(settled: true, budgetLimited: false, wanted: 0,
+                             resident: resident.count, demandSlots: 0)
             return false
         }
         let views = latestViews
@@ -2483,11 +2527,13 @@ actor StreamingDriver {
         let wanted: Set<ChunkID>
         let wantedOrdered: [ChunkID]
         let budgetLimited: Bool
+        let demand: Int
         let wasCacheMiss: Bool
         if cachedViews == views, cachedBudgetSlots == budgetSlots {
             wanted = cachedWanted
             wantedOrdered = cachedWantedSorted
             budgetLimited = cachedBudgetLimited
+            demand = cachedDemandSlots
             lastTickCandidates = cachedCandidates
             wantedCacheHits &+= 1
             wasCacheMiss = false
@@ -2496,11 +2542,13 @@ actor StreamingDriver {
             wanted = computed.set
             wantedOrdered = computed.ordered
             budgetLimited = computed.budgetLimited
+            demand = computed.demand
             cachedViews = views
             cachedBudgetSlots = budgetSlots
             cachedWanted = wanted
             cachedWantedSorted = wantedOrdered
             cachedBudgetLimited = budgetLimited
+            cachedDemandSlots = demand
             cachedCandidates = lastTickCandidates
             wantedCacheMisses &+= 1
             wasCacheMiss = true
@@ -2517,7 +2565,8 @@ actor StreamingDriver {
         func publishSettle() {
             let settled = inFlight.isEmpty && !wanted.contains { resident[$0] == nil }
             settleBox.update(settled: settled, budgetLimited: budgetLimited,
-                             wanted: wanted.count, resident: resident.count)
+                             wanted: wanted.count, resident: resident.count,
+                             demandSlots: demand)
         }
 
         var tickRemoved: [ChunkID] = []
@@ -2670,16 +2719,17 @@ actor StreamingDriver {
     }
 
     private func computeWantedSet(views: [StreamingCameraView], budget: Int)
-    -> (set: Set<ChunkID>, ordered: [ChunkID], budgetLimited: Bool) {
+    -> (set: Set<ChunkID>, ordered: [ChunkID], budgetLimited: Bool, demand: Int) {
         // Whole-file shortcut: if every node's slots fit in the budget, every
         // node is wanted. Skip the frustum scan and sort entirely, but
         // produce a depth-ASC load order so coarse coverage arrives
-        // before any leaf-depth detail during streaming-in.
+        // before any leaf-depth detail during streaming-in. Every node is a
+        // candidate here, so the pre-clamp demand is the whole file's slot cost.
         if totalNodeSlots <= budget {
             lastTickCandidates = nodes.count
             lastTickFrustumVisible = 0
             let ordered = nodes.sorted { $0.id.depth < $1.id.depth }.map(\.id)
-            return (allNodeIDs, ordered, false)
+            return (allNodeIDs, ordered, false, totalNodeSlots)
         }
 
         struct Scored { let id: ChunkID; let score: Float; let slots: Int }
@@ -2751,13 +2801,27 @@ actor StreamingDriver {
             return 1 / (1 + err)
         }
 
+        // Pre-clamp demand: total slot cost of the candidate set that could feed
+        // the wanted set BEFORE the budget clamps it — the frustum-visible nodes
+        // (every node under .distanceOnly and the whole-file shortcut above). The
+        // off-frustum halo is opportunistic leftover-budget fill, not appetite
+        // the camera is actually asking for, so it is deliberately excluded: a
+        // source with nothing in any submitted frustum reports demand 0 and a
+        // host governor hands it only the floor. Accumulated here for near-zero
+        // extra cost (we already touch every candidate to score it). Pinned
+        // always-resident nodes are a niche feature and are not added — demand
+        // tracks the view set's appetite, and pinned coverage is charged to the
+        // budget independently.
+        var demandSlots = 0
         switch options.residencyPolicy {
         case .distanceOnly:
             // No frustum gate — everything is a candidate; score = best over views.
             for node in nodes {
                 var best: Float = 0
                 for e in evals { best = max(best, score(node, in: e)) }
-                visible.append(Scored(id: node.id, score: best, slots: slotCost(node.pointCount)))
+                let slots = slotCost(node.pointCount)
+                demandSlots += slots
+                visible.append(Scored(id: node.id, score: best, slots: slots))
             }
         case .frustumFirstThenHalo:
             // Candidate if visible in ANY view; score = best over the views
@@ -2773,6 +2837,7 @@ actor StreamingDriver {
                 }
                 let slots = slotCost(node.pointCount)
                 if seen {
+                    demandSlots += slots
                     visible.append(Scored(id: node.id, score: best, slots: slots))
                 } else {
                     // Not in any frustum: halo candidate, scored by its best
@@ -2868,7 +2933,7 @@ actor StreamingDriver {
             for c in hidden { admit(c.id) }
         }
 
-        return (wanted, ordered, budgetLimited)
+        return (wanted, ordered, budgetLimited, demandSlots)
     }
 
     /// GPU slot cost of a single node's payload, or `0` if the node is not in

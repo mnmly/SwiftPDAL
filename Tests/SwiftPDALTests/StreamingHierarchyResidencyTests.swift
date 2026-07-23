@@ -177,6 +177,32 @@ private func chainOptions(
     #expect(small.set.count <= 2, "admitted slots (\(small.set.count)) must not exceed the 2-slot budget")
 }
 
+// MARK: - Pre-clamp residency demand
+
+@Test func residencyDemand_reportsUnclampedAppetite() async throws {
+    // 9 nodes @ 1 slot each (100-pt nodes, pointsPerBatch 100) → the whole file
+    // is 9 slots. `.distanceOnly` (chainOptions default) makes every node a
+    // candidate, so the pre-clamp demand is the full 9 slots regardless of the
+    // budget the wanted set is clamped to.
+    guard let (driver, _) = makeDriver(nodes: chainNodes(), options: chainOptions())
+    else { Issue.record("fixture reader unavailable"); return }
+
+    // Unclamped: budget covers the whole file (whole-file shortcut). Demand
+    // equals the wanted set's cost — everything the camera wants is admitted.
+    let unclamped = await driver._wantedSetForTest(views: [chainView()], budget: 9)
+    #expect(unclamped.demand == 9, "unclamped demand should equal the whole-file slot cost")
+    #expect(unclamped.set.count == unclamped.demand,
+            "unclamped, the wanted set cost (\(unclamped.set.count)) should equal demand (\(unclamped.demand))")
+
+    // Clamped: budget admits only 4 of the 9 candidate slots. Demand still
+    // reports the full pre-clamp appetite (9), strictly above the budget — this
+    // is the grant-independent weight a host governor divides a global budget by.
+    let clamped = await driver._wantedSetForTest(views: [chainView()], budget: 4)
+    #expect(clamped.demand == 9, "clamped demand must stay at the pre-clamp appetite (9), not the budget")
+    #expect(clamped.demand > 4, "demand should exceed the clamping budget")
+    #expect(clamped.set.count <= 4, "the clamped wanted set (\(clamped.set.count)) must fit the 4-slot budget")
+}
+
 // MARK: - Admission ordering (adversarial completeLoad, deepest-first)
 
 @Test func hierarchy_publishedAdded_parentBeforeChild_underOutOfOrderDecodes() async throws {
