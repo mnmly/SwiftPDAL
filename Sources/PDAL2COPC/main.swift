@@ -2,12 +2,17 @@
 // XYZ/TXT, …) into a Cloud-Optimized Point Cloud (`*.copc.laz`), and
 // write a STAC sidecar JSON (`<output>.json`) alongside it.
 //
-//   swift run -c release PDAL2COPC <input> [output.copc.laz] [--no-sidecar]
+//   swift run -c release PDAL2COPC <input> [output.copc.laz]
+//                                  [--scale <metres>] [--no-sidecar]
 //
 // The reader driver is inferred from the input extension; the writer is
 // always `writers.copc` with `extra_dims: "all"` so custom per-point
 // dimensions survive the round-trip. When the output path is omitted it
 // is derived as `<input-stem>.copc.laz` next to the input.
+//
+// `--scale` sets the LAS coordinate quantum (default 1 mm). PDAL's own
+// default is 1 cm, which is coarse enough to collapse a dense scan onto a
+// visible cubic lattice — see ConvertOptions.coordinateScale.
 //
 // Per-dimension statistics are computed in the same streaming pass (via
 // `filters.stats`, no extra read of the source) and written as a STAC
@@ -22,15 +27,41 @@ struct PDAL2COPC {
     static func main() {
         var positional: [String] = []
         var writeSidecar = true
+        // Coordinate quantum in source units. LAS stores X/Y/Z as Int32
+        // multiples of this, so it is the file's precision floor; PDAL's
+        // own default of 1 cm visibly lattices architectural scans.
+        var scale = ConvertOptions.defaultCoordinateScale
+        var expectingScale = false
         for arg in CommandLine.arguments.dropFirst() {
+            if expectingScale {
+                expectingScale = false
+                guard let v = Double(arg), v > 0 else {
+                    print("--scale expects a positive number in source units, got '\(arg)'")
+                    exit(2)
+                }
+                scale = v
+                continue
+            }
             switch arg {
             case "--no-sidecar": writeSidecar = false
+            case "--scale":      expectingScale = true
+            case _ where arg.hasPrefix("--scale="):
+                let raw = String(arg.dropFirst("--scale=".count))
+                guard let v = Double(raw), v > 0 else {
+                    print("--scale expects a positive number in source units, got '\(raw)'")
+                    exit(2)
+                }
+                scale = v
             default:             positional.append(arg)
             }
         }
+        if expectingScale {
+            print("--scale expects a value")
+            exit(2)
+        }
 
         guard let first = positional.first else {
-            print("usage: PDAL2COPC <input> [output.copc.laz] [--no-sidecar]")
+            print("usage: PDAL2COPC <input> [output.copc.laz] [--scale <metres>] [--no-sidecar]")
             exit(2)
         }
 
@@ -43,6 +74,7 @@ struct PDAL2COPC {
 
         print("input:   \(input.path)")
         print("output:  \(output.path)")
+        print("scale:   \(scale) (coordinate quantum, source units)")
         if writeSidecar { print("sidecar: \(sidecar.path)") }
 
         let start = Date()
@@ -52,6 +84,8 @@ struct PDAL2COPC {
             // "all"` keeps non-standard dimensions; without it the
             // LAS-family writer silently drops them.
             writer: PDALStage("writers.copc", ["extra_dims": .string("all")]),
+            // `scale_x/y/z` (+ `offset_*: auto`) are stamped onto the writer
+            // above from `coordinateScale`; see ConvertOptions.
             onProgress: { p in
                 if let f = p.fraction {
                     let pct = Int(f * 100)
@@ -62,7 +96,8 @@ struct PDAL2COPC {
                     }
                 }
                 return true
-            }
+            },
+            coordinateScale: scale
         )
 
         do {

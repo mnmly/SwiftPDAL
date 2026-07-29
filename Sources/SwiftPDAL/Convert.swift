@@ -168,13 +168,43 @@ public struct ConvertOptions: @unchecked Sendable {
     /// heuristic (file-size ÷ average-line-bytes) for headerless ASCII.
     public var pointTotalHint: UInt64?
 
+    /// Coordinate quantum, in the output CRS's units, for LAS-family
+    /// writers (`writers.las`, `writers.copc`).
+    ///
+    /// LAS stores X/Y/Z as `Int32` multiples of a per-file scale, so the
+    /// scale *is* the smallest representable coordinate difference.
+    /// PDAL's own default is `0.01` — a 1 cm lattice, which visibly
+    /// quantizes terrestrial and architectural scans (dense scans collapse
+    /// to a few per cent distinct positions, and the resulting periodic
+    /// lattice moirés against a pixel grid). SwiftPDAL defaults to
+    /// ``ConvertOptions/defaultCoordinateScale`` (1 mm) instead.
+    ///
+    /// Applied to whichever writer ends up in the pipeline — inferred or
+    /// supplied via ``writer`` — but never overriding a `scale_x`/`scale_y`/
+    /// `scale_z` the caller set explicitly on that stage. Alongside the
+    /// scale, `offset_x/y/z` are set to `"auto"` (again only when unset) so
+    /// the `Int32` range covers the data's *extent* rather than its distance
+    /// from the origin; without that, a 1 mm scale caps absolute coordinates
+    /// at ±2147 km and would overflow for a far-from-origin projected CRS.
+    ///
+    /// Set to `nil` to write nothing and inherit PDAL's defaults.
+    public var coordinateScale: Double?
+
+    /// 1 mm — SwiftPDAL's default LAS-family coordinate quantum.
+    ///
+    /// Chosen as the finest scale that still leaves five orders of magnitude
+    /// of `Int32` headroom (±2147 km of extent) while resolving well below
+    /// any real scanner's noise floor.
+    public static let defaultCoordinateScale: Double = 0.001
+
     public init(reader: PDALStage? = nil,
                 filters: [PDALStage] = [],
                 writer: PDALStage? = nil,
                 streaming: Bool = true,
                 streamingChunkSize: Int = 10_000,
                 onProgress: ((ConvertProgress) -> Bool)? = nil,
-                pointTotalHint: UInt64? = nil)
+                pointTotalHint: UInt64? = nil,
+                coordinateScale: Double? = ConvertOptions.defaultCoordinateScale)
     {
         self.reader = reader
         self.filters = filters
@@ -183,6 +213,7 @@ public struct ConvertOptions: @unchecked Sendable {
         self.streamingChunkSize = streamingChunkSize
         self.onProgress = onProgress
         self.pointTotalHint = pointTotalHint
+        self.coordinateScale = coordinateScale
     }
 }
 
@@ -292,13 +323,14 @@ public enum PDALConvert {
         } else {
             reader = try inferReaderStage(for: input)
         }
-        let writer: PDALStage
+        var writer: PDALStage
         if let w = options.writer {
             writer = w
         } else {
             writer = PDALStage(try inferWriterDriver(for: output),
                                writerExtras(for: output))
         }
+        writer = applyingCoordinateScale(options.coordinateScale, to: writer)
 
         var stages: [[String: Any]] = []
         stages.append(reader.jsonDict(adding: ["filename": .string(input.path)]))
@@ -399,13 +431,14 @@ public enum PDALConvert {
         // the driver type + a flat `key=value\n`-separated bag of
         // options. PDAL's Option coerces these strings to whatever
         // each writer expects.
-        let writer: PDALStage
+        var writer: PDALStage
         if let w = options.writer {
             writer = w
         } else {
             writer = PDALStage(try inferWriterDriver(for: output),
                                writerExtras(for: output))
         }
+        writer = applyingCoordinateScale(options.coordinateScale, to: writer)
         let writerType = writer.type
         let writerOptsKV: String = writer.options
             .filter { $0.key != "filename" }
@@ -742,6 +775,43 @@ public enum PDALConvert {
         default:
             return [:]
         }
+    }
+
+    /// Stamp ``ConvertOptions/coordinateScale`` onto a LAS-family writer
+    /// stage. Non-LAS writers and explicitly-set `scale_*`/`offset_*`
+    /// options are left untouched, so this can be applied unconditionally.
+    ///
+    /// The C++ E57 bridge takes the same stage as flat `key=value` strings
+    /// and hands them to `pdal::Options`, so the values are written as
+    /// strings on both paths — PDAL's COPC/LAS writers declare `scale_*`
+    /// and `offset_*` as string-valued header options (`"auto"` is a legal
+    /// value) and coerce to `double` when consuming them.
+    static func applyingCoordinateScale(_ scale: Double?,
+                                        to writer: PDALStage) -> PDALStage {
+        guard let scale, scale > 0,
+              writer.type == "writers.las" || writer.type == "writers.copc"
+        else { return writer }
+
+        var out = writer
+        let scaleText = PDALValue.string(fixedNotation(scale))
+        for axis in ["x", "y", "z"] {
+            if out.options["scale_\(axis)"] == nil {
+                out.options["scale_\(axis)"] = scaleText
+            }
+            if out.options["offset_\(axis)"] == nil {
+                out.options["offset_\(axis)"] = .string("auto")
+            }
+        }
+        return out
+    }
+
+    /// Decimal (never exponential) rendering of a scale factor. PDAL parses
+    /// either form, but `1e-05` in a header-option string is easy to
+    /// misread in logs and pipeline dumps.
+    private static func fixedNotation(_ v: Double) -> String {
+        let plain = String(v)
+        guard plain.contains("e") || plain.contains("E") else { return plain }
+        return String(format: "%.15f", v)
     }
 
     private static func swiftStringFromCxx(_ s: std.string) -> String {

@@ -34,6 +34,10 @@ struct SidecarTool {
         let start = Date()
         var lastPct = -1
         let opts = ConvertOptions(
+            // Inherits `coordinateScale` (1 mm) like every other convert,
+            // so the throwaway re-encode matches what PDAL2COPC would
+            // produce. Stats come from `filters.stats` upstream of the
+            // writer, so the scale doesn't affect the sidecar either way.
             writer: PDALStage("writers.copc"),
             onProgress: { p in
                 if let f = p.fraction {

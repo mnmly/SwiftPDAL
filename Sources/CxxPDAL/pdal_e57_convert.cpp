@@ -87,9 +87,12 @@ inline void applyScanPose(float* x, float* y, float* z, size_t n,
 {
     // Precompute rotation matrix from quaternion. The doubles let us
     // preserve scan-to-world precision; result is cast to float on
-    // store. For large coordinates we'd need a global translation —
-    // writers.copc applies its own offset/scale so leaving the values
-    // in source space is fine.
+    // store. Leaving the values in source space is fine for *range*:
+    // writers.copc re-bases them onto its own offset. It is NOT fine for
+    // *precision* — the writer's scale defaults to 1 cm and silently
+    // quantizes everything we computed here, so the caller must pass
+    // scale_x/y/z explicitly (SwiftPDAL does, via
+    // ConvertOptions.coordinateScale).
     const double m00 = 1 - 2*(qy*qy + qz*qz);
     const double m01 =     2*(qx*qy - qz*qw);
     const double m02 =     2*(qx*qz + qy*qw);

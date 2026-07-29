@@ -209,3 +209,106 @@ import Foundation
     #expect(try header(rows6lf,   "rgb_lf.xyz")   == "X Y Z Red Green Blue")
     #expect(try header(rows3crlf, "plain_crlf.xyz") == "X Y Z")
 }
+
+// MARK: - Coordinate scale
+
+/// LAS public-header block: `scale_x/y/z` at byte 131, `offset_x/y/z` at
+/// byte 155, both as three little-endian doubles. Reading them directly
+/// keeps the assertion independent of whatever reader we'd otherwise use
+/// to inspect the file.
+private func lasScaleAndOffset(_ url: URL) throws -> (scale: (Double, Double, Double),
+                                                      offset: (Double, Double, Double)) {
+    let handle = try FileHandle(forReadingFrom: url)
+    defer { try? handle.close() }
+    guard let head = try handle.read(upToCount: 400), head.count >= 179 else {
+        throw ConvertError.cannotInferDriver("short LAS header in \(url.lastPathComponent)")
+    }
+    #expect(head.prefix(4) == Data("LASF".utf8))
+    func double(at byte: Int) -> Double {
+        head.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: byte, as: Double.self) }
+    }
+    return ((double(at: 131), double(at: 139), double(at: 147)),
+            (double(at: 155), double(at: 163), double(at: 171)))
+}
+
+/// LAS quantizes X/Y/Z onto an `Int32` lattice of `scale_*` units, and
+/// PDAL's default of 1 cm is coarse enough to collapse a dense scan onto a
+/// visible cubic grid (which then moirés against the pixel grid under camera
+/// motion). SwiftPDAL defaults to 1 mm instead. Regression for
+/// ``ConvertOptions/coordinateScale`` reaching both writer families.
+@Test func convertDefaultsToMillimetreCoordinateScale() async throws {
+    setenv("SWIFTPDAL_TESTING", "1", 1)
+    guard let input = Bundle.module.path(forResource: "test", ofType: "laz") else {
+        Issue.record("test.laz missing from bundle"); return
+    }
+    let inputURL = URL(fileURLWithPath: input)
+
+    // `.copc.laz` (writers.copc, non-streamable — buffers and computes true
+    // bounds) and plain `.laz` (writers.las, streams).
+    for (suffix, streaming) in [("copc.laz", false), ("laz", true)] {
+        let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("scale-\(UUID().uuidString).\(suffix)")
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+
+        let writer: PDALStage? = suffix == "copc.laz"
+            ? PDALStage("writers.copc", ["extra_dims": .string("all")])
+            : nil
+        _ = try PDALConvert.convert(from: inputURL, to: outputURL,
+                                    options: .init(writer: writer, streaming: streaming))
+
+        let (scale, offset) = try lasScaleAndOffset(outputURL)
+        #expect(scale == (0.001, 0.001, 0.001), "\(suffix): got scale \(scale)")
+        // `offset_*: auto` re-bases onto the data, so the Int32 range covers
+        // the extent rather than the distance from the origin. test.laz sits
+        // at ~114 km easting; a 1 mm scale with offset 0 would still fit, but
+        // a UTM northing would not.
+        #expect(offset.0 != 0 && offset.1 != 0, "\(suffix): expected auto offset, got \(offset)")
+    }
+}
+
+/// The scale is a knob, not a constant: an explicit value wins, `nil`
+/// restores PDAL's own default, and a `scale_x` already set on a
+/// caller-supplied writer stage is never overwritten.
+@Test func convertCoordinateScaleIsOverridable() async throws {
+    setenv("SWIFTPDAL_TESTING", "1", 1)
+    guard let input = Bundle.module.path(forResource: "test", ofType: "laz") else {
+        Issue.record("test.laz missing from bundle"); return
+    }
+    let inputURL = URL(fileURLWithPath: input)
+
+    func scaleOfConversion(_ options: ConvertOptions) throws -> (Double, Double, Double) {
+        let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("scaleopt-\(UUID().uuidString).laz")
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+        _ = try PDALConvert.convert(from: inputURL, to: outputURL, options: options)
+        return try lasScaleAndOffset(outputURL).scale
+    }
+
+    #expect(try scaleOfConversion(.init(coordinateScale: 0.005)) == (0.005, 0.005, 0.005))
+    // nil = inherit PDAL, which is 1 cm.
+    #expect(try scaleOfConversion(.init(coordinateScale: nil)) == (0.01, 0.01, 0.01))
+    // Explicit stage options win over `coordinateScale`.
+    let explicit = ConvertOptions(
+        writer: PDALStage("writers.las", ["compression": .string("laszip"),
+                                          "scale_x": .string("0.02"),
+                                          "scale_y": .string("0.02"),
+                                          "scale_z": .string("0.02")]),
+        coordinateScale: 0.001)
+    #expect(try scaleOfConversion(explicit) == (0.02, 0.02, 0.02))
+}
+
+/// `coordinateScale` must not leak onto writers that have no LAS header.
+@Test func coordinateScaleOnlyTouchesLASFamilyWriters() throws {
+    let ply = PDALConvert.applyingCoordinateScale(0.001, to: PDALStage("writers.ply"))
+    #expect(ply.options.isEmpty)
+
+    let copc = PDALConvert.applyingCoordinateScale(0.001, to: PDALStage("writers.copc"))
+    #expect(copc.options.count == 6)
+    if case .string(let s)? = copc.options["scale_z"] { #expect(s == "0.001") }
+    else { Issue.record("scale_z missing or not a string: \(copc.options)") }
+    if case .string(let o)? = copc.options["offset_y"] { #expect(o == "auto") }
+    else { Issue.record("offset_y missing or not a string: \(copc.options)") }
+
+    // Disabled: nothing stamped at all.
+    #expect(PDALConvert.applyingCoordinateScale(nil, to: PDALStage("writers.las")).options.isEmpty)
+}
