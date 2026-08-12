@@ -142,6 +142,51 @@ public struct StreamingSourceInfo: Sendable {
     /// (`4 * requestedDimensionCount`), accounted separately from
     /// ``bytesPerPoint``. `0` when no extra dimensions were requested.
     public let extraBytesPerPoint: Int
+    /// Node count at each octree depth (`nodesAtDepth[0]` = the root level).
+    /// Length is `maxDepth + 1`; empty when the producer didn't supply it
+    /// (a mock built through the memberwise init's default).
+    public let nodesAtDepth: [Int]
+    /// Slot footprint of the nodes at each octree depth: `slotsAtDepth[d]` is
+    /// `Σ ceil(node.pointCount / pointsPerBatch)` over every node at depth `d`,
+    /// the granularity ``StreamingPointCloudSource/setBudget(slots:)`` charges
+    /// in. Length is `maxDepth + 1`; empty when the producer didn't supply it.
+    ///
+    /// Together with ``slotsThroughDepth(_:)`` this lets a host size a GPU pool
+    /// for a *depth-limited* pin (see
+    /// ``StreamingOptions/alwaysResidentDepth``) from the pinned set's real
+    /// footprint instead of the whole hierarchy's — on a deep scan the two
+    /// differ by two orders of magnitude.
+    public let slotsAtDepth: [Int]
+
+    /// Slot footprint of every node with `depth <= depth` — the exact pool cost
+    /// of pinning at that depth. `nil` when ``slotsAtDepth`` is empty (the
+    /// source didn't publish a histogram, so there is no basis to answer).
+    ///
+    /// Depths above ``maxDepth`` clamp to the whole hierarchy, matching
+    /// ``StreamingOptions/alwaysResidentDepth``'s "pins every node" behavior;
+    /// a negative depth is `0` (nothing pinned).
+    public func slotsThroughDepth(_ depth: Int) -> Int? {
+        guard !slotsAtDepth.isEmpty else { return nil }
+        guard depth >= 0 else { return 0 }
+        return slotsAtDepth.prefix(depth + 1).reduce(0, +)
+    }
+
+    /// Node count at `depth <= depth`, on the same contract as
+    /// ``slotsThroughDepth(_:)``.
+    public func nodesThroughDepth(_ depth: Int) -> Int? {
+        guard !nodesAtDepth.isEmpty else { return nil }
+        guard depth >= 0 else { return 0 }
+        return nodesAtDepth.prefix(depth + 1).reduce(0, +)
+    }
+
+    /// Slot footprint of the whole hierarchy — what a fully-resident file
+    /// costs. `nil` when ``slotsAtDepth`` is empty.
+    ///
+    /// Strictly greater than `ceil(totalPoints / pointsPerBatch)` whenever any
+    /// node's final batch is partial, which on real scans is every node.
+    public var totalSlots: Int? {
+        slotsAtDepth.isEmpty ? nil : slotsAtDepth.reduce(0, +)
+    }
 
     /// Create source metadata.
     ///
@@ -160,6 +205,11 @@ public struct StreamingSourceInfo: Sendable {
     ///   - availableDimensions: Per-point dimension names available to stream.
     ///   - extraBytesPerPoint: Host-side byte cost per point of requested
     ///     extra dimensions. Defaults to `0`.
+    ///   - nodesAtDepth: Per-depth node counts. Defaults to empty ("unknown").
+    ///   - slotsAtDepth: Per-depth slot footprints. Defaults to empty
+    ///     ("unknown"), which makes ``slotsThroughDepth(_:)`` and
+    ///     ``totalSlots`` return `nil` so callers fall back to their own
+    ///     estimate rather than reading a bogus zero.
     public init(
         bounds: Bounds,
         originShift: SIMD3<Double>,
@@ -168,7 +218,9 @@ public struct StreamingSourceInfo: Sendable {
         pointsPerBatch: Int,
         bytesPerPoint: Int,
         availableDimensions: [String],
-        extraBytesPerPoint: Int = 0
+        extraBytesPerPoint: Int = 0,
+        nodesAtDepth: [Int] = [],
+        slotsAtDepth: [Int] = []
     ) {
         self.bounds = bounds
         self.originShift = originShift
@@ -178,6 +230,8 @@ public struct StreamingSourceInfo: Sendable {
         self.bytesPerPoint = bytesPerPoint
         self.availableDimensions = availableDimensions
         self.extraBytesPerPoint = extraBytesPerPoint
+        self.nodesAtDepth = nodesAtDepth
+        self.slotsAtDepth = slotsAtDepth
     }
 }
 
@@ -1565,6 +1619,12 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
         var nodes: [NodeMeta] = []
         nodes.reserveCapacity(Int(nodeCount))
         var maxDepth = 0
+        // Per-depth node/slot histogram, published on `StreamingSourceInfo` so a
+        // host can size a pool for a depth-limited pin from that prefix's real
+        // cost. Grown on demand — the hierarchy isn't walked in depth order.
+        let pointsPerBatch = ChunkPacker.defaultPointsPerBatch
+        var nodesAtDepth: [Int] = []
+        var slotsAtDepth: [Int] = []
         for i in 0..<nodeCount {
             var n = CopcNodeInfo()
             if !reader.node_at(i, &n) { continue }
@@ -1587,7 +1647,17 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
                 center: center, extent: extent,
                 offset: n.offset, byteSize: Int(n.byte_size)
             ))
-            maxDepth = max(maxDepth, Int(n.depth))
+            let depth = Int(n.depth)
+            maxDepth = max(maxDepth, depth)
+            if nodesAtDepth.count <= depth {
+                let pad = depth + 1 - nodesAtDepth.count
+                nodesAtDepth.append(contentsOf: repeatElement(0, count: pad))
+                slotsAtDepth.append(contentsOf: repeatElement(0, count: pad))
+            }
+            nodesAtDepth[depth] += 1
+            // A node occupies whole slots — the same `ceil` the driver charges
+            // admission in, so an empty node (0 points) costs nothing.
+            slotsAtDepth[depth] += (Int(n.point_count) + pointsPerBatch - 1) / pointsPerBatch
         }
 
         let bounds = Bounds(
@@ -1648,10 +1718,12 @@ public final class CopcStreamingPointCloudSource: StreamingPointCloudSource, @un
             originShift: originShift,
             totalPoints: UInt64(totalPoints),
             maxDepth: maxDepth,
-            pointsPerBatch: ChunkPacker.defaultPointsPerBatch,
+            pointsPerBatch: pointsPerBatch,
             bytesPerPoint: 17,
             availableDimensions: availableDimensions,
-            extraBytesPerPoint: 4 * extraNames.count
+            extraBytesPerPoint: 4 * extraNames.count,
+            nodesAtDepth: nodesAtDepth,
+            slotsAtDepth: slotsAtDepth
         )
 
         let queue = UpdateQueue()
